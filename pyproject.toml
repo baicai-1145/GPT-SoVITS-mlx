@@ -1,7 +1,8 @@
 [project]
 name = "gsovits-mlx"
 version = "0.1.0"
-description = "GPT-SoVITS text-to-speech on Apple MLX (v1/v2/v2Pro/v2ProPlus/v3/v4/v5dev/v5turbo)"
+description = "GPT-SoVITS text-to-speech on Apple MLX — all 8 official model families (v1/v2/v2Pro/v2ProPlus/v3/v4/v5dev/v5turbo), zero torch at inference; official multi-language front-end (zh/ja/ko/yue/en, auto) on Metal"
+keywords = ["tts", "gpt-sovits", "mlx", "apple-silicon", "metal", "speech-synthesis", "text-to-speech"]
 requires-python = ">=3.12"
 dependencies = [
     # Pinned exactly: MLX kernel releases change fp ulp behavior, which flips
