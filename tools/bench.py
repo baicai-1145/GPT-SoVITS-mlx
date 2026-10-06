@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
                    help="Path to the e2e script to drive (default: tools/e2e_v2.py "
                         "alongside this file). Only v2 is wired today; other "
                         "versions fail fast until their e2e scripts land.")
+    p.add_argument("--gpu", action="store_true",
+                   help="Opt the e2e children into Metal: sets GSOVITS_GPU_LOCK_OK=1;\n                        children still require a fresh gpu.lock (default-deny).")
     p.add_argument("--keep-audio", default=None,
                    help="Optional path for the rendered wav of the last repeat.")
     return p.parse_args()
@@ -193,8 +195,20 @@ def _wav_seconds(path: str) -> float:
 
 def main() -> None:
     args = parse_args()
+    # bench spawns the e2e scripts as children; they self-gate via
+    # GSOVITS_GPU_LOCK_OK/--gpu. bench --gpu sets the opt-in env for the
+    # children (the lock check happens in each child).
+    if args.gpu:
+        os.environ["GSOVITS_GPU_LOCK_OK"] = "1"
+    from gsovits_mlx.gpu_lock import lock_status
+
+    held, owner = lock_status()
+    device = "gpu" if (args.gpu and held) else "cpu"
+    print(f"[bench] device={device} "
+          f"(lock={'held: ' + owner if held else 'not held'})", flush=True)
     for i in range(args.repeat):
         row = run_one(args, args.keep_audio if i == args.repeat - 1 else None)
+        row["device"] = device
         print(json.dumps(row, ensure_ascii=False), flush=True)
 
 

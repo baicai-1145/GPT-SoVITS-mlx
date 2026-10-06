@@ -83,6 +83,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cfg-rate", type=float, default=DEFAULT_CFG_RATE,
                    help="CFM inference_cfg_rate (official v3 default: 0.0).")
     p.add_argument("--out", default="out_v3.wav", help="Output wav path (24 kHz).")
+    p.add_argument("--gpu", action="store_true",
+                   help="Opt in to Metal for ALL stages: requires GSOVITS_GPU_LOCK_OK=1\n                        and a fresh .tmp/gpu.lock.d owner (default-deny; CPU otherwise).")
     p.add_argument("--bench", action="store_true",
                    help="Print per-stage wall times and peak RSS to stderr.")
     return p.parse_args()
@@ -157,6 +159,13 @@ def load_audio_official(path: str, target_sr: int) -> np.ndarray:
 
 def main() -> None:
     args = parse_args()
+    # Process-wide device gate (default-deny): pins MLX to CPU unless
+    # --gpu/GSOVITS_GPU_LOCK_OK AND a fresh gpu.lock. See gsovits_mlx.gpu_lock.
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from gsovits_mlx.gpu_lock import resolve_device
+    resolve_device(flag_gpu=args.gpu, verbose=True)
     # AR sampling draws its inverse-CDF uniform from numpy's global RNG
     # (gsovits_mlx/gpt/t2s.py::_sample); seed it so runs are reproducible.
     np.random.seed(args.seed)
