@@ -558,6 +558,47 @@ def convert_sovits_v3v5(path: str, out_dir: str, version: str, fp16: bool = True
     return len(arrays)
 
 
+# ---------------------------------------------------------------------------
+# v4/v5 HiFi-GAN vocoder (gsv-v4-pretrained/vocoder.pth)
+# ---------------------------------------------------------------------------
+
+def convert_generator_vocoder(ckpt_path: str, out_dir: str):
+    """v4/v5 vocoder.pth (Generator, 48 kHz) -> vocoder.safetensors + vocoder.json.
+
+    The checkpoint stores PLAIN conv weights (official calls remove_weight_norm
+    before state_dict capture), so no weight-norm fusion is needed.
+    """
+    import torch
+
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    assert not any("weight_g" in k for k in sd), "unexpected weight_norm keys"
+    arrays: dict[str, np.ndarray] = {}
+    arrays["conv_pre.weight"] = to_mlx_conv1d(sd["conv_pre.weight"].float().numpy())
+    arrays["conv_pre.bias"] = sd["conv_pre.bias"].float().numpy()
+    n_ups = len([k for k in sd if re.fullmatch(r"ups\.\d+\.weight", k)])
+    for i in range(n_ups):
+        arrays[f"ups.{i}.weight"] = to_mlx_conv1d_t(sd[f"ups.{i}.weight"].float().numpy())
+        arrays[f"ups.{i}.bias"] = sd[f"ups.{i}.bias"].float().numpy()
+    n_rb = len([k for k in sd if re.fullmatch(r"resblocks\.\d+\.convs1\.0\.weight", k)])
+    for b in range(n_rb):
+        for cn in ("convs1", "convs2"):
+            for j in range(3):
+                arrays[f"resblocks.{b}.{cn}.{j}.weight"] = to_mlx_conv1d(sd[f"resblocks.{b}.{cn}.{j}.weight"].float().numpy())
+                arrays[f"resblocks.{b}.{cn}.{j}.bias"] = sd[f"resblocks.{b}.{cn}.{j}.bias"].float().numpy()
+    arrays["conv_post.weight"] = to_mlx_conv1d(sd["conv_post.weight"].float().numpy())
+    arrays["conv_post.bias"] = sd["conv_post.bias"].float().numpy()
+    save_safetensors(os.path.join(out_dir, "vocoder.safetensors"), arrays)
+    meta = {"initial_channel": 100, "resblock": "1",
+            "resblock_kernel_sizes": [3, 7, 11],
+            "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+            "upsample_rates": [10, 6, 2, 2, 2], "upsample_initial_channel": 512,
+            "upsample_kernel_sizes": [20, 12, 4, 4, 4], "gin_channels": 0,
+            "is_bias": True, "sampling_rate": 48000}
+    with open(os.path.join(out_dir, "vocoder.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+    return len(arrays)
+
+
 def _fuse_wn_hf(g, v):
     """HF weight_norm(g, v, dim=last): norm over all dims except the last."""
     g = g.astype(np.float32)

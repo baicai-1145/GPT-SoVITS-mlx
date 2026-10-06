@@ -252,3 +252,40 @@ identical in both forms. After the fix fea diff is 3.4e-6.
 (8.80 s, 24 kHz, 119 AR tokens, 32 CFM steps, ~220 s wall, peak RSS 2.5 GB).
 Listen check: prompt parroting + target text clearly intelligible, no
 artifacts.
+
+## v4 addendum (task-6, e2e_v4.py — CFM + Generator vocoder 48 kHz)
+
+The v4 port (`tools/e2e_v4.py`, weights gsv-v4-pretrained/s2Gv4.pth +
+vocoder.pth) reuses the whole v3 CFM machinery. Version-specific findings:
+
+1. **ckpt `config["model"]` has NO `version` key.** The torch reference
+   harness must inject `version="v4"` explicitly — `SynthesizerTrnV3.__init__`
+   defaults to `"v3"`, which silently switches decode_encp to the 3.875×
+   interp (116 frames for 30 codes) instead of the v4 integer 4× (120
+   frames). Official CPUFast sets `hps["model"]["version"] = model_version`
+   (TTS.py:579-581). The MLX loader takes the version explicitly.
+2. **Interp scale 2 (integer).** `_nearest_interp` without scale_factor is
+   exact here (both index maps agree for integer scales).
+3. **Chunk constants**: `vocoder_configs` v4 = sr 48000, T_ref=500,
+   T_chunk=1000, upsample_rate=480, overlapped_len=12
+   (`cfm_chunked_decode_v4`; v3 helper keeps 468/934).
+4. **Prompt mel is mel_fn_v4**: 100-mel, n_fft 1280 / hop 320 @ 32 kHz
+   center=False (v3 was 1024/256 @ 24 kHz). The ref audio for mel2 is
+   resampled to 32 kHz (not 24 kHz) per TTS.py tgt_sr.
+5. **Vocoder is the HiFi-GAN `Generator`** (module/models.py:464,
+   initial_channel=100, upsample [10,6,2,2,2], kernels [20,12,4,4,4], 512ch,
+   LeakyReLU 0.1, final tanh) — same class already verified for v1/v2
+   decoders. The vocoder.pth stores PLAIN conv weights (official calls
+   `remove_weight_norm()` before capture), so `convert_generator_vocoder`
+   does no weight-norm fusion. Torch-vs-MLX A/B on a random 100-mel input:
+   **max 6.6e-5, mean 3.3e-6**.
+6. **DiT keeps `use_step_embedding=True` for v4** (only v5 family drops it);
+   all task-5 DiT fixes (raw-angle rope cache, head-0-only partial RoPE)
+   apply unchanged.
+
+Parity summary (official torch CPUFast, this machine): ge 4.6e-5,
+decode_encp fea 8.3e-6, single DiT step v_pos 4.1e-5 / v_neg 7.4e-5,
+32-step Euler+CFG(0.25) per-step trajectory **2.0e-5 max**.
+`tools/e2e_v4.py` → `/Volumes/2T/gpt-sovits-models/bench/mlx/v4.wav`
+(9.52 s, 48 kHz, 137 AR tokens, 32 CFM steps, ~64 s wall, peak RSS 2.7 GB);
+listen check: prompt parroting + target text intelligible, no artifacts.

@@ -226,6 +226,32 @@ def load_sovits_v3(path: str, version: str = "v3"):
     return m, meta
 
 
+def load_vocoder_v4(path: str):
+    """Converted v4/v5 HiFi-GAN Generator (vocoder.safetensors + vocoder.json)."""
+    from .sovits.models_v1v2 import Generator
+    arrays = load_mlx_safetensors(os.path.join(path, "vocoder.safetensors"))
+    h = json.load(open(os.path.join(path, "vocoder.json")))
+    g = arrays.get
+    voc = Generator(h["initial_channel"], h["resblock"], h["resblock_kernel_sizes"],
+                    h["resblock_dilation_sizes"], h["upsample_rates"],
+                    h["upsample_initial_channel"], h["upsample_kernel_sizes"],
+                    gin_channels=h["gin_channels"])
+    voc.conv_pre.weight, voc.conv_pre.bias = g("conv_pre.weight"), g("conv_pre.bias")
+    for i in range(len(voc.ups)):
+        voc.ups[i].weight = g(f"ups.{i}.weight")
+        voc.ups[i].bias = g(f"ups.{i}.bias")
+    for b, rb in enumerate(voc.resblocks):
+        for j in range(len(rb.convs1)):
+            rb.convs1[j].weight = g(f"resblocks.{b}.convs1.{j}.weight")
+            rb.convs1[j].bias = g(f"resblocks.{b}.convs1.{j}.bias")
+            rb.convs2[j].weight = g(f"resblocks.{b}.convs2.{j}.weight")
+            rb.convs2[j].bias = g(f"resblocks.{b}.convs2.{j}.bias")
+    voc.conv_post.weight = g("conv_post.weight")
+    voc.conv_post.bias = g("conv_post.bias")
+    mx.eval(voc.parameters())
+    return voc
+
+
 def load_bigvgan(path: str):
     """Converted BigVGAN v2 (bigvgan.safetensors + bigvgan.json)."""
     arrays = load_mlx_safetensors(os.path.join(path, "bigvgan.safetensors"))
@@ -278,12 +304,31 @@ def cfm_chunked_decode_v3(model: SynthesizerTrnV3, fea_ref: mx.array, fea_todo: 
                           mel2: mx.array, sample_steps: int = 32,
                           inference_cfg_rate: float = 0.0,
                           key: mx.array | None = None) -> mx.array:
-    """TTS.py v3/v4 chunked CFM loop (T_ref=468, T_chunk=934, 100-mel). Returns the
+    """TTS.py v3 chunked CFM loop (T_ref=468, T_chunk=934, 100-mel). Returns the
     predicted mel (B, 100, T_target); denorm NOT applied."""
+    return _cfm_chunked_decode(model, fea_ref, fea_todo, mel2, sample_steps,
+                               inference_cfg_rate, key, T_ref=468, T_chunk=934)
+
+
+def cfm_chunked_decode_v4(model: SynthesizerTrnV3, fea_ref: mx.array, fea_todo: mx.array,
+                          mel2: mx.array, sample_steps: int = 32,
+                          inference_cfg_rate: float = 0.0,
+                          key: mx.array | None = None) -> mx.array:
+    """TTS.py v4 chunked CFM loop (vocoder_configs: T_ref=500, T_chunk=1000)."""
+    return _cfm_chunked_decode(model, fea_ref, fea_todo, mel2, sample_steps,
+                               inference_cfg_rate, key, T_ref=500, T_chunk=1000)
+
+
+def _cfm_chunked_decode(model: SynthesizerTrnV3, fea_ref: mx.array, fea_todo: mx.array,
+                        mel2: mx.array, sample_steps: int,
+                        inference_cfg_rate: float, key: mx.array | None,
+                        T_ref: int, T_chunk: int) -> mx.array:
+    """Shared chunked CFM loop (using_vocoder_synthesis): crops the prompt to the
+    last T_ref frames, then slides chunk_len = T_chunk - T_min windows; each chunk's
+    CFM result beyond the prompt becomes the next prompt."""
     T_min = min(mel2.shape[2], fea_ref.shape[2])
     mel2 = mel2[:, :, :T_min]
     fea_ref = fea_ref[:, :, :T_min]
-    T_ref, T_chunk = 468, 934
     if T_min > T_ref:
         mel2 = mel2[:, :, -T_ref:]
         fea_ref = fea_ref[:, :, -T_ref:]
