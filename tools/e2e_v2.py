@@ -194,7 +194,7 @@ def main() -> None:
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     from gsovits_mlx.text.bert_tokenizer import encode_text, find_tokenizer_json, load_bert_tokenizer
-    from gsovits_mlx.io import eval_tree, load_mlx_safetensors, release
+    from gsovits_mlx.io import load_mlx_safetensors
     from gsovits_mlx.text.bert import BertModel
     from gsovits_mlx.text.hubert import HubertModel
     from gsovits_mlx.text.mel_frontend import spectrogram
