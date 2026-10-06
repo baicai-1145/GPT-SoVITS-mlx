@@ -72,6 +72,25 @@ def release(*_discarded) -> None:
     gc.collect()
 
 
+def trim_metal() -> None:
+    """Return MLX's cached Metal buffers to the OS (no-op on CPU builds).
+
+    Freed mx arrays go to MLX's internal buffer cache, NOT back to the OS,
+    so the physical footprint only drops when the cache is flushed. Call at
+    STAGE BOUNDARIES (after the stage's outputs are realized and its
+    temporaries dropped) — clearing per-step would defeat buffer reuse and
+    slow the loop down. Pure allocator hygiene: no math effect.
+    """
+    try:
+        import mlx.core as _mx
+
+        metal = getattr(_mx, "metal", None)
+        if metal is not None and hasattr(metal, "clear_cache"):
+            metal.clear_cache()
+    except Exception:
+        pass
+
+
 def eval_tree(*roots) -> None:
     """mx.eval a whole object graph of arrays / containers / modules.
 

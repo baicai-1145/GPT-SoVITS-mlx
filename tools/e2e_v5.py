@@ -209,7 +209,7 @@ def main() -> None:
     import mlx.core as mx
     import soundfile as sf
     
-    from gsovits_mlx.io import load_mlx_safetensors
+    from gsovits_mlx.io import load_mlx_safetensors, trim_metal
     from gsovits_mlx.text.hubert import HubertModel
     from gsovits_mlx.text.mel_frontend import mel_spectrogram, spectrogram
     from gsovits_mlx.pipeline import (denorm_spec, load_gpt, load_sovits_v3,
@@ -281,6 +281,7 @@ def main() -> None:
     mx.eval(all_phones, all_bert)
     del p_bert, t_bert
     gc.collect()
+    trim_metal()
     times["frontend"] = time.perf_counter() - t0
     times["frontend_cache_hit"] = cache_hit
     if args.bench:
@@ -301,6 +302,7 @@ def main() -> None:
     hx = mx.transpose(h, (0, 2, 1))
     del hb, h, wav16k
     gc.collect()
+    trim_metal()
     t_load = time.perf_counter()
     sov, _meta = load_sovits_v3(os.path.join(args.models_root, version), version)
     times["model_load"] = time.perf_counter() - t_load
@@ -333,6 +335,7 @@ def main() -> None:
     mx.eval(seq)
     del gpt
     gc.collect()
+    trim_metal()
     times["ar"] = time.perf_counter() - t0
     n_gen = seq.shape[1]
     if args.bench:
@@ -351,6 +354,7 @@ def main() -> None:
     mx.eval(fea_ref, fea_todo)
     del ge, refer_mask
     gc.collect()
+    trim_metal()
 
     # prompt mel2: mel_fn_v4 (100-mel, 1280/320 @ 32 kHz, center=False) on the ref
     # audio resampled to 32 kHz, then norm_spec (same as v4)
@@ -367,12 +371,14 @@ def main() -> None:
     mx.eval(pred)
     del fea_ref, fea_todo, mel2, all_codes, mel
     gc.collect()
+    trim_metal()
 
     voc = load_vocoder_v4(os.path.join(args.models_root, "v5_vocoder"))
     audio = voc(pred)
     mx.eval(audio)
     del pred
     gc.collect()
+    trim_metal()
     times["sovits_vocoder"] = time.perf_counter() - t0
 
     # vocoder upsamples 480x per mel frame (48 kHz)
@@ -382,6 +388,7 @@ def main() -> None:
 
     del audio
     gc.collect()
+    trim_metal()
     sf.write(args.out, audio_np, 48000)
     if args.bench:
         rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

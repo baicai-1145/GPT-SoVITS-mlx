@@ -202,7 +202,7 @@ def main() -> None:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-    from gsovits_mlx.io import load_mlx_safetensors
+    from gsovits_mlx.io import load_mlx_safetensors, trim_metal
     from gsovits_mlx.text.hubert import HubertModel
     from gsovits_mlx.text.mel_frontend import spectrogram
     from gsovits_mlx.pipeline import _load_sovits_v1v2, load_gpt
@@ -272,6 +272,7 @@ def main() -> None:
     mx.eval(all_phones, all_bert)
     del p_bert, t_bert
     gc.collect()
+    trim_metal()
     times["frontend"] = time.perf_counter() - t0
     times["frontend_cache_hit"] = cache_hit
     if args.bench:
@@ -294,6 +295,7 @@ def main() -> None:
     hx = mx.transpose(h, (0, 2, 1))
     del hb, h, wav16k
     gc.collect()
+    trim_metal()
     t_load = time.perf_counter()
     sov, _meta = _load_sovits_v1v2(os.path.join(args.models_root, "v1"), "v1")
     times["model_load"] = time.perf_counter() - t_load
@@ -332,6 +334,7 @@ def main() -> None:
     mx.eval(seq)
     del gpt
     gc.collect()
+    trim_metal()
     times["ar"] = time.perf_counter() - t0
     n_gen = seq.shape[1]
     if args.bench:
@@ -362,6 +365,7 @@ def main() -> None:
     # drop the mx graph before the disk write (memory hygiene)
     del audio, y_mask, all_codes
     gc.collect()
+    trim_metal()
 
     sf.write(args.out, audio_np, 32000)
     if args.bench:
