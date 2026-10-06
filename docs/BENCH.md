@@ -156,3 +156,37 @@ real pipelines (attention, dynamic shapes, per-stage launches) land well
 below this, which is why the AR decoder (per-token sequential) runs at
 ~26–37 tok/s in the stage-1 codebase (the seeded table above supersedes
 those stage splits).
+
+## Memory footprint (task-3, post P0-B)
+
+Peak physical footprint = /usr/bin/footprint on the e2e child (Activity-Monitor
+"Memory" caliber: resident + compressed + Metal wired), sampled every 0.2-0.5 s;
+`tools/bench.py` emits `peak_footprint_kb` per row. Fixes: lazy mmap weight
+loading, per-step/per-chunk CFM evals, Metal buffer-cache trim at stage
+boundaries, front-end (BERT+G2PW) teardown after the phones/bert stage,
+DiT model freed before the vocoder.
+
+| version | footprint peak | RSS peak | wall (GPU) | note |
+|---|---|---|---|---|
+| v1 | 3.74 GB | 2.75 GB | 7.2 s | |
+| v2 | 3.96 GB | 3.39 GB | 3.3 s | was 7.78 GB on main@2e8bddb |
+| v2Pro | 3.97 GB | 3.39 GB | 11.9 s | sv encoder stays fp32 by design |
+| v2ProPlus | 4.84 GB | 3.39 GB | 10.6 s | sv encoder (fp32) rides on the peak |
+| v3 | 12.58 GB | 3.39 GB | 45.4 s | BigVGAN 256x fp32 stack, see note |
+| v4 | 3.85 GB | 3.39 GB | 56.9 s | |
+| v5dev | 3.47-3.68 GB | 1.96-3.39 GB | 28.2 s | acceptance cell: <4 GB (was 9.64) |
+| v5turbo | 3.80 GB | 3.39 GB | 18.6 s | |
+
+v5dev before/after on identical seed/text/ref (main@2e8bddb -> task-3):
+footprint 9.64 -> 3.68 GB, RSS 6.03 -> 1.96 GB, wall 187 -> 28.8 s. The
+wall gain is the same fix: with wired memory released at stage boundaries
+Metal stops throttling (AR 11.8 -> 89 tok/s).
+
+v3 outlier: the transient 12.6 GB spike is the BigVGAN vocoder graph (256x
+upsample, fp32 by design for audio fidelity). Not a leak - RSS stays 3.4 GB;
+reaching it would need graph evals per BigVGAN stage (owner: task-5
+mx.compile work, flagged to lead). Acceptance cell for P0-B was v5dev.
+
+Outputs verified byte-identical to main@2e8bddb (seed 0) for v2 and v5dev
+after all memory changes; g2pw/BERT reload lazily if the front-end is ever
+re-entered after teardown.

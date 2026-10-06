@@ -20,6 +20,7 @@ Requires the GPT-SoVITS-CPUFast checkout ONLY for the text front-end
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -180,8 +181,9 @@ def main() -> None:
     device = resolve_device(flag_gpu=args.gpu, verbose=True)
     if not args.frontend_only:
         from gsovits_mlx.gpu_lock import require_gpu_for_pipeline
-        require_gpu_for_pipeline("gpu" if args.gpu else "cpu",
-                                 cpu_ok_flag=args.cpu_i_know_broken)
+        # gate on the RESOLVED device (env opt-in counts as gpu), not the
+        # raw flag — resolve_device already validated lock freshness+tag.
+        require_gpu_for_pipeline(device, cpu_ok_flag=args.cpu_i_know_broken)
     # AR sampling draws its inverse-CDF uniform from numpy's global RNG
     # (gsovits_mlx/gpt/t2s.py::_sample); seed it so runs are reproducible.
     np.random.seed(args.seed)
@@ -197,7 +199,7 @@ def main() -> None:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-    from gsovits_mlx.io import load_mlx_safetensors
+    from gsovits_mlx.io import load_mlx_safetensors, trim_metal
     from gsovits_mlx.text.hubert import HubertModel
     from gsovits_mlx.text.mel_frontend import mel_spectrogram, spectrogram
     from gsovits_mlx.pipeline import (denorm_spec, load_bigvgan, load_gpt,
@@ -267,6 +269,16 @@ def main() -> None:
     # all_bert = concat(prompt_bert, target_bert) along time -- official layout
     all_bert = mx.array(np.concatenate([np.asarray(p_bert), np.asarray(t_bert)], axis=1))[None]  # (1, 1024, Tp+Tt)
     mx.eval(all_phones, all_bert)
+    del p_bert, t_bert
+    # Release the whole front-end for the audio stages: the TextFrontend holds
+    # the fp32 BERT (~1.2 GB) and g2pw_mlx keeps its weights in a module-level
+    # global; both are dead weight after this point. g2pw reloads lazily if a
+    # later call needs it (batch/re-entry), so this is safe, not just cheap.
+    del fe, frontend_run
+    import gsovits_mlx.text.g2pw_mlx as _g2pw_mod
+    _g2pw_mod._MODEL = None
+    gc.collect()
+    trim_metal()
     times["frontend"] = time.perf_counter() - t0
     times["frontend_cache_hit"] = cache_hit
     if args.bench:
@@ -284,10 +296,15 @@ def main() -> None:
                      json.load(open(os.path.join(hubert_dir, "config.json"))))
     h = hb(mx.array(wav16k[None]))
     mx.eval(h)
+    hx = mx.transpose(h, (0, 2, 1))
+    del hb, h, wav16k
+    gc.collect()
+    trim_metal()
     t_load = time.perf_counter()
     sov, _meta = load_sovits_v3(os.path.join(args.models_root, "v3"), "v3")
     times["model_load"] = time.perf_counter() - t_load
-    prompt_sem = sov.extract_latent(mx.transpose(h, (0, 2, 1)))  # (1, Tp) int
+    prompt_sem = sov.extract_latent(hx)  # (1, Tp) int
+    del hx
     mx.eval(prompt_sem)
     times["prompt_codes"] = time.perf_counter() - t0
     if args.bench:
@@ -313,6 +330,9 @@ def main() -> None:
                     repetition_penalty=args.repetition_penalty,
                     early_stop_num=args.early_stop_num, key=mx.random.key(args.seed))
     mx.eval(seq)
+    del gpt
+    gc.collect()
+    trim_metal()
     times["ar"] = time.perf_counter() - t0
     n_gen = seq.shape[1]
     if args.bench:
@@ -333,6 +353,9 @@ def main() -> None:
     # fea_ref); official drops nothing here because decode_encp is re-run on the
     # FULL code stream and the chunk loop starts at the prompt boundary.
     mx.eval(fea_ref, fea_todo)
+    del ge
+    gc.collect()
+    trim_metal()
 
     # prompt mel2: mel_fn (100-mel, 1024/256 @ 24 kHz, center=False) on the ref
     # audio resampled to 24 kHz, then norm_spec
@@ -348,10 +371,17 @@ def main() -> None:
                                  key=mx.random.key(args.seed))
     pred = denorm_spec(pred)
     mx.eval(pred)
+    del sov  # DiT weights are dead once pred is realized; vocoder loads next
+    del fea_ref, fea_todo, mel2, all_codes
+    gc.collect()
+    trim_metal()
 
     voc = load_bigvgan(os.path.join(args.models_root, "bigvgan"))
     audio = voc(pred)
     mx.eval(audio)
+    del pred
+    gc.collect()
+    trim_metal()
     times["sovits_vocoder"] = time.perf_counter() - t0
 
     # vocoder upsamples 256x per mel frame (24 kHz)
@@ -359,6 +389,9 @@ def main() -> None:
     from gsovits_mlx._audio_check import assert_audible
     assert_audible(audio_np, context=f"{args.out} pre-write")
 
+    del audio
+    gc.collect()
+    trim_metal()
     sf.write(args.out, audio_np, 24000)
     if args.bench:
         rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

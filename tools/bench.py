@@ -1,12 +1,13 @@
 """Benchmark harness for gsovits_mlx pipelines (skeleton).
 
 Runs one synthesis per invocation, timing each pipeline stage and reporting
-process peak RSS, as one JSON line on stdout. Stage names are stable so the
-output can be concatenated across runs and versions:
+process peak RSS plus peak physical footprint, as one JSON line on stdout.
+Stage names are stable so the output can be concatenated across runs and
+versions:
 
     {"version": "v2", "stages": {"frontend_s": .., "prompt_codes_s": ..,
      "refer_spec_s": .., "ar_s": .., "sovits_s": .., "ar_tokens": ..,
-     "audio_s": .., "peak_rss_kb": ..}, "total_s": ..}
+     "audio_s": .., "peak_rss_kb": .., "peak_footprint_kb": ..}, "total_s": ..}
 
 Stage semantics:
     frontend      text -> phones + BERT features (official cleaner + MLX BERT)
@@ -23,6 +24,11 @@ Peak RSS is the child process's high-water mark
 reports bytes), so it covers MLX Metal buffer cache growth; compare across
 identical stage sequences, not across versions.
 
+Peak footprint is the Activity-Monitor "Memory" caliber sampled live from the
+e2e child with /usr/bin/footprint (resident + compressed + Metal/GPU wired),
+normalized to KB; 0 means the sampler could not read it. It is the number to
+watch for the memory-peak budget, RSS alone under-reports GPU-wired pages.
+
 Examples:
     python3 tools/bench.py --version v2 \
         --text "你好，欢迎来到各自的旅程。今天我们聊聊机器学习。" \
@@ -35,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import resource
 import subprocess
 import sys
@@ -107,6 +114,24 @@ E2E_SCRIPTS = {
 _STAGE_NAMES = ("frontend", "prompt_codes", "refer_spec", "ar", "sovits", "sovits_vocoder",
                 "cfm", "vocoder", "sv_emb")
 
+# /usr/bin/footprint prints: "python [123]: 64-bit    Footprint: 309 MB (...)"
+_FOOTPRINT_HEADER_RE = re.compile(r"Footprint:\s+([\d.]+)\s+(B|KB|MB|GB)\b")
+_FOOTPRINT_UNIT = {"B": 1, "KB": 2**10, "MB": 2**20, "GB": 2**30}
+
+
+def _footprint_bytes(pid: int) -> int:
+    """Live physical footprint (Activity Monitor caliber) of pid in bytes; 0 if
+    /usr/bin/footprint is unavailable or refuses (wrong user, exited pid)."""
+    try:
+        out = subprocess.run(["/usr/bin/footprint", str(pid)],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return 0
+    m = _FOOTPRINT_HEADER_RE.search(out)
+    if not m:
+        return 0
+    return int(float(m.group(1)) * _FOOTPRINT_UNIT[m.group(2)])
+
 
 def run_one(args: argparse.Namespace, out_path: str | None) -> dict:
     """Drive one synthesis and collect stage timings as a dict."""
@@ -145,17 +170,24 @@ def run_one(args: argparse.Namespace, out_path: str | None) -> dict:
     t0 = time.perf_counter()
     # RUSAGE_CHILDREN.ru_maxrss = max peak RSS across reaped children;
     # macOS reports bytes, Linux kilobytes. Normalize to KB.
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    # Popen (not run) so the child can be sampled live with /usr/bin/footprint;
+    # stdout+stderr are still fully captured and parsed below.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    peak_footprint = 0
+    while proc.poll() is None:
+        peak_footprint = max(peak_footprint, _footprint_bytes(proc.pid))
+        time.sleep(0.5)
+    stdout, stderr = proc.communicate()
     total = time.perf_counter() - t0
     peak_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     if sys.platform == "darwin":
         peak_rss //= 1024
     if proc.returncode != 0:
-        sys.stderr.write(proc.stderr)
+        sys.stderr.write(stderr)
         raise SystemExit(f"e2e run failed with code {proc.returncode}")
 
     stages: dict[str, float] = {}
-    for line in proc.stderr.splitlines():
+    for line in stderr.splitlines():
         # e2e_v2.py --bench emits: "[bench] frontend: ... 0.42s" etc.
         if not line.startswith("[bench] "):
             continue
@@ -174,6 +206,7 @@ def run_one(args: argparse.Namespace, out_path: str | None) -> dict:
     stages.setdefault("vocoder_s", 0.0)  # v1/v2 decode includes the vocoder
     stages["audio_s"] = _wav_seconds(out_path) if os.path.isfile(out_path) else 0.0
     stages["peak_rss_kb"] = peak_rss
+    stages["peak_footprint_kb"] = peak_footprint // 1024
     if unlink_after and os.path.isfile(out_path):
         os.unlink(out_path)
     return {"version": args.version, "stages": stages, "total_s": round(total, 3)}
