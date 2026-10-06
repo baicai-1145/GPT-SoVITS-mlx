@@ -83,14 +83,28 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# version -> (e2e script, extra CLI args, supports --noise-scale/--early-stop-num)
+E2E_SCRIPTS = {
+    "v1": ("e2e_v1.py", [], True),
+    "v2": ("e2e_v2.py", [], True),
+    "v2Pro": ("e2e_v2pro.py", ["--model", "pro"], True),
+    "v2ProPlus": ("e2e_v2pro.py", ["--model", "proplus"], True),
+    "v3": ("e2e_v3.py", [], False),
+    "v4": ("e2e_v4.py", [], False),
+    "v5dev": ("e2e_v5.py", ["--model", "dev"], False),
+    "v5turbo": ("e2e_v5.py", ["--model", "turbo"], False),
+}
+# stage names emitted per family ("sovits+vocoder" splits to sovits_vocoder;
+# v1/v2 decode includes the vocoder in `sovits`)
+_STAGE_NAMES = ("frontend", "prompt_codes", "refer_spec", "ar", "sovits", "sovits_vocoder",
+                "cfm", "vocoder", "sv_emb")
+
+
 def run_one(args: argparse.Namespace, out_path: str | None) -> dict:
     """Drive one synthesis and collect stage timings as a dict."""
+    script_name, extra, has_v2_args = E2E_SCRIPTS[args.version]
     script = args.e2e_script or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                             "e2e_v2.py")
-    if args.version != "v2":
-        raise SystemExit(
-            f"bench for version '{args.version}' is not wired yet: add tools/e2e_{args.version}.py "
-            "and extend the dispatch in bench.py run_one() (today only e2e_v2.py exists)")
+                                             script_name)
     if not os.path.isfile(script):
         raise SystemExit(f"e2e script not found: {script}")
 
@@ -110,10 +124,11 @@ def run_one(args: argparse.Namespace, out_path: str | None) -> dict:
            "--top-k", str(args.top_k), "--top-p", str(args.top_p),
            "--temperature", str(args.temperature),
            "--repetition-penalty", str(args.repetition_penalty),
-           "--noise-scale", str(args.noise_scale), "--seed", str(args.seed),
-           "--bench", "--out", out_path]
-    if args.early_stop_num is not None:
-        cmd += ["--early-stop-num", str(args.early_stop_num)]
+           "--seed", str(args.seed), "--bench", "--out", out_path] + extra
+    if has_v2_args:
+        cmd += ["--noise-scale", str(args.noise_scale)]
+        if args.early_stop_num is not None:
+            cmd += ["--early-stop-num", str(args.early_stop_num)]
 
     t0 = time.perf_counter()
     # RUSAGE_CHILDREN.ru_maxrss = max peak RSS across reaped children;
@@ -139,7 +154,8 @@ def run_one(args: argparse.Namespace, out_path: str | None) -> dict:
                 stages["peak_rss_kb"] = int(tail.split("peak_rss=")[1].split()[0])
             stages["total_e2e_s"] = _last_seconds(tail)
         name, _, rest = body.partition(": ")
-        if name in ("frontend", "prompt_codes", "refer_spec", "ar", "sovits"):
+        name = name.replace("sovits+vocoder", "sovits_vocoder")
+        if name in _STAGE_NAMES:
             stages[name + "_s"] = _last_seconds(rest)
         if "tokens" in rest:
             stages["ar_tokens"] = int(rest.split("tokens")[0].split()[-1])
