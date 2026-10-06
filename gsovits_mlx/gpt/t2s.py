@@ -116,6 +116,44 @@ class T2SBlock:
         out = out @ self.out_w.T + self.out_b
         return out, k_cache, v_cache
 
+    def _attn_fastcache(self, x: mx.array, cache: dict | None, mask: mx.array | None,
+                        pos: int):
+        """Attention against a PREALLOCATED (B, H, T_max, D) KV buffer.
+
+        Identical math to _attn with an incrementally built cache: the buffer
+        holds the same values in the same order — new keys/values are written
+        at slot ``pos`` (slice update, no history copy) and attention reads
+        the lazy slice [.., :pos+1, ..]. The legacy path copies the whole
+        history per step (concatenate) and re-splits heads per step; this one
+        writes one slot and never re-touches history. Returns the same
+        attention output plus the (unchanged except slot pos) buffer dict.
+        """
+        b, t, d = x.shape
+        qkv = x @ self.qkv_w.T + self.qkv_b
+        q, k, v = qkv[..., :d], qkv[..., d : 2 * d], qkv[..., 2 * d :]
+
+        def split_heads(t4: mx.array) -> mx.array:
+            return t4.reshape(b, t4.shape[1], self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+
+        if cache is None:
+            t_total = t
+            kh, vh = split_heads(k), split_heads(v)
+        else:
+            kh, vh = split_heads(k), split_heads(v)
+            cache["k"][:, :, pos : pos + t, :] = kh
+            cache["v"][:, :, pos : pos + t, :] = vh
+            kh = cache["k"][:, :, : pos + t, :]
+            vh = cache["v"][:, :, : pos + t, :]
+        qh = split_heads(q)
+        out = mx.fast.scaled_dot_product_attention(
+            qh, kh, vh, scale=1.0 / math.sqrt(self.head_dim),
+            mask=mask if mask is not None else None)
+        out = out.transpose(0, 2, 1, 3).reshape(b, t, d)
+        out = out @ self.out_w.T + self.out_b
+        if cache is None:
+            return out, kh, vh
+        return out, cache, cache
+
     def run(self, x: mx.array, emb_cond: mx.array | None, mask: mx.array | None,
             k_cache, v_cache, prefill: bool):
         if prefill:
@@ -128,6 +166,17 @@ class T2SBlock:
         x = self._ln(x + attn, 1, emb_cond)
         x = self._ln(x + self._mlp(x), 2, emb_cond)
         return x, k_cache, v_cache
+
+    def run_fastcache(self, x: mx.array, emb_cond: mx.array | None,
+                      cache: dict | None, pos: int, mask: mx.array | None = None):
+        """Prefill (cache=None) or one decode step against a preallocated KV
+        buffer (see _attn_fastcache). Returns (x, cache_a, cache_b): prefill
+        yields the head-split kh/vh to be wrapped into padded buffers; a
+        decode step yields the updated cache dict in both slots."""
+        attn, c1, c2 = self._attn_fastcache(x, cache, mask, pos)
+        x = self._ln(x + attn, 1, emb_cond)
+        x = self._ln(x + self._mlp(x), 2, emb_cond)
+        return x, c1, c2
 
 
 class Text2SemanticDecoder:
@@ -167,7 +216,7 @@ class Text2SemanticDecoder:
     def infer(self, phones: mx.array, bert_feature: mx.array, prompt: mx.array,
               top_k: int = 15, top_p: float = 1.0, temperature: float = 1.0,
               repetition_penalty: float = 1.35, early_stop_num: int | None = None,
-              key: mx.array | None = None) -> mx.array:
+              key: mx.array | None = None, fast_cache: bool = True) -> mx.array:
         """Batch=1 AR decode with KV cache. Returns generated semantic tokens (1, T)."""
         early_stop_num = early_stop_num if early_stop_num is not None else self.early_stop_num
         if key is None:
@@ -194,15 +243,40 @@ class Text2SemanticDecoder:
 
         k_cache: list = [None] * len(self.blocks)
         v_cache: list = [None] * len(self.blocks)
+        caches: list = [None] * len(self.blocks)
+        t_max = src_len + 1500  # decode loop is hard-capped at 1500 steps
         emb_cond = None
         for idx in range(1500):
-            for bi, block in enumerate(self.blocks):
+            if fast_cache:
                 if idx == 0:
-                    out, k_cache[bi], v_cache[bi] = block.run(
-                        out, emb_cond, causal, k_cache[bi], v_cache[bi], prefill=True)
+                    kh_list, vh_list = [], []
+                    for block in self.blocks:
+                        out, kh_i, vh_i = block.run_fastcache(
+                            out, emb_cond, None, 0, mask=causal)
+                        kh_list.append(kh_i)
+                        vh_list.append(vh_i)
+                    # one-time wrap into preallocated buffers (dtype follows
+                    # the computed k/v; slice writes afterwards, no copies)
+                    for bi in range(len(self.blocks)):
+                        kh, vh = kh_list[bi], vh_list[bi]
+                        kb = mx.zeros((1, kh.shape[1], t_max, kh.shape[3]), dtype=kh.dtype)
+                        kb[:, :, :src_len, :] = kh
+                        vb = mx.zeros((1, vh.shape[1], t_max, vh.shape[3]), dtype=vh.dtype)
+                        vb[:, :, :src_len, :] = vh
+                        caches[bi] = {"k": kb, "v": vb}
                 else:
-                    out, k_cache[bi], v_cache[bi] = block.run(
-                        out, emb_cond, None, k_cache[bi], v_cache[bi], prefill=False)
+                    pos = src_len + idx - 1
+                    for bi, block in enumerate(self.blocks):
+                        out, caches[bi], _ = block.run_fastcache(
+                            out, emb_cond, caches[bi], pos)
+            else:
+                for bi, block in enumerate(self.blocks):
+                    if idx == 0:
+                        out, k_cache[bi], v_cache[bi] = block.run(
+                            out, emb_cond, causal, k_cache[bi], v_cache[bi], prefill=True)
+                    else:
+                        out, k_cache[bi], v_cache[bi] = block.run(
+                            out, emb_cond, None, k_cache[bi], v_cache[bi], prefill=False)
             logits = out[:, -1] @ self.ar_predict_layer_w.T
 
             if idx < 11:
