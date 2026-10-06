@@ -289,3 +289,44 @@ decode_encp fea 8.3e-6, single DiT step v_pos 4.1e-5 / v_neg 7.4e-5,
 `tools/e2e_v4.py` → `/Volumes/2T/gpt-sovits-models/bench/mlx/v4.wav`
 (9.52 s, 48 kHz, 137 AR tokens, 32 CFM steps, ~64 s wall, peak RSS 2.7 GB);
 listen check: prompt parroting + target text intelligible, no artifacts.
+
+## v5 addendum (task-7, e2e_v5.py — v5dev/v5turbo, CFMV5 rolling chunks)
+
+The v5 ports (`tools/e2e_v5.py --model dev|turbo`, weights
+gsv-v5-pretrained/{s2Gv5dev,s2Gv5turbo,vocoder}.pth) reuse the v4 DiT/interp
+machinery with the v5 CFM. Findings:
+
+1. **Corrupt-header ckpts.** Both s2Gv5 ckpts are torch zip saves whose first
+   two bytes were overwritten with the version tag (`07`/`08` instead of
+   `PK` — official `my_save2`). Repair = stream-copy with a `PK` header
+   (`.tmp/fix_v5_header.py`). Note: `shutil.copyfile` on this host hung in
+   kernel IO for these files; use explicit read/write loops.
+2. **No d_embed in the v5 family.** `use_step_embedding=False` (models.py
+   builds DiT with `use_step_embedding = version not in V5_VERSIONS`); the
+   ckpts confirm (no `d_embed.*` keys) despite the task brief saying
+   otherwise. `t` is time_embed output alone; dt_cache never used.
+3. **CFMV5 static conditioner cache** (precomputed text_embed + input
+   projection + rope): the MLX DiT `prepare_static_cache` consumes
+   `condition` as (B, C, T) — `CFMV5.inference` receives `mu` as (B, T, C)
+   and passes `mu.transpose(2,1)`. Getting this layout wrong silently
+   broadcasts the sinus pos-embed wrong and crashes at concat.
+4. **Rolling chunk decode** (`synthesize_v5_mel`): reference 500 frames,
+   chunk = min(1000-ref, 640), 32-frame rolling tail for prompt
+   reconstruction after the first chunk, CFG 1.30 (v5dev, 32 steps) /
+   0.0 (v5turbo, 4 steps) via `resolve_sampling`; noise temperature 0.875;
+   steps validated to {4,8,16,32}.
+5. **fp16 source weights** (info: "fp16 converted from …; aligned to
+   s2Gv4.pth keys") are upcast to fp32 at conversion like the other ports.
+
+Parity (official torch CPUFast, this machine, v5dev):
+- ge 5.3e-5; decode_encp fea 5.4e-6; single DiT step (static cache)
+  v_pos 4.2e-5 / v_neg 3.8e-5.
+- Chunk-0 full 32-step Euler+CFG(1.30): **3.0e-5 max, 3.3e-6 mean**
+  (torch ref seeds the CFM noise; injected into the MLX loop for
+  trajectory comparison).
+- vocoder is the same Generator as v4 (identical A/B 6.6e-5).
+
+e2e: `bench/mlx/v5dev.wav` (8.84 s, 120 AR tokens, cfg 1.3) and
+`bench/mlx/v5turbo.wav` (8.40 s, 109 AR tokens, 4 steps, cfg 0.0), both
+48 kHz, listen-verified intelligible with no chunk-boundary artifacts.
+Wall: ~88 s (dev) / ~59 s (turbo), peak RSS 2.3–4.0 GB.
