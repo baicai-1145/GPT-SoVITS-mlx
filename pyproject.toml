@@ -15,6 +15,23 @@ dependencies = [
 # A one-off tokenizer cross-check vs transformers AutoTokenizer: `uv run --with transformers \
 #   pytest -q tests/test_tokenizer.py` (see that file's docstring).
 convert = ["torch>=2.2"]
+# Official text front-end (multi-language G2P via the vendored CPUFast modules).
+# Core inference stays lean; only synthesis with the full language matrix needs these.
+frontend = [
+    "jieba-fast",
+    "pypinyin",
+    "jamo",
+    "ko-pron",
+    "ToJyutping",
+    "split-lang",
+    "g2p-en",
+    "g2pk2",
+    "cn2an",
+    "pyopenjtalk",
+    "nltk",
+    "python-mecab-ko",
+    "fast-langdetect",
+]
 dev = ["pytest>=8.0"]
 
 [tool.pytest.ini_options]
