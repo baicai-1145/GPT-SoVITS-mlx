@@ -86,10 +86,16 @@ def convert_s1(ckpt_path: str, out_dir: str, fp16: bool = True):
         arrays[dst + "qkv_b"] = qkv_b
         arrays[dst + "out_w"] = t(pre + "self_attn.out_proj.weight")
         arrays[dst + "out_b"] = t(pre + "self_attn.out_proj.bias")
-        arrays[dst + "norm1.w"] = t(pre + "norm1.project_layer.weight")
-        arrays[dst + "norm1.b"] = t(pre + "norm1.project_layer.bias")
-        arrays[dst + "norm2.w"] = t(pre + "norm2.project_layer.weight")
-        arrays[dst + "norm2.b"] = t(pre + "norm2.project_layer.bias")
+        if pre + "norm1.project_layer.weight" in sd:
+            arrays[dst + "norm1.w"] = t(pre + "norm1.project_layer.weight")
+            arrays[dst + "norm1.b"] = t(pre + "norm1.project_layer.bias")
+            arrays[dst + "norm2.w"] = t(pre + "norm2.project_layer.weight")
+            arrays[dst + "norm2.b"] = t(pre + "norm2.project_layer.bias")
+        else:
+            arrays[dst + "norm1.g"] = t(pre + "norm1.weight")
+            arrays[dst + "norm1.b"] = t(pre + "norm1.bias")
+            arrays[dst + "norm2.g"] = t(pre + "norm2.weight")
+            arrays[dst + "norm2.b"] = t(pre + "norm2.bias")
         arrays[dst + "mlp1.w"] = t(pre + "linear1.weight")
         arrays[dst + "mlp1.b"] = t(pre + "linear1.bias")
         arrays[dst + "mlp2.w"] = t(pre + "linear2.weight")
@@ -467,3 +473,12 @@ def convert_sovits_v3v5(path: str, out_dir: str, version: str, fp16: bool = True
     with open(os.path.join(out_dir, "sovits.json"), "w") as f:
         json.dump(meta, f, indent=1)
     return len(arrays)
+
+
+def _fuse_wn_hf(g, v):
+    """HF weight_norm(g, v, dim=last): norm over all dims except the last."""
+    g = g.astype(np.float32)
+    v = v.astype(np.float32)
+    axes = tuple(range(v.ndim - 1))
+    norm = np.sqrt(np.sum(v**2, axis=axes, keepdims=True))
+    return g * v / norm
