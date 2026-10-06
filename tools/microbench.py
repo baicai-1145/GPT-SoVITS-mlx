@@ -103,9 +103,9 @@ def _frontend_inputs(models_root: str, cpufast_repo: str) -> dict:
     t = fe.preprocess(DEFAULT_TEXT, "zh", "cut0", "v2")
     return {
         "p_ids": np.asarray(p.phones, dtype=np.int32),
-        "t_ids": np.asarray(t.phones, dtype=np.int32),
+        "t_ids": np.asarray([ph for r in t for ph in r.phones], dtype=np.int32),
         "p_bert": np.asarray(p.bert, dtype=np.float32),
-        "t_bert": np.asarray(t.bert, dtype=np.float32),
+        "t_bert": np.concatenate([r.bert for r in t], axis=1).astype(np.float32),
     }
 
 
@@ -157,9 +157,10 @@ def capture_gpt(component: str, models_root: str, cpufast_repo: str, out_dir: st
     eval_tree(gpt)
     release(arrays)
 
-    all_phones = mx.array([list(fe_inputs["p_ids"]) + list(fe_inputs["t_ids"])], mx.int32)
+    all_phones = mx.array([[int(v) for v in fe_inputs["p_ids"]] + [int(v) for v in fe_inputs["t_ids"]]], mx.int32)
     all_bert = mx.array(np.concatenate([fe_inputs["p_bert"], fe_inputs["t_bert"]], axis=1))[None]
 
+    np.random.seed(0)  # _sample draws from numpy's global RNG (same as e2e)
     t0 = time.perf_counter()
     seq = gpt.infer(all_phones, all_bert, prompt_sem, top_k=15, top_p=1.0,
                     temperature=1.0, repetition_penalty=1.35,
@@ -202,6 +203,7 @@ def bench_gpt(component: str, models_root: str, iters: int, out_dir: str) -> dic
 
     result = {"component": component, "iters": iters}
     for i in range(iters):
+        np.random.seed(0)  # identical stream to the capture run -> parity holds
         t0 = time.perf_counter()
         seq = gpt.infer(phones, bert, prompt, top_k=15, top_p=1.0,
                         temperature=1.0, repetition_penalty=1.35,
