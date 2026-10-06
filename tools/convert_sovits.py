@@ -181,10 +181,12 @@ def convert_sovits_v1v2(path: str, out_dir: str, version: str, sv_path: str | No
     conv_attn("enc_p.enc_text", "enc_p.encoder_text", max_idx("enc_p.encoder_text.attn_layers"))
     conv_attn("enc_p.enc2", "enc_p.encoder2", max_idx("enc_p.encoder2.attn_layers"))
 
-    arrays["enc_p.mrte.c_pre.weight"] = t("enc_p.mrte.c_pre.weight")
+    arrays["enc_p.mrte.c_pre.weight"] = to_mlx_conv1d(t("enc_p.mrte.c_pre.weight"))
     arrays["enc_p.mrte.c_pre.bias"] = t("enc_p.mrte.c_pre.bias")
-    arrays["enc_p.mrte.text_pre.weight"] = t("enc_p.mrte.text_pre.weight")
+    arrays["enc_p.mrte.text_pre.weight"] = to_mlx_conv1d(t("enc_p.mrte.text_pre.weight"))
     arrays["enc_p.mrte.text_pre.bias"] = t("enc_p.mrte.text_pre.bias")
+    arrays["enc_p.mrte.c_post.weight"] = to_mlx_conv1d(t("enc_p.mrte.c_post.weight"))
+    arrays["enc_p.mrte.c_post.bias"] = t("enc_p.mrte.c_post.bias")
     arrays["enc_p.mrte.cross_attn.conv_q.weight"] = to_mlx_conv1d(t("enc_p.mrte.cross_attention.conv_q.weight"))
     arrays["enc_p.mrte.cross_attn.conv_q.bias"] = t("enc_p.mrte.cross_attention.conv_q.bias")
     arrays["enc_p.mrte.cross_attn.conv_k.weight"] = to_mlx_conv1d(t("enc_p.mrte.cross_attention.conv_k.weight"))
@@ -219,36 +221,60 @@ def convert_sovits_v1v2(path: str, out_dir: str, version: str, sv_path: str | No
     # ---- dec (Generator) ----
     arrays["dec.conv_pre.weight"] = to_mlx_conv1d(t("dec.conv_pre.weight"))
     arrays["dec.conv_pre.bias"] = t("dec.conv_pre.bias")
-    n_up = len({k.split(".")[1] for k in sd if k.startswith("dec.ups.")})
+    _up_idxs = [int(re.match(r"dec\.ups\.(\d+)\.", k).group(1))
+                for k in sd if re.match(r"dec\.ups\.(\d+)\.", k)]
+    n_up = (max(_up_idxs) + 1) if _up_idxs else 0
     for i in range(n_up):
-        arrays[f"dec.ups.{i}.weight"] = to_mlx_conv1d_t(t(f"dec.ups.{i}.weight"))
-        arrays[f"dec.ups.{i}.bias"] = t(f"dec.ups.{i}.bias")
+        if f"dec.ups.{i}.weight" in sd:
+            arrays[f"dec.ups.{i}.weight"] = to_mlx_conv1d_t(t(f"dec.ups.{i}.weight"))
+            arrays[f"dec.ups.{i}.bias"] = t(f"dec.ups.{i}.bias")
+        else:
+            arrays[f"dec.ups.{i}.weight"] = to_mlx_conv1d_t(wn(f"dec.ups.{i}"))
+            arrays[f"dec.ups.{i}.bias"] = t(f"dec.ups.{i}.bias")
     n_rb = max_idx("dec.resblocks") + 1
     for i in range(n_rb):
         for cn in ("convs1", "convs2"):
-            nc = len({k.split(".")[3] for k in sd if k.startswith(f"dec.resblocks.{i}.{cn}.")})
+            idxs = [int(re.match(rf"dec\.resblocks\.{i}\.{cn}\.(\d+)\.", k).group(1))
+                    for k in sd
+                    if re.match(rf"dec\.resblocks\.{i}\.{cn}\.(\d+)\.", k)]
+            nc = (max(idxs) + 1) if idxs else 0
             for j in range(nc):
-                arrays[f"dec.resblocks.{i}.{cn}.{j}.weight"] = to_mlx_conv1d(t(f"dec.resblocks.{i}.{cn}.{j}.weight"))
-                arrays[f"dec.resblocks.{i}.{cn}.{j}.bias"] = t(f"dec.resblocks.{i}.{cn}.{j}.bias")
+                key = f"dec.resblocks.{i}.{cn}.{j}"
+                if f"{key}.weight" in sd:
+                    arrays[f"{key}.weight"] = to_mlx_conv1d(t(f"{key}.weight"))
+                else:
+                    arrays[f"{key}.weight"] = to_mlx_conv1d(wn(key))
+                arrays[f"{key}.bias"] = t(f"{key}.bias")
     arrays["dec.cond.weight"] = to_mlx_conv1d(t("dec.cond.weight"))
     arrays["dec.cond.bias"] = t("dec.cond.bias")
     arrays["dec.conv_post.weight"] = to_mlx_conv1d(t("dec.conv_post.weight"))
-    arrays["dec.conv_post.bias"] = t("dec.conv_post.bias")
+    if "dec.conv_post.bias" in sd:
+        arrays["dec.conv_post.bias"] = t("dec.conv_post.bias")
+    else:  # fused as no-bias conv or via weight_norm
+        arrays["dec.conv_post.bias"] = np.zeros(arrays["dec.conv_post.weight"].shape[0], np.float32)
 
-    # ---- flow (weight-norm fused) ----
-    arrays["flow.pre.weight"] = to_mlx_conv1d(t("flow.pre.weight"))
-    arrays["flow.pre.bias"] = t("flow.pre.bias")
-    arrays["flow.post.weight"] = to_mlx_conv1d(t("flow.post.weight"))
-    arrays["flow.post.bias"] = t("flow.post.bias")
+    # ---- flow (weight-norm fused); top-level flow.pre/post only exist in v1 ----
+    if "flow.pre.weight" in sd:
+        arrays["flow.pre.weight"] = to_mlx_conv1d(t("flow.pre.weight"))
+        arrays["flow.pre.bias"] = t("flow.pre.bias")
+        arrays["flow.post.weight"] = to_mlx_conv1d(t("flow.post.weight"))
+        arrays["flow.post.bias"] = t("flow.post.bias")
     n_flow = len([k for k in sd if re.match(r"flow\.flows\.\d+\.enc$", k) or False])
     n_flow = max(int(k.split(".")[2]) for k in sd if k.startswith("flow.flows.")) // 2 + 1
     for fi in range(n_flow):
         base = f"flow.flows.{fi * 2}.enc."
         dst = f"flow.{fi}.enc."
-        arrays[dst + "pre.weight"] = to_mlx_conv1d(t(base + "pre.weight"))
-        arrays[dst + "pre.bias"] = t(base + "pre.bias")
-        arrays[dst + "post.weight"] = to_mlx_conv1d(t(base + "post.weight"))
-        arrays[dst + "post.bias"] = t(base + "post.bias")
+        if base + "pre.weight" in sd:
+            arrays[dst + "pre.weight"] = to_mlx_conv1d(t(base + "pre.weight"))
+            arrays[dst + "pre.bias"] = t(base + "pre.bias")
+            arrays[dst + "post.weight"] = to_mlx_conv1d(t(base + "post.weight"))
+            arrays[dst + "post.bias"] = t(base + "post.bias")
+        # v2/v3 ckpts: layer-level pre/post outside enc
+        elif f"flow.flows.{fi * 2}.pre.weight" in sd:
+            arrays[f"flow.{fi}.pre.weight"] = to_mlx_conv1d(t(f"flow.flows.{fi * 2}.pre.weight"))
+            arrays[f"flow.{fi}.pre.bias"] = t(f"flow.flows.{fi * 2}.pre.bias")
+            arrays[f"flow.{fi}.post.weight"] = to_mlx_conv1d(t(f"flow.flows.{fi * 2}.post.weight"))
+            arrays[f"flow.{fi}.post.bias"] = t(f"flow.flows.{fi * 2}.post.bias")
         arrays[dst + "cond"] = np.ascontiguousarray(np.transpose(wn(base + "cond_layer"), (0, 2, 1)))
         arrays[dst + "cond.b"] = t(base + "cond_layer.bias")
         n_wn = max_idx(base + "in_layers")

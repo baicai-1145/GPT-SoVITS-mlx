@@ -18,6 +18,7 @@ from ..utils.layers import (
 )
 from .attentions import Encoder
 from .mrte import MRTE, MelStyleEncoder
+from .quantizer import ResidualVectorQuantizer
 
 
 class TextEncoder(nn.Module):
@@ -259,6 +260,7 @@ class SynthesizerTrn(nn.Module):
             self.sv_emb = ConvlessLinear(20480, gin_channels)
             self.ge_to512 = ConvlessLinear(gin_channels, 512)
             self.prelu_weight = mx.ones((gin_channels,))
+        self.quantizer = ResidualVectorQuantizer(mx.zeros((1024, ssl_dim)))
 
     # -- reference embedding ------------------------------------------------
     def get_ge(self, refer: mx.array, sv_emb_raw: mx.array | None = None) -> mx.array:
