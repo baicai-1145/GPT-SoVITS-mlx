@@ -63,6 +63,15 @@ _G2PW_SUBS_STUB = ("text.g2pw.compact_pypinyin", "text.g2pw.pronunciation",
                    "text.g2pw.utils", "text.g2pw.dataset")
 
 _loaded_repo: str | None = None
+_MISSING = object()
+_saved_modules: dict = {}
+
+
+def _preserve_shadowed(name: str) -> None:
+    """Remember a sys.modules entry the vendored load is about to
+    shadow so it can be restored afterwards (see load_cpufront)."""
+    if name not in _saved_modules:
+        _saved_modules[name] = sys.modules.get(name)
 
 
 def _exec_module(fullname: str, path: str) -> types.ModuleType:
@@ -124,6 +133,10 @@ def load_cpufront(explicit: str | None = None) -> str:
         return _loaded_repo
 
     repo = cpufast_repo(explicit)
+    # The official modules exec with CWD + "." in sys.path pointing at
+    # the CPUFast repo; any same-named top-level package found there
+    # (notably CPUFast tools/) must not shadow the caller's afterwards.
+    _preserve_shadowed("tools")
     text_dir = os.path.join(repo, "GPT_SoVITS", "text")
     tts_dir = os.path.join(repo, "GPT_SoVITS", _TTS_PKG)
 
@@ -187,6 +200,11 @@ def load_cpufront(explicit: str | None = None) -> str:
                  os.path.join(tts_dir, "text_segmentation_method.py"))
 
     _loaded_repo = repo
+    prev = _saved_modules.get("tools", _MISSING)
+    if prev is None or prev is _MISSING:
+        sys.modules.pop("tools", None)
+    else:
+        sys.modules["tools"] = prev
     return repo
 
 

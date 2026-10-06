@@ -83,13 +83,27 @@ def test_static_regression_cells():
         pytest.skip("refenv python / CPUFast / G2PW assets not available")
     refs = json.loads(refs_path.read_text())
     fe = _front_fe()
-    for cell_json, want in refs["cells"].items():
-        cell = json.loads(cell_json)
-        if cell.get("kind") == "prompt":
-            r = fe.segment_prompt(cell["text"], cell["lang"], cell["version"])
-        else:
-            r = fe.get_phones_and_bert(cell["text"], cell["lang"], cell["version"])
-        assert _digest(r.phones, r.bert) == want, f"cell {cell} drifted"
+    cwd = os.getcwd()
+    try:
+        for cell_json, want in refs["cells"].items():
+            cell = json.loads(cell_json)
+            if cell.get("kind") == "prompt":
+                r = fe.segment_prompt(cell["text"], cell["lang"], cell["version"])
+                digest = _digest(r.phones, r.bert)
+            elif cell.get("kind") == "bench_combined":
+                p = fe.segment_prompt(cell["ref_text"], cell["lang"], cell["version"])
+                t = fe.preprocess(cell["text"], cell["lang"], "cut0", cell["version"])
+                t_ids = [ph for seg in t for ph in seg.phones]
+                t_bert = np.concatenate([seg.bert for seg in t], axis=1)
+                digest = _digest(list(p.phones) + t_ids,
+                                 np.concatenate([p.bert, t_bert], axis=1))
+            else:
+                r = fe.get_phones_and_bert(cell["text"], cell["lang"], cell["version"])
+                digest = _digest(r.phones, r.bert)
+            assert digest == want, f"cell {cell} drifted"
+    finally:
+        # the front-end chdirs into the CPUFast repo; restore for other tests
+        os.chdir(cwd)
 
 
 @pytest.mark.static
@@ -109,12 +123,28 @@ def test_lang_segmenter_equivalence():
         sys.path.insert(0, repo_root)
     from gsovits_mlx.text.lang_segmenter import get_texts as ours
 
+    # PATH HYGIENE: inserting CPUFAST lets the official package shadow our
+    # own top-level names (tools/, GPT_SoVITS/) for every later import in
+    # the process. Scope it: import the official module through a temp
+    # sys.path + sys.modules save/restore so nothing leaks to other tests.
+    saved_sys_path = list(sys.path)
+    saved_modules = {k: sys.modules.get(k) for k in
+                     ("text", "text.LangSegmenter", "text.LangSegmenter.langsegmenter",
+                      "split_lang", "fast_langdetect")}
     sys.path.insert(0, os.path.join(CPUFAST, "GPT_SoVITS"))
     sys.path.insert(0, CPUFAST)
     try:
         from text.LangSegmenter import LangSegmenter  # noqa: F401
+        official_get_texts = LangSegmenter.getTexts
     except ImportError:
         pytest.skip("official LangSegmenter import failed (missing deps)")
+    finally:
+        sys.path[:] = saved_sys_path
+        for k, v in saved_modules.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
 
     texts = [t for _, t, _, _ in CORPUS] + [
         "MyGO?,你也喜欢まいご吗？",
@@ -123,7 +153,7 @@ def test_lang_segmenter_equivalence():
     ]
     for t in texts:
         for dl in ("", "zh", "ja", "ko"):
-            assert ours(t, dl) == LangSegmenter.getTexts(t, dl), (t, dl)
+            assert ours(t, dl) == official_get_texts(t, dl), (t, dl)
 
 
 def test_non_zh_bert_is_zero():
