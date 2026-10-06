@@ -185,7 +185,7 @@ def main() -> None:
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     from gsovits_mlx.gpu_lock import resolve_device
-    resolve_device(flag_gpu=args.gpu, verbose=True)
+    device = resolve_device(flag_gpu=args.gpu, verbose=True)
     if not args.frontend_only:
         from gsovits_mlx.gpu_lock import require_gpu_for_pipeline
         require_gpu_for_pipeline("gpu" if args.gpu else "cpu",
@@ -230,7 +230,7 @@ def main() -> None:
     # stages run under the gpu.lock discipline; the front-end only needs
     # Metal for front-end-only speed runs (GSOVITS_FRONTEND_DEVICE=gpu).
     fe = TextFrontend(models_root=args.models_root, lazy=True,
-                      device=os.environ.get("GSOVITS_FRONTEND_DEVICE", "cpu"))
+                      device=device)  # process device from resolve_device (never re-pin)
     prompt_lang = args.prompt_lang or args.lang
 
     def frontend_run():

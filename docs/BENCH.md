@@ -105,6 +105,42 @@ residency: v5dev best run 1.66 GB vs 6.4 GB in the fp32-era table (fp16
 sovits halves the mmap+GPU-resident weight footprint).
 The wav anchors above are the authoritative parity evidence.
 
+## prompt_codes decomposition + device-gate regression (task-4)
+
+Stage accounting split (`[bench] model_load` line in all 6 entry points,
+commit c5a3cdd): prompt_codes previously conflated model load+first-touch
+with compute. Measured alone (fixed 16k wav + 9600 zeros, GPU, one
+process per version):
+
+| stage | v2 | v3 | v5turbo |
+|---|---|---|---|
+| sovits load (in-stage) | 1.32 s | 12.4 s | 11.4 s |
+| HuBERT forward warm | 0.046 s | 0.046 s | 0.048 s |
+| extract_latent warm | 0.0008 s | 0.0008 s | 0.0008 s |
+
+- Warm prompt_codes = **0.19 s** (target <0.5 s met); compute was never the
+  problem — the 26-32 s stage times were cold-load (NAS read + full
+  safetensors materialization + first-touch compile) counted inside the
+  stage. Codes bit-identical across v2/v3/v5turbo (sum 53426, len 101).
+- mx.compile A/B (HuBERT forward + whole stage): codes identical, warm
+  44 ms vs 47 ms plain (noise), but +1.7 s cold compile cost per process —
+  NOT wired (prompt_codes runs once per process; compile is a net loss
+  here). Revisit only if stages become warm-reusable.
+- Cold-start to first codes remains dominated by sovits load (~12 s on
+  v3-family from /Volumes/2T); load-side speedup is P0-B territory
+  (lazy/mmap loading), out of this task's scope.
+- REGRESSION found+fixed en route: f37e37f/3cd0ecf left TextFrontend
+  defaulting to GSOVITS_FRONTEND_DEVICE=cpu, and its __init__ calls
+  mx.set_default_device(cpu) — PROCESS-GLOBAL — after the gpu gate had
+  approved Metal. v3-family CFM silently produced ALL-ZERO audio at
+  ~100x slowdown (v3 sovits+vocoder 300 s, wav peak 0.0); v1/v2 rendered
+  30-100x slow. Fix d3e5732 threads resolve_device()'s result through;
+  verification: v3 e2e --gpu sovits+vocoder 24.6 s, wav corr 0.99991 vs
+  the seed-0 anchor, 113 tokens, 101 codes. Related guard fix 2f94ec0:
+  the frontend GPU-guard's hardcoded perf-frontend/task-2 owner whitelist
+  replaced by the anonymous fresh-lock contract (location-correct: walks
+  from module __file__, not CWD, which bootstrap() chdirs away).
+
 ## GEMM microbenchmark
 
 `tools/gemm_bench.py` (square fp16 matmul, MLX Metal GPU, includes launch

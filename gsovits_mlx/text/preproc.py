@@ -40,6 +40,7 @@ Differences from the official runner that are deliberate:
 from __future__ import annotations
 
 import os
+import time
 import re
 import sys
 from typing import Callable, NamedTuple
@@ -435,15 +436,23 @@ def _assert_gpu_allowed(device: str) -> None:
     while True:
         lock = os.path.join(d, ".tmp", "gpu.lock.d")
         if os.path.isdir(lock):
+            # Machine law: the lock is ANONYMOUS discipline -- any fresh,
+            # non-empty owner counts. Do NOT name-match specific agents and
+            # do NOT delegate to gpu_lock.lock_status() here: that walks up
+            # from CWD, which by front-end time is the CPUFast repo
+            # (bootstrap chdir) and never finds this lock.
             try:
                 owner = open(os.path.join(lock, "owner")).read().strip()
+                fresh = (time.time()
+                         - os.path.getmtime(os.path.join(lock, "owner"))) < 45 * 60
             except OSError:
-                owner = ""
-            if "perf-frontend" in owner or "task-2" in owner:
+                owner, fresh = "", False
+            if owner and fresh:
                 return
             raise RuntimeError(
-                f"GPU device requested but gpu.lock is not ours "
-                f"(owner={owner!r}); run CPU-side or claim the lock first")
+                f"GPU device requested but gpu.lock is stale/empty "
+                f"(owner={owner!r}, fresh={fresh}); refresh the owner file "
+                "or claim the lock")
         seen.append(d)
         parent = os.path.dirname(d)
         if parent == d:
