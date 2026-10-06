@@ -104,7 +104,8 @@ class HubertModel:
         self.proj_b = g("feature_projection.projection.bias")
         # pos conv: torch grouped (768, 48, 128) groups=16 -> MLX (768, 128, 48); pad 63 both sides, stride 1
         pw = g("encoder.pos_conv_embed.conv.weight")
-        self.pos_weight = mx.transpose(pw, (0, 2, 1)) if pw.shape[1] != pw.shape[2] else pw
+        # torch (out=768, in/groups=48, kernel=128); mlx conv1d wants (out, kernel, in/groups)
+        self.pos_weight = mx.transpose(pw, (0, 2, 1))
         self.pos_groups = 16
         self.pos_bias = g("encoder.pos_conv_embed.conv.bias")
         self.enc_ln_w = g("encoder.layer_norm.weight")
@@ -132,10 +133,10 @@ class HubertModel:
         x = self._conv_front(wav)
         x = mx.fast.layer_norm(x, self.feat_ln_w, self.feat_ln_b, self.eps)
         x = x @ self.proj_w.T + self.proj_b
-        # pos conv
+        # pos conv: pad 64 both sides, conv (out T+1), KEEP FIRST T frames (torch HubertSamePad semantics)
         xp = mx.pad(x, [(0, 0), (64, 64), (0, 0)])
         pe = mx.conv1d(xp, self.pos_weight, stride=1, groups=self.pos_groups)
-        pe = pe[:, :-1, :]  # HubertSamePadLayer trims last frame (even kernel)
+        pe = pe[:, : x.shape[1], :]
         pe = pe + self.pos_bias[None, None, :]
         x = x + _gelu(pe)
         x = mx.fast.layer_norm(x, self.enc_ln_w, self.enc_ln_b, self.eps)

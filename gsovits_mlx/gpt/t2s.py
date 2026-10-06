@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 
 import mlx.core as mx
+import numpy as np
 import mlx.nn as nn
 
 NEG_INF = -1e9
@@ -119,14 +120,10 @@ class T2SBlock:
             k_cache, v_cache, prefill: bool):
         if prefill:
             attn, k_out, v_out = self._attn(x, None, None, mask)
-            k_cache = list(k_cache) if k_cache else []
-            v_cache = list(v_cache) if v_cache else []
-            k_cache.append(k_out)
-            v_cache.append(v_out)
+            k_cache = k_out  # (b, t, d) for this block
+            v_cache = v_out
         else:
-            attn, k_new, v_new = self._attn(x, k_cache[0], v_cache[0], None)
-            k_cache[0] = k_new
-            v_cache[0] = v_new
+            attn, k_cache, v_cache = self._attn(x, k_cache, v_cache, None)
         # post-norm
         x = self._ln(x + attn, 1, emb_cond)
         x = self._ln(x + self._mlp(x), 2, emb_cond)
@@ -173,6 +170,8 @@ class Text2SemanticDecoder:
               key: mx.array | None = None) -> mx.array:
         """Batch=1 AR decode with KV cache. Returns generated semantic tokens (1, T)."""
         early_stop_num = early_stop_num if early_stop_num is not None else self.early_stop_num
+        if key is None:
+            key = mx.random.key(0)
         x = self._text_embed(phones, bert_feature)
         x_len = x.shape[1]
         y = prompt
@@ -183,29 +182,39 @@ class Text2SemanticDecoder:
         out = mx.concatenate([x, y_pos], axis=1)
 
         src_len = x_len + prefix_len
-        causal = mx.triu(mx.full((src_len, src_len), NEG_INF, mx.float32), k=1)[None, None]
-        causal[:, :, :x_len, :x_len] = 0
+        # Mask semantics (torch infer_panel_naive):
+        #   x rows: attend x only (y columns blocked)
+        #   y rows: x columns always visible; causal only within the y block
+        x_rows = mx.concatenate(
+            [mx.zeros((x_len, x_len), mx.float32),
+             mx.full((x_len, prefix_len), NEG_INF, mx.float32)], axis=1)
+        y_causal = mx.triu(mx.full((prefix_len, prefix_len), NEG_INF, mx.float32), k=1)
+        y_rows = mx.concatenate([mx.zeros((prefix_len, x_len), mx.float32), y_causal], axis=1)
+        causal = mx.concatenate([x_rows, y_rows], axis=0)[None, None]
 
-        k_cache: list = []
-        v_cache: list = []
+        k_cache: list = [None] * len(self.blocks)
+        v_cache: list = [None] * len(self.blocks)
         emb_cond = None
         for idx in range(1500):
-            for block in self.blocks:
+            for bi, block in enumerate(self.blocks):
                 if idx == 0:
-                    out, k_cache, v_cache = block.run(out, emb_cond, causal, k_cache, v_cache,
-                                                      prefill=True)
+                    out, k_cache[bi], v_cache[bi] = block.run(
+                        out, emb_cond, causal, k_cache[bi], v_cache[bi], prefill=True)
                 else:
-                    out, k_cache, v_cache = block.run(out, emb_cond, None, k_cache, v_cache,
-                                                      prefill=False)
+                    out, k_cache[bi], v_cache[bi] = block.run(
+                        out, emb_cond, None, k_cache[bi], v_cache[bi], prefill=False)
             logits = out[:, -1] @ self.ar_predict_layer_w.T
 
             if idx < 11:
                 logits = logits[:, :-1]  # EOS forbidden for first 10 tokens
 
-            sample = _sample(logits, y, top_k, top_p, temperature, repetition_penalty, key)
+            key, step_key = mx.random.split(key)
+            sample = _sample(logits, y, top_k, top_p, temperature, repetition_penalty, step_key)
             y = mx.concatenate([y, sample], axis=1)
 
-            if int(sample[0, 0]) == self.EOS:
+            # torch: stop when argmax(logits)==EOS OR sampled token==EOS
+            amax = int(mx.argmax(logits[0]))
+            if amax == self.EOS or int(sample[0, 0]) == self.EOS:
                 if y.shape[1] == prefix_len:
                     y = mx.concatenate([y, mx.zeros((1, 1), mx.int32)], axis=1)
                 break
@@ -242,7 +251,12 @@ def _sample(logits: mx.array, previous_tokens: mx.array, top_k: int, top_p: floa
         kth = mx.sort(logits, axis=-1)[:, -top_k][:, None]
         logits = mx.where(logits < kth, NEG_INF, logits)
     probs = mx.softmax(logits, axis=-1)
-    q = mx.random.uniform(shape=probs.shape, key=key)
+    # One uniform per row (batch), not per column. Inverse-CDF over the row distribution.
     cdf = mx.cumsum(probs, axis=-1)
-    idx = mx.argmax((cdf > q).astype(mx.int32), axis=-1)
-    return idx[:, None].astype(mx.int32)
+    u = np.random.random((probs.shape[0],))
+    idx_np = np.empty((probs.shape[0],), dtype=np.int64)
+    cdf_np = np.asarray(cdf)
+    for b in range(probs.shape[0]):
+        idx_np[b] = np.searchsorted(cdf_np[b], u[b], side='right')
+        idx_np[b] = min(idx_np[b], probs.shape[-1] - 1)
+    return mx.array(idx_np)[:, None].astype(mx.int32)

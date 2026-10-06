@@ -46,12 +46,18 @@ def resample_linear(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
 
 
 def load_audio_16k(path: str) -> np.ndarray:
-    """Decode any audio file to float32 mono 16 kHz using ffmpeg."""
-    import subprocess
-    cmd = ["ffmpeg", "-v", "error", "-i", path, "-ac", "1", "-ar", "16000",
-           "-f", "f32le", "-"]
-    raw = subprocess.run(cmd, capture_output=True, check=True).stdout
-    return np.frombuffer(raw, dtype=np.float32)
+    """Decode any audio file to float32 mono 16 kHz.
+
+    Uses soundfile (libsndfile) with numpy linear resampling. ffmpeg f32le
+    output on this machine produced out-of-range samples (max 1.52 on a
+    clean int16 file), so it is avoided.
+    """
+    import soundfile as sf
+    data, sr = sf.read(path, dtype="float32", always_2d=True)
+    mono = data.mean(axis=1)
+    if sr != 16000:
+        mono = resample_linear(mono, sr, 16000)
+    return mono
 
 
 # ---------------------------------------------------------------------------
