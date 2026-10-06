@@ -24,6 +24,7 @@ Requires the GPT-SoVITS-CPUFast checkout ONLY for the text front-end
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -278,6 +279,8 @@ def main() -> None:
     # all_bert = concat(prompt_bert, target_bert) along time -- official layout
     all_bert = mx.array(np.concatenate([np.asarray(p_bert), np.asarray(t_bert)], axis=1))[None]  # (1, 1024, Tp+Tt)
     mx.eval(all_phones, all_bert)
+    del p_bert, t_bert
+    gc.collect()
     times["frontend"] = time.perf_counter() - t0
     times["frontend_cache_hit"] = cache_hit
     if args.bench:
@@ -295,10 +298,14 @@ def main() -> None:
                      json.load(open(os.path.join(hubert_dir, "config.json"))))
     h = hb(mx.array(wav16k[None]))
     mx.eval(h)
+    hx = mx.transpose(h, (0, 2, 1))
+    del hb, h, wav16k
+    gc.collect()
     t_load = time.perf_counter()
     sov, _meta = load_sovits_v3(os.path.join(args.models_root, version), version)
     times["model_load"] = time.perf_counter() - t_load
-    prompt_sem = sov.extract_latent(mx.transpose(h, (0, 2, 1)))  # (1, Tp) int
+    prompt_sem = sov.extract_latent(hx)  # (1, Tp) int
+    del hx
     mx.eval(prompt_sem)
     times["prompt_codes"] = time.perf_counter() - t0
     if args.bench:
@@ -324,6 +331,8 @@ def main() -> None:
                     repetition_penalty=args.repetition_penalty,
                     early_stop_num=args.early_stop_num, key=mx.random.key(args.seed))
     mx.eval(seq)
+    del gpt
+    gc.collect()
     times["ar"] = time.perf_counter() - t0
     n_gen = seq.shape[1]
     if args.bench:
@@ -340,6 +349,8 @@ def main() -> None:
                                   refer=refer, ge=ge)
     fea_todo, _ = sov.decode_encp(all_codes, all_phones, refer=refer, ge=ge, speed=1.0)
     mx.eval(fea_ref, fea_todo)
+    del ge, refer_mask
+    gc.collect()
 
     # prompt mel2: mel_fn_v4 (100-mel, 1280/320 @ 32 kHz, center=False) on the ref
     # audio resampled to 32 kHz, then norm_spec (same as v4)
@@ -354,10 +365,14 @@ def main() -> None:
                             key=mx.random.key(args.seed))
     pred = denorm_spec(mel)
     mx.eval(pred)
+    del fea_ref, fea_todo, mel2, all_codes, mel
+    gc.collect()
 
     voc = load_vocoder_v4(os.path.join(args.models_root, "v5_vocoder"))
     audio = voc(pred)
     mx.eval(audio)
+    del pred
+    gc.collect()
     times["sovits_vocoder"] = time.perf_counter() - t0
 
     # vocoder upsamples 480x per mel frame (48 kHz)
@@ -365,6 +380,8 @@ def main() -> None:
     from gsovits_mlx._audio_check import assert_audible
     assert_audible(audio_np, context=f"{args.out} pre-write")
 
+    del audio
+    gc.collect()
     sf.write(args.out, audio_np, 48000)
     if args.bench:
         rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

@@ -19,7 +19,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .gpt.t2s import Text2SemanticDecoder
-from .io import load_mlx_safetensors
+from .io import eval_tree, load_mlx_safetensors, release
 from .sovits.models_v1v2 import SynthesizerTrn
 from .sovits.models_v3 import SynthesizerTrnV3
 from .sovits.dit import load_dit_params
@@ -118,7 +118,10 @@ def _load_sovits_v1v2(path: str, version: str):
         m.sv_emb.weight, m.sv_emb.bias = g("sv_emb.weight"), g("sv_emb.bias")
         m.ge_to512.weight, m.ge_to512.bias = g("ge_to512.weight"), g("ge_to512.bias")
         m.prelu_weight = g("prelu.weight").reshape(1, -1, 1)
-    mx.eval(m.parameters())
+    # m.param holds array copies; the mmap-backed mapping can be dropped now.
+    m.param = None
+    eval_tree(m)
+    release(arrays)
     return m, meta
 
 
@@ -127,7 +130,8 @@ def load_gpt(path: str) -> Text2SemanticDecoder:
     meta = json.load(open(os.path.join(path, "gpt.json")))
     gpt = Text2SemanticDecoder(meta["config"])
     gpt.load(dict(arrays))
-    mx.eval(list(gpt.__dict__.values()))
+    eval_tree(gpt)
+    release(arrays)
     return gpt
 
 
@@ -222,7 +226,8 @@ def load_sovits_v3(path: str, version: str = "v3"):
         m.linear_mel.weight, m.linear_mel.bias = g("linear_mel.weight"), g("linear_mel.bias")
     load_dit_params(m.cfm.estimator, arrays, meta["dit"]["depth"],
                     meta["dit"]["text_blocks"], has_d_embed=version not in {"v5", "v5dev", "v5turbo"})
-    mx.eval(m.parameters())
+    eval_tree(m)
+    release(arrays)
     return m, meta
 
 
@@ -248,7 +253,8 @@ def load_vocoder_v4(path: str):
             rb.convs2[j].bias = g(f"resblocks.{b}.convs2.{j}.bias")
     voc.conv_post.weight = g("conv_post.weight")
     voc.conv_post.bias = g("conv_post.bias")
-    mx.eval(voc.parameters())
+    eval_tree(voc)
+    release(arrays)
     return voc
 
 
@@ -302,7 +308,8 @@ def load_sv_encoder(path: str):
     missing = [k for k in arrays if ("running" in k or k.endswith(".weight") or k.endswith(".bias"))
                and not k.endswith("num_batches_tracked")
                and all(a.get(k) is None for a in [arrays])]
-    mx.eval(m.__dict__.values() if False else [])
+    eval_tree(m)
+    release(arrays)
     return m, h
 
 
@@ -336,7 +343,8 @@ def load_bigvgan(path: str):
     voc.conv_post.weight = g("conv_post.weight")
     if voc.use_bias_at_final:
         voc.conv_post.bias = g("conv_post.bias")
-    mx.eval(voc.parameters())
+    eval_tree(voc)
+    release(arrays)
     return voc
 
 
@@ -376,10 +384,16 @@ def cfm_chunked_decode_v4(model: SynthesizerTrnV3, fea_ref: mx.array, fea_todo: 
 def _cfm_chunked_decode(model: SynthesizerTrnV3, fea_ref: mx.array, fea_todo: mx.array,
                         mel2: mx.array, sample_steps: int,
                         inference_cfg_rate: float, key: mx.array | None,
-                        T_ref: int, T_chunk: int) -> mx.array:
+                        T_ref: int, T_chunk: int, *, memory_efficient: bool = True) -> mx.array:
     """Shared chunked CFM loop (using_vocoder_synthesis): crops the prompt to the
     last T_ref frames, then slides chunk_len = T_chunk - T_min windows; each chunk's
-    CFM result beyond the prompt becomes the next prompt."""
+    CFM result beyond the prompt becomes the next prompt.
+
+    memory_efficient=True evaluates and frees each chunk as soon as the next
+    rolling prompt is sliced off (physical footprint = one chunk + running
+    result buffer) instead of retaining the whole chunk graph list; array
+    contents are identical.
+    """
     T_min = min(mel2.shape[2], fea_ref.shape[2])
     mel2 = mel2[:, :, :T_min]
     fea_ref = fea_ref[:, :, :T_min]
@@ -388,7 +402,7 @@ def _cfm_chunked_decode(model: SynthesizerTrnV3, fea_ref: mx.array, fea_todo: mx
         fea_ref = fea_ref[:, :, -T_ref:]
         T_min = T_ref
     chunk_len = T_chunk - T_min
-    cfm_resss = []
+    cfm_resss: list[mx.array] = []
     idx = 0
     while True:
         fea_todo_chunk = fea_todo[:, :, idx : idx + chunk_len]
@@ -402,5 +416,15 @@ def _cfm_chunked_decode(model: SynthesizerTrnV3, fea_ref: mx.array, fea_todo: mx
         cfm_res = cfm_res[:, :, mel2.shape[2]:]
         mel2 = cfm_res[:, :, -T_min:]
         fea_ref = fea_todo_chunk[:, :, -T_min:]
-        cfm_resss.append(cfm_res)
+        if memory_efficient:
+            # Realize this chunk (and the DiT graphs behind it) now so the
+            # eager graph dies here instead of piling up across chunks; the
+            # rolling mel2/fea_ref slices keep their (now realized) buffers.
+            cfm_resss.append(cfm_res)
+            mx.eval(cfm_res)
+            fea = None
+            fea_todo_chunk = None
+            cfm_res = None
+        else:
+            cfm_resss.append(cfm_res)
     return mx.concatenate(cfm_resss, 2)

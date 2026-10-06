@@ -1,4 +1,13 @@
-"""CFM (v3/v4 Euler flow) and CFMV5 rolling-chunk sampler. Pure MLX."""
+"""CFM (v3/v4 Euler flow) and CFMV5 rolling-chunk sampler. Pure MLX.
+
+Memory notes (task-3): the Euler loops eval the flow state ``x`` every step
+and realize the conditioner/static caches once after creation. Without
+this, every step's DiT graph stays referenced by the next step's inputs
+(text/dt caches) and the whole 32-step (x2 with CFG) graph materializes at
+the caller's final eval — the end-of-run footprint spike. Evals are
+placement-only: noise is drawn once per ``inference`` call, so trajectories
+are bitwise identical to the un-evaluated graph.
+"""
 
 from __future__ import annotations
 
@@ -91,6 +100,10 @@ class CFM:
             x = x + d * v_pred
             t_val += d
             x[:, :, :prompt_len] = 0
+            # Realize the flow state now; this transitively realizes the
+            # text/dt caches consumed this step, so the previous step's graph
+            # is not retained by the next one.
+            mx.eval(x)
         return x
 
 
@@ -118,6 +131,8 @@ class CFMV5:
         condition = mx.transpose(mu, (0, 2, 1))
         cache_enabled = bool(self.use_conditioner_cache and self.use_static_cache)
         cache = self.estimator.prepare_static_cache(prompt_x, x_lens, condition) if cache_enabled else None
+        if cache is not None:
+            mx.eval(*cache.values())
         text_cache = None
         step = 1.0 / steps
         for index in range(steps):
@@ -140,6 +155,9 @@ class CFMV5:
                 velocity = velocity + cfg * (velocity - negative)
             x = x + step * velocity
             x[:, :, :prompt_len] = 0
+            # Realize the flow state now (covers the static-cache and
+            # text_cache inputs of this step); keeps residency at one step.
+            mx.eval(x)
         return x
 
 
@@ -180,6 +198,9 @@ def synthesize_v5_mel(model, reference_features: mx.array, target_features: mx.a
         results.append(generated)
         rolling_mel = generated[:, :, -reference_frames:].astype(reference_mel.dtype)
         rolling_features = target[:, :, -reference_frames:]
+        # Realize the chunk now: the rolling prompts above must not keep the
+        # whole chunk's DiT graph alive until the final concatenate.
+        mx.eval(rolling_mel, rolling_features, *results)
     if not results:
         raise ValueError("V5 requires nonempty target semantic features")
     return mx.concatenate(results, axis=-1)

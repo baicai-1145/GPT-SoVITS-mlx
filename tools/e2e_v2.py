@@ -18,6 +18,7 @@ Requires the GPT-SoVITS-CPUFast checkout ONLY for the text front-end
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -193,7 +194,7 @@ def main() -> None:
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     from gsovits_mlx.text.bert_tokenizer import encode_text, find_tokenizer_json, load_bert_tokenizer
-    from gsovits_mlx.io import load_mlx_safetensors
+    from gsovits_mlx.io import eval_tree, load_mlx_safetensors, release
     from gsovits_mlx.text.bert import BertModel
     from gsovits_mlx.text.hubert import HubertModel
     from gsovits_mlx.text.mel_frontend import spectrogram
@@ -268,6 +269,8 @@ def main() -> None:
     # all_bert = concat(prompt_bert, target_bert) along time -- official layout
     all_bert = mx.array(np.concatenate([np.asarray(p_bert), np.asarray(t_bert)], axis=1))[None]  # (1, 1024, Tp+Tt)
     mx.eval(all_phones, all_bert)
+    del p_bert, t_bert
+    gc.collect()
     times["frontend"] = time.perf_counter() - t0
     if args.bench:
         print(f"[bench] frontend: phones={all_phones.shape} bert={all_bert.shape} "
@@ -285,10 +288,14 @@ def main() -> None:
                      json.load(open(os.path.join(hubert_dir, "config.json"))))
     h = hb(mx.array(wav16k[None]))
     mx.eval(h)
+    hx = mx.transpose(h, (0, 2, 1))
+    del hb, h, wav16k
+    gc.collect()
     t_load = time.perf_counter()
     sov, _meta = _load_sovits_v1v2(os.path.join(args.models_root, "v2"), "v2")
     times["model_load"] = time.perf_counter() - t_load
-    codes = sov.extract_latent(mx.transpose(h, (0, 2, 1)))
+    codes = sov.extract_latent(hx)
+    del hx
     mx.eval(codes)
     # extract_latent -> (B, T, 1); flatten trailing dims to (B, T) = official
     # prompt_semantic (codes[0, 0] on the torch (B, 1, T) layout).
@@ -321,6 +328,8 @@ def main() -> None:
                     repetition_penalty=args.repetition_penalty,
                     early_stop_num=args.early_stop_num, key=mx.random.key(args.seed))
     mx.eval(seq)
+    del gpt
+    gc.collect()
     times["ar"] = time.perf_counter() - t0
     n_gen = seq.shape[1]
     if args.bench:
@@ -337,9 +346,15 @@ def main() -> None:
     times["sovits"] = time.perf_counter() - t0
 
     n_out = int(y_mask.shape[2] * 960)  # 2*480 samples per semantic frame
+    # Realize the audio BEFORE dropping the intermediates, then convert to
+    # numpy with the mx graph already dead (end-of-run footprint spike fix).
+    mx.eval(audio)
     audio_np = np.array(audio)[0, 0][:n_out]
     from gsovits_mlx._audio_check import assert_audible
     assert_audible(audio_np, context=f"{args.out} pre-write")
+    # drop the mx graph before the disk write (memory hygiene)
+    del audio, y_mask, all_codes
+    gc.collect()
 
     sf.write(args.out, audio_np, 32000)
     if args.bench:
