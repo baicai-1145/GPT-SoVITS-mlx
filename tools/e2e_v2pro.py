@@ -214,7 +214,6 @@ def main() -> None:
     times: dict[str, float] = {}
 
     import mlx.core as mx
-    import numpy as np
     import soundfile as sf
     
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
