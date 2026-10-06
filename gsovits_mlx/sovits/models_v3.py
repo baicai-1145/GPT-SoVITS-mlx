@@ -1,4 +1,8 @@
-"""SynthesizerTrnV3 for v3/v4/v5dev/v5turbo. Pure MLX."""
+"""SynthesizerTrnV3 for v3/v4/v5dev/v5turbo. Pure MLX.
+
+Reference: GPT-SoVITS-CPUFast module/models.py SynthesizerTrnV3 (inference path:
+decode_encp / extract_latent only; training forward omitted).
+"""
 
 from __future__ import annotations
 
@@ -14,7 +18,8 @@ from .quantizer import ResidualVectorQuantizer
 
 
 class WNEncoder(nn.Module):
-    """models.WNEncoder (pre -> WN(gin) -> proj); checkpoint has no final norm."""
+    """models.Encoder (models.py:397) as used for wns1: pre -> WN(gin) -> proj.
+    Checkpoint has no final norm; returns (out, x_mask)."""
 
     def __init__(self, in_channels, out_channels, hidden_channels, kernel_size,
                  dilation_rate, n_layers, gin_channels=0):
@@ -88,9 +93,21 @@ class SynthesizerTrnV3(nn.Module):
             quantized = _nearest_interp(quantized, quantized.shape[-1] * 2)
         x, m_p, logs_p, y_mask = self.enc_p(quantized, y_lengths, text, text_lengths, ge, speed)
         fea = nn.leaky_relu(self.bridge_0(x), 0.01)
-        fea = _nearest_interp(fea, int(fea.shape[-1] * (1.875 if self.version == "v3" else 2)))
+        sc = 1.875 if self.version == "v3" else 2
+        fea = _nearest_interp(fea, int(fea.shape[-1] * sc), scale_factor=sc)
         fea, _ = self.wns1(fea, y_lengths1, ge)
         return fea, ge
+
+    def extract_latent(self, x: mx.array) -> mx.array:
+        """ssl (B, 768, T) -> codes (B, T) int32. Official SynthesizerTrnV3.extract_latent
+        returns codes.transpose(0, 1) of shape (B, 1, T); callers index [0, 0],
+        folded here into a (B, T) return."""
+        ssl = self.ssl_proj(x)
+        codes = self.quantizer.encode(ssl)  # (B, 1, T)
+        return codes[:, 0]
+
+    def forward(self, *a, **kw):
+        raise NotImplementedError("SynthesizerTrnV3 is inference-only; use decode_encp")
 
 
 class MelStyleEncoderLocal:

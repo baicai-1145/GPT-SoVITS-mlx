@@ -75,12 +75,20 @@ def _linear_interp(x: mx.array, size: int) -> mx.array:
     return a * (1 - frac) + b * frac
 
 
-def _nearest_interp(x: mx.array, size: int) -> mx.array:
+def _nearest_interp(x: mx.array, size: int, scale_factor: float | None = None) -> mx.array:
+    """torch F.interpolate(mode='nearest') exact semantics.
+
+    With scale_factor, torch indexes src = floor(dst / scale_factor) (fp32 division);
+    with size, src = floor(dst * t_in / size). These differ for non-integer scales (v3 1.875).
+    """
     t_in = x.shape[-1]
     if t_in == size:
         return x
-    scale = t_in / size
-    idx = mx.clip((mx.arange(size, dtype=mx.float32) * scale).astype(mx.int32), 0, t_in - 1)
+    if scale_factor is not None:
+        idx = (mx.arange(size, dtype=mx.float32) / scale_factor).astype(mx.int32)
+    else:
+        idx = (mx.arange(size, dtype=mx.float32) * (t_in / size)).astype(mx.int32)
+    idx = mx.clip(idx, 0, t_in - 1)
     return x[:, :, idx]
 
 

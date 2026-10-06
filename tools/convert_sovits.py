@@ -565,3 +565,70 @@ def _fuse_wn_hf(g, v):
     axes = tuple(range(v.ndim - 1))
     norm = np.sqrt(np.sum(v**2, axis=axes, keepdims=True))
     return g * v / norm
+
+
+# ---------------------------------------------------------------------------
+# BigVGAN v2 vocoder (v3; nvidia--bigvgan_v2_24khz_100band_256x)
+# ---------------------------------------------------------------------------
+
+def convert_bigvgan(gen_pt_path: str, config_path: str, out_dir: str, fp16: bool = False):
+    """bigvgan_generator.pt (weights_only-safe dict['generator']) -> bigvgan.safetensors.
+
+    Weight-norm convs are pre-fused (equivalent to official remove_weight_norm():
+    fused weight = weight_g * weight_v / ||weight_v||_per_out_channel, which stays
+    EXACTLY the module's effective weight). kaiser resample filters are buffers,
+    recomputed at runtime (verified identical to the checkpoint buffers).
+
+    NOTE: fp16 is available but defaults OFF -- fp16 rounding of the fused convs
+    amplifies through the 256x stack (A/B max-abs 1.1e-2 on random mel vs 5e-5
+    fp32 on the same input). v3 keeps the vocoder in fp32 like official CPU.
+    """
+    import torch
+
+    sd = torch.load(gen_pt_path, map_location="cpu", weights_only=False)["generator"]
+    with open(config_path) as f:
+        h = json.load(f)
+
+    def fuse(k):
+        g = sd[k + ".weight_g"].float().numpy()
+        v = sd[k + ".weight_v"].float().numpy()
+        norm = np.linalg.norm(v.reshape(v.shape[0], -1), axis=1, keepdims=True)
+        return (g.reshape(-1, *([1] * (v.ndim - 1))) * v / norm.reshape(-1, *([1] * (v.ndim - 1))))
+
+    arrays: dict[str, np.ndarray] = {}
+    arrays["conv_pre.weight"] = to_mlx_conv1d(fuse("conv_pre"))
+    arrays["conv_pre.bias"] = sd["conv_pre.bias"].float().numpy()
+
+    n_ups = len(h["upsample_rates"])
+    for i in range(n_ups):
+        arrays[f"ups.{i}.weight"] = to_mlx_conv1d_t(fuse(f"ups.{i}.0"))
+        arrays[f"ups.{i}.bias"] = sd[f"ups.{i}.0.bias"].float().numpy()
+
+    n_k = len(h["resblock_kernel_sizes"])
+    n_rb = n_ups * n_k
+    for b in range(n_rb):
+        for cn in ("convs1", "convs2"):
+            for j in range(3):
+                arrays[f"resblocks.{b}.{cn}.{j}.weight"] = to_mlx_conv1d(fuse(f"resblocks.{b}.{cn}.{j}"))
+                arrays[f"resblocks.{b}.{cn}.{j}.bias"] = sd[f"resblocks.{b}.{cn}.{j}.bias"].float().numpy()
+        for a in range(6):
+            arrays[f"resblocks.{b}.act.{a}.alpha"] = sd[f"resblocks.{b}.activations.{a}.act.alpha"].float().numpy().reshape(-1)
+            arrays[f"resblocks.{b}.act.{a}.beta"] = sd[f"resblocks.{b}.activations.{a}.act.beta"].float().numpy().reshape(-1)
+
+    arrays["post.alpha"] = sd["activation_post.act.alpha"].float().numpy().reshape(-1)
+    arrays["post.beta"] = sd["activation_post.act.beta"].float().numpy().reshape(-1)
+    arrays["conv_post.weight"] = to_mlx_conv1d(fuse("conv_post"))
+    if h.get("use_bias_at_final", True) and "conv_post.bias" in sd:
+        arrays["conv_post.bias"] = sd["conv_post.bias"].float().numpy()
+
+    if fp16:
+        arrays = {k: v.astype(np.float16) for k, v in arrays.items()}
+    save_safetensors(os.path.join(out_dir, "bigvgan.safetensors"), arrays)
+    meta = {k: h.get(k) for k in (
+        "upsample_rates", "upsample_kernel_sizes", "upsample_initial_channel",
+        "resblock_kernel_sizes", "resblock_dilation_sizes", "num_mels",
+        "activation", "snake_logscale", "use_bias_at_final", "use_tanh_at_final",
+        "sampling_rate")}
+    with open(os.path.join(out_dir, "bigvgan.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+    return len(arrays)

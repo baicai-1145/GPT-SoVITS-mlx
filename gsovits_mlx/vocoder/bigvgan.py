@@ -49,8 +49,10 @@ def _np_kaiser(n: int, beta: float) -> "list[float]":
 
 
 def _sinc(x: mx.array) -> mx.array:
+    """torch.sinc: sin(pi x) / (pi x), value 1 at x=0."""
     pix = math.pi * x
-    return mx.where(mx.abs(x) < 1e-12, mx.array(1.0, x.dtype), mx.sin(pix) / mx.maximum(mx.abs(pix), 1e-12) * mx.sign(pix + 1e-30) * mx.sign(x + 1e-30))
+    safe = mx.where(mx.abs(x) < 1e-30, mx.array(1.0, x.dtype), pix)
+    return mx.where(mx.abs(x) < 1e-30, mx.array(1.0, x.dtype), mx.sin(safe) / safe)
 
 
 def _sinc_safe(x: mx.array) -> mx.array:

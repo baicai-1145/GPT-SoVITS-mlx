@@ -97,15 +97,23 @@ class ConvNeXtV2Block(nn.Module):
 
 
 def rope_rotate_half(x: mx.array) -> mx.array:
+    """x-transformers rotate_half: freqs are packed as INTERLEAVED pairs
+    (stack((f, f), -1).reshape), so 'pairs' are adjacent elements
+    (x[2i], x[2i+1]); rotate_half swaps them -> (-x2, x1) interleaved.
+    """
     x1, x2 = x[..., ::2], x[..., 1::2]
-    # x-transformers packs freqs as (freqs, freqs) interleaved pairs via stack+rearrange:
-    #   freqs[..., 2i] = freqs[..., 2i+1] = f_i ; rotate_half swaps (x1, x2) -> (-x2, x1)
-    return mx.concatenate([-x2, x1], axis=-1)
+    rot = mx.concatenate([-x2[..., None], x1[..., None]], axis=-1)
+    return mx.reshape(rot, x.shape)
 
 
 def apply_rope(t: mx.array, freqs: mx.array) -> mx.array:
-    """t: (B, H, T, D); freqs: (T, D) -> rotated."""
-    cosv, sinv = mx.cos(freqs), mx.sin(freqs)
+    """t: (B, H, T, D); freqs: (T, D/2) raw angles -> rotated.
+
+    torch packs freqs interleaved ([f0, f0, f1, f1, ...]); we repeat cos/sin
+    to the same layout instead of materialising the interleaved angles.
+    """
+    cosv = mx.repeat(mx.cos(freqs), 2, axis=-1)
+    sinv = mx.repeat(mx.sin(freqs), 2, axis=-1)
     return t * cosv[None, None] + rope_rotate_half(t) * sinv[None, None]
 
 
@@ -129,14 +137,20 @@ class Attention(nn.Module):
         q = x @ self.to_q_w.T + self.to_q_b
         k = x @ self.to_k_w.T + self.to_k_b
         v = x @ self.to_v_w.T + self.to_v_b
-        q = apply_rope(q.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3), rope)
-        k = apply_rope(k.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3), rope)
+        # torch applies apply_rotary_pos_emb BEFORE the head split on the (B, T, inner)
+        # tensor; rot_dim = freqs.shape[-1] = dim_head, so only the FIRST dim_head
+        # channels (= head 0 after the split) get rotated; heads 1..N-1 are unrotated.
+        # Replicate exactly: rotate the head-0 slice only.
+        q_h = q.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
+        k_h = k.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
         v = v.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
+        q_h = mx.concatenate([apply_rope(q_h[:, :1], rope), q_h[:, 1:]], axis=1)
+        k_h = mx.concatenate([apply_rope(k_h[:, :1], rope), k_h[:, 1:]], axis=1)
 
         if mask is not None:
             attn_mask = mask[:, None, None, :].astype(mx.float32)  # (B,1,1,T)
             neg = mx.array(-1e9, mx.float32)
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(self.dim_head),
+        out = mx.fast.scaled_dot_product_attention(q_h, k_h, v, scale=1.0 / math.sqrt(self.dim_head),
                                                    mask=mask[:, None, None, :] if mask is not None else None)
         out = out.transpose(0, 2, 1, 3).reshape(b, t, self.heads * self.dim_head)
         out = out @ self.to_out_0_w.T + self.to_out_0_b
@@ -253,14 +267,12 @@ class InputEmbedding(nn.Module):
         self.groups = 16
 
     def _conv_pos(self, x: mx.array) -> mx.array:
-        # x: (B, T, C)
+        # x: (B, T, C); MLX conv1d is channels-last: out (B, T', C), bias over C
         xc = mx.pad(x, [(0, 0), (15, 15), (0, 0)])
-        y = mx.conv1d(xc, self.conv_pos_0_w, groups=self.groups)
-        y = mx.transpose(y, (0, 2, 1)) + self.conv_pos_0_b[None, None, :]
+        y = mx.conv1d(xc, self.conv_pos_0_w, groups=self.groups) + self.conv_pos_0_b[None, None, :]
         y = nn_mish(y)
         yc = mx.pad(y, [(0, 0), (15, 15), (0, 0)])
-        y = mx.conv1d(yc, self.conv_pos_1_w, groups=self.groups)
-        y = mx.transpose(y, (0, 2, 1)) + self.conv_pos_1_b[None, None, :]
+        y = mx.conv1d(yc, self.conv_pos_1_w, groups=self.groups) + self.conv_pos_1_b[None, None, :]
         return nn_mish(y)
 
     def __call__(self, x: mx.array, cond: mx.array, text_embed: mx.array,
@@ -305,10 +317,15 @@ class DiT(nn.Module):
         self.proj_out_b = mx.zeros((mel_dim,))
 
     def _rope(self, seq_len: int, dtype) -> mx.array:
-        # cached per seq_len
+        # cached per seq_len; RAW angles (T, dim_head/2) — apply_rope derives
+        # interleaved cos/sin. (torch RotaryEmbedding: inv_freq = theta**-arange(0,d,2)/d,
+        # freqs = t[:, None] * inv_freq[None, :], then stack((f,f),-1).reshape.)
         cache = getattr(self, "_rope_cache", None)
         if cache is None or cache.shape[0] < seq_len or cache.dtype != dtype:
-            cache = precompute_freqs_cis(self.dim_head, max(seq_len, 4096)).astype(dtype)
+            half = self.dim_head // 2
+            inv_freq = 1.0 / (10000.0 ** (mx.arange(0, half, dtype=mx.float32) / half))
+            t = mx.arange(max(seq_len, 4096), dtype=mx.float32)
+            cache = (t[:, None] * inv_freq[None, :]).astype(dtype)
             self._rope_cache = cache
         return cache[:seq_len]
 
@@ -339,13 +356,16 @@ class DiT(nn.Module):
             mask = sequence_mask_2d(x_lens, x.shape[1])
 
         batch, seq_len = x.shape[0], x.shape[1]
+        # torch: t = time_embed(time); dt = d_embed(dt_base) (first call) or dt_cache;
+        #        t += dt; returns dt (the d_embed OUTPUT, not time+d) as the cache value.
         t = self.time_embed(time.astype(mx.float32))
-        if not self.use_step_embedding:
-            pass
-        elif infer and dt_cache is not None:
-            t = t + dt_cache
-        else:
-            t = t + self.d_embed(dt_base_bootstrap.astype(mx.float32))
+        dt_out = None
+        if self.use_step_embedding:
+            if infer and dt_cache is not None:
+                t = t + dt_cache
+            else:
+                dt_out = self.d_embed(dt_base_bootstrap.astype(mx.float32))
+                t = t + dt_out
 
         if static_cache is not None:
             static = static_cache["negative_condition"] if drop_audio_cond else static_cache["condition"]
@@ -366,8 +386,7 @@ class DiT(nn.Module):
 
         x = self.norm_out(x, t)
         out = x @ self.proj_out_w.T + self.proj_out_b
-        return (out, text_embed if static_cache is None else None,
-                t if (self.use_step_embedding and not (infer and dt_cache is not None)) else None) if infer else out
+        return (out, text_embed if static_cache is None else None, dt_out) if infer else out
 
 
 def load_dit_params(dit: DiT, arrays: dict, depth: int, text_blocks: int, has_d_embed: bool):

@@ -173,3 +173,82 @@ stream. Verified by `.tmp/officialT_genonly.wav` vs `.tmp/out_v2_torchfull.wav`.
   official replay (both recorded in commit `a5066c7`).
 - Official 6 random seeds produce 4.5–5.3 s of audio for the same text —
   sampling variance, not a bug (`.tmp/official_seeds.txt`).
+
+## v3 addendum (task-5, e2e_v3.py — CFM/DiT + BigVGAN 24 kHz)
+
+The v3 port (`tools/e2e_v3.py`, weights s1v3.ckpt + s2Gv3.pth +
+nvidia/bigvgan_v2_24khz_100band_256x) follows TTS.py `using_vocoder_synthesis`.
+Findings, all stage-verified against official torch on this machine:
+
+### Two DiT bugs fixed in `gsovits_mlx/sovits/dit.py`
+
+1. **Rope cache double-encoding.** The cache stored `cos|sin`-concatenated
+   values and `apply_rope` then took `cos()/sin()` of them AGAIN, corrupting
+   every attention. Fix: cache RAW angles `(T, dim_head/2)`
+   (`inv_freq = 10000**-arange(0,d,2)/d`, `freqs = t[:,None]*inv_freq`),
+   and derive interleaved cos/sin via `repeat(freqs, 2, -1)` inside
+   `apply_rope`. `rope_rotate_half` swaps interleaved pairs `x[2i] <-> x[2i+1]`
+   (x-transformers packs freqs as `stack((f,f),-1).reshape`).
+2. **Partial RoPE is head-0-ONLY (f5-tts quirk, easy to misread).** CPUFast's
+   `AttnProcessor` calls `apply_rotary_pos_emb(query, freqs, ...)` on the
+   FLAT `(B, T, 1024)` projection BEFORE the head split; `rot_dim =
+   freqs.shape[-1] = 64`, so only the first 64 channels rotate — i.e. after
+   `view(B,T,16,64)` **only head 0 gets RoPE, heads 1–15 are unrotated**.
+   The MLX port originally applied RoPE per-head (all heads rotated), which
+   quietly passes a naive same-input unit test on `(B,H,T,64)` but diverges
+   7.7 abs at the attention output. Fix: rotate the head-0 slice only.
+   Verified vs fp64 ground truth: MLX 1.4e-6 rel; torch fp32 itself carries
+   1.2e-3 rel error at this op.
+
+### `_nearest_interp` scale_factor semantics (`models_v1v2.py`)
+
+`torch F.interpolate(mode='nearest')` has TWO index maps: with `size`,
+`src = floor(dst * t_in / size)`; with `scale_factor`, `src = floor(dst /
+scale_factor)`. They differ at 12 positions for the v3 1.875× upsample
+(60→112/112→210), producing 3.6e-2 abs drift in `decode_encp` fea. Fix:
+`_nearest_interp(x, size, scale_factor=...)` uses the division form; the v3
+call site passes `scale_factor=1.875`. Integer scales (the 2× path) are
+identical in both forms. After the fix fea diff is 3.4e-6.
+
+### CFM / Euler / CFG parity (harness: `.tmp/torch_cfm_ref.py` +
+`.tmp/mlx_euler_traj_check.py`)
+
+- `decode_encp` fea: 3.4e-6 abs; ge: 2.7e-5 (fp16-converted weights).
+- Single DiT step v_pos: 2.5e-5, v_neg: 4.0e-5 (post head-0-rope fix).
+- Full 32-step Euler with cfg_rate=0.25, per-step trajectory diff:
+  **1.16e-5 max** (fp32 noise floor for this stack).
+- Sampling: `resolve_sampling('v3')` → `(sample_steps=32, cfg_rate=0.0)`
+  (cfg only becomes 1.30 for v5 family; 0.25 appears only if the caller
+  overrides). `x[..., :prompt_len] = 0` after every Euler step; chunk loop
+  T_ref=468 / T_chunk=934 replicates `using_vocoder_synthesis`.
+
+### BigVGAN v2 vocoder (`gsovits_mlx/vocoder/bigvgan.py`,
+`tools/convert_sovits.py:convert_bigvgan`)
+
+- Weight-norm convs pre-fused at conversion: `w = g * v/||v||_per_out_channel`
+  — bit-equivalent to the official `remove_weight_norm()` effective weight.
+  **Keep the vocoder fp32**: fp16 rounding of the fused convs amplifies
+  through the 256× stack (A/B max-abs 1.1e-2 vs 5e-5 fp32 on a random mel).
+- kaiser-sinc resample filters (Activation1d up/down) are buffers recomputed
+  at runtime; verified 8.9e-8 vs checkpoint buffers. A previous `_sinc`
+  sign-hack produced garbage (NaNs) — fixed to `sin(πx)/(πx)`, 1 at x=0.
+- Torch-vs-MLX A/B on random 100-mel input: **max 5e-5, mean 8.3e-6** (fp32).
+- Output sr is 24000 (not the SoVITS 32000); mel_fn for the prompt is
+  100-mel n_fft 1024 / hop 256 @ 24 kHz center=False; spec_min=-12,
+  spec_max=2 normalisation as in TTS.py.
+
+### Conversion artifacts
+
+- `/Volumes/2T/gpt-sovits-models/mlx/v3/` — pre-existing export verified
+  against s2Gv3.pth on spot keys (0 diff on fp32 rows; it was already fp32).
+- `/Volumes/2T/gpt-sovits-models/mlx/bigvgan/` — new
+  `bigvgan.safetensors` (449 arrays, fp32) + `bigvgan.json`.
+- `mlx/s1/gpt.safetensors` is the s1v3.ckpt conversion (ar_predict_layer
+  diff 0; max_sec 57 → early_stop_num = 50*57 = 2850).
+
+### e2e result
+
+`tools/e2e_v3.py` → `/Volumes/2T/gpt-sovits-models/bench/mlx/v3.wav`
+(8.80 s, 24 kHz, 119 AR tokens, 32 CFM steps, ~220 s wall, peak RSS 2.5 GB).
+Listen check: prompt parroting + target text clearly intelligible, no
+artifacts.

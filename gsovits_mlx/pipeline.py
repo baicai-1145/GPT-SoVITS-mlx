@@ -22,7 +22,9 @@ from .gpt.t2s import Text2SemanticDecoder
 from .io import load_mlx_safetensors
 from .sovits.models_v1v2 import SynthesizerTrn
 from .sovits.models_v3 import SynthesizerTrnV3
+from .sovits.dit import load_dit_params
 from .text.mel_frontend import mel_spectrogram, spectrogram
+from .vocoder.bigvgan import BigVGAN
 
 SPEC_MIN = -12.0
 SPEC_MAX = 2.0
@@ -76,56 +78,10 @@ def _load_sovits_v1v2(path: str, version: str):
                        hps["upsample_rates"], hps["upsample_initial_channel"],
                        hps["upsample_kernel_sizes"], gin_channels=hps["gin_channels"],
                        semantic_frame_rate=hps["semantic_frame_rate"], version=version)
-    ep = m.enc_p
-    ep.ssl_proj.weight = g("enc_p.ssl_proj.weight"); ep.ssl_proj.bias = g("enc_p.ssl_proj.bias")
-    ep.text_embedding = g("enc_p.text_embedding")
-    ep.proj.weight = g("enc_p.proj.weight"); ep.proj.bias = g("enc_p.proj.bias")
-    for enc, prefix in ((ep.encoder_ssl, "enc_p.enc_ssl"),
-                        (ep.encoder_text, "enc_p.enc_text"),
-                        (ep.encoder2, "enc_p.enc2")):
-        for i in range(len(enc.attn_layers)):
-            at = enc.attn_layers[i]
-            for nm in ("conv_q", "conv_k", "conv_v", "conv_o"):
-                getattr(at, nm).weight = g(f"{prefix}.{i}.attn.{nm}.weight")
-                getattr(at, nm).bias = g(f"{prefix}.{i}.attn.{nm}.bias")
-            if f"{prefix}.{i}.attn.emb_rel_k" in arrays:
-                at.emb_rel_k = g(f"{prefix}.{i}.attn.emb_rel_k")
-                at.emb_rel_v = g(f"{prefix}.{i}.attn.emb_rel_v")
-            n1, n2 = enc.norm_layers_1[i], enc.norm_layers_2[i]
-            n1.gamma, n1.beta = g(f"{prefix}.{i}.norm1"), g(f"{prefix}.{i}.norm1.b")
-            n2.gamma, n2.beta = g(f"{prefix}.{i}.norm2"), g(f"{prefix}.{i}.norm2.b")
-            f = enc.ffn_layers[i]
-            f.conv_1.weight = g(f"{prefix}.{i}.ffn.conv1.weight")
-            f.conv_1.bias = g(f"{prefix}.{i}.ffn.conv1.bias")
-            f.conv_2.weight = g(f"{prefix}.{i}.ffn.conv2.weight")
-            f.conv_2.bias = g(f"{prefix}.{i}.ffn.conv2.bias")
-    mr = ep.mrte
-    mr.c_pre.weight, mr.c_pre.bias = g("enc_p.mrte.c_pre.weight"), g("enc_p.mrte.c_pre.bias")
-    mr.text_pre.weight, mr.text_pre.bias = g("enc_p.mrte.text_pre.weight"), g("enc_p.mrte.text_pre.bias")
-    mr.c_post.weight, mr.c_post.bias = g("enc_p.mrte.c_post.weight"), g("enc_p.mrte.c_post.bias")
-    ca = mr.cross_attention
-    for nm in ("conv_q", "conv_k", "conv_v", "conv_o"):
-        getattr(ca, nm).weight = g(f"enc_p.mrte.cross_attn.{nm}.weight")
-        getattr(ca, nm).bias = g(f"enc_p.mrte.cross_attn.{nm}.bias")
-    if "enc_p.mrte.cross_attn.emb_rel_k" in arrays:
-        ca.emb_rel_k = g("enc_p.mrte.cross_attn.emb_rel_k")
-        ca.emb_rel_v = g("enc_p.mrte.cross_attn.emb_rel_v")
+    _load_text_encoder_shared(m.enc_p, g, arrays)
+    _load_ref_enc(m.ref_enc, g)
     m.ssl_proj.weight, m.ssl_proj.bias = g("ssl_proj.weight"), g("ssl_proj.bias")
     m.quantizer.embed = g("quantizer.codebook")
-    # ref_enc
-    re_ = m.ref_enc
-    re_.spectral_0.weight = g("ref_enc.spectral.0.weight")
-    re_.spectral_0.bias = g("ref_enc.spectral.0.bias")
-    re_.spectral_1.weight = g("ref_enc.spectral.3.weight")
-    re_.spectral_1.bias = g("ref_enc.spectral.3.bias")
-    for i, t in enumerate((re_.temporal_0, re_.temporal_1)):
-        t.w_1 = g(f"ref_enc.temporal.{i}.w1"); t.b_1 = g(f"ref_enc.temporal.{i}.b1")
-    sa = re_.slf_attn
-    sa.w_qs.weight, sa.w_qs.bias = g("ref_enc.slf_attn.w_qs"), g("ref_enc.slf_attn.w_qs.b")
-    sa.w_ks.weight, sa.w_ks.bias = g("ref_enc.slf_attn.w_ks"), g("ref_enc.slf_attn.w_ks.b")
-    sa.w_vs.weight, sa.w_vs.bias = g("ref_enc.slf_attn.w_vs"), g("ref_enc.slf_attn.w_vs.b")
-    sa.fc.weight, sa.fc.bias = g("ref_enc.slf_attn.fc"), g("ref_enc.slf_attn.fc.b")
-    re_.fc.weight, re_.fc.bias = g("ref_enc.fc"), g("ref_enc.fc.b")
     # flow (v2 checkpoints have no top-level flow.pre/post)
     fl = m.flow
     if "flow.pre.weight" in arrays:
@@ -173,3 +129,179 @@ def load_gpt(path: str) -> Text2SemanticDecoder:
     gpt.load(dict(arrays))
     mx.eval(list(gpt.__dict__.values()))
     return gpt
+
+
+# ---------------------------------------------------------------------------
+# SoVITS v3/v4/v5 (SynthesizerTrnV3) + BigVGAN vocoder
+# ---------------------------------------------------------------------------
+
+def _load_text_encoder_shared(ep, g, arrays):
+    """enc_p weights shared by v1/v2/v3 layouts."""
+    ep.ssl_proj.weight = g("enc_p.ssl_proj.weight"); ep.ssl_proj.bias = g("enc_p.ssl_proj.bias")
+    ep.text_embedding = g("enc_p.text_embedding")
+    ep.proj.weight = g("enc_p.proj.weight"); ep.proj.bias = g("enc_p.proj.bias")
+    for enc, prefix in ((ep.encoder_ssl, "enc_p.enc_ssl"),
+                        (ep.encoder_text, "enc_p.enc_text"),
+                        (ep.encoder2, "enc_p.enc2")):
+        for i in range(len(enc.attn_layers)):
+            at = enc.attn_layers[i]
+            for nm in ("conv_q", "conv_k", "conv_v", "conv_o"):
+                getattr(at, nm).weight = g(f"{prefix}.{i}.attn.{nm}.weight")
+                getattr(at, nm).bias = g(f"{prefix}.{i}.attn.{nm}.bias")
+            if f"{prefix}.{i}.attn.emb_rel_k" in arrays:
+                at.emb_rel_k = g(f"{prefix}.{i}.attn.emb_rel_k")
+                at.emb_rel_v = g(f"{prefix}.{i}.attn.emb_rel_v")
+            n1, n2 = enc.norm_layers_1[i], enc.norm_layers_2[i]
+            n1.gamma, n1.beta = g(f"{prefix}.{i}.norm1"), g(f"{prefix}.{i}.norm1.b")
+            n2.gamma, n2.beta = g(f"{prefix}.{i}.norm2"), g(f"{prefix}.{i}.norm2.b")
+            f = enc.ffn_layers[i]
+            f.conv_1.weight = g(f"{prefix}.{i}.ffn.conv1.weight")
+            f.conv_1.bias = g(f"{prefix}.{i}.ffn.conv1.bias")
+            f.conv_2.weight = g(f"{prefix}.{i}.ffn.conv2.weight")
+            f.conv_2.bias = g(f"{prefix}.{i}.ffn.conv2.bias")
+    mr = ep.mrte
+    mr.c_pre.weight, mr.c_pre.bias = g("enc_p.mrte.c_pre.weight"), g("enc_p.mrte.c_pre.bias")
+    mr.text_pre.weight, mr.text_pre.bias = g("enc_p.mrte.text_pre.weight"), g("enc_p.mrte.text_pre.bias")
+    mr.c_post.weight, mr.c_post.bias = g("enc_p.mrte.c_post.weight"), g("enc_p.mrte.c_post.bias")
+    ca = mr.cross_attention
+    for nm in ("conv_q", "conv_k", "conv_v", "conv_o"):
+        getattr(ca, nm).weight = g(f"enc_p.mrte.cross_attn.{nm}.weight")
+        getattr(ca, nm).bias = g(f"enc_p.mrte.cross_attn.{nm}.bias")
+    if "enc_p.mrte.cross_attn.emb_rel_k" in arrays:
+        ca.emb_rel_k = g("enc_p.mrte.cross_attn.emb_rel_k")
+        ca.emb_rel_v = g("enc_p.mrte.cross_attn.emb_rel_v")
+
+
+def _load_ref_enc(re_, g):
+    re_.spectral_0.weight = g("ref_enc.spectral.0.weight")
+    re_.spectral_0.bias = g("ref_enc.spectral.0.bias")
+    re_.spectral_1.weight = g("ref_enc.spectral.3.weight")
+    re_.spectral_1.bias = g("ref_enc.spectral.3.bias")
+    for i, t in enumerate((re_.temporal_0, re_.temporal_1)):
+        t.w_1 = g(f"ref_enc.temporal.{i}.w1"); t.b_1 = g(f"ref_enc.temporal.{i}.b1")
+    sa = re_.slf_attn
+    sa.w_qs.weight, sa.w_qs.bias = g("ref_enc.slf_attn.w_qs"), g("ref_enc.slf_attn.w_qs.b")
+    sa.w_ks.weight, sa.w_ks.bias = g("ref_enc.slf_attn.w_ks"), g("ref_enc.slf_attn.w_ks.b")
+    sa.w_vs.weight, sa.w_vs.bias = g("ref_enc.slf_attn.w_vs"), g("ref_enc.slf_attn.w_vs.b")
+    sa.fc.weight, sa.fc.bias = g("ref_enc.slf_attn.fc"), g("ref_enc.slf_attn.fc.b")
+    re_.fc.weight, re_.fc.bias = g("ref_enc.fc"), g("ref_enc.fc.b")
+
+
+def load_sovits_v3(path: str, version: str = "v3"):
+    """Converted SynthesizerTrnV3 (v3/v4/v5 family) from sovits.safetensors + sovits.json."""
+    arrays = load_mlx_safetensors(os.path.join(path, "sovits.safetensors"))
+    meta = json.load(open(os.path.join(path, "sovits.json")))
+    hps = meta["model_hps"]
+    g = arrays.get
+    # v1/v2-only constructor fields are unused by SynthesizerTrnV3
+    m = SynthesizerTrnV3(1025, 20, hps["inter_channels"], hps["hidden_channels"],
+                         768, 2, 6, 3, 0.1, "1", [3, 7, 11], [[1, 3, 5]] * 3,
+                         [10, 8, 2, 2, 2], 512, [16, 16, 8, 2, 2],
+                         gin_channels=hps["gin_channels"],
+                         semantic_frame_rate=hps.get("semantic_frame_rate") or "25hz",
+                         version=version)
+    _load_text_encoder_shared(m.enc_p, g, arrays)
+    _load_ref_enc(m.ref_enc, g)
+    if "ssl_proj.weight" in arrays:
+        m.ssl_proj.weight, m.ssl_proj.bias = g("ssl_proj.weight"), g("ssl_proj.bias")
+    m.quantizer.embed = g("quantizer.codebook")
+    # bridge (torch Sequential(Conv1d, LeakyReLU) -> bridge_0 + leaky_relu in forward)
+    m.bridge_0.weight, m.bridge_0.bias = g("bridge.weight"), g("bridge.bias")
+    # wns1 (WNEncoder: pre -> WN(gin) -> proj)
+    m.wns1.pre.weight, m.wns1.pre.bias = g("wns1.pre.weight"), g("wns1.pre.bias")
+    m.wns1.proj.weight, m.wns1.proj.bias = g("wns1.proj.weight"), g("wns1.proj.bias")
+    m.wns1.enc.cond_layer.weight = g("wns1.cond")
+    m.wns1.enc.cond_layer.bias = g("wns1.cond.b")
+    n_wn = len(m.wns1.enc.in_layers)
+    for wi in range(n_wn):
+        m.wns1.enc.in_layers[wi].weight = g(f"wns1.in.{wi}")
+        m.wns1.enc.in_layers[wi].bias = g(f"wns1.in.{wi}.b")
+        m.wns1.enc.res_skip_layers[wi].weight = g(f"wns1.skip.{wi}")
+        m.wns1.enc.res_skip_layers[wi].bias = g(f"wns1.skip.{wi}.b")
+    if "linear_mel.weight" in arrays:
+        m.linear_mel.weight, m.linear_mel.bias = g("linear_mel.weight"), g("linear_mel.bias")
+    load_dit_params(m.cfm.estimator, arrays, meta["dit"]["depth"],
+                    meta["dit"]["text_blocks"], has_d_embed=version not in {"v5", "v5dev", "v5turbo"})
+    mx.eval(m.parameters())
+    return m, meta
+
+
+def load_bigvgan(path: str):
+    """Converted BigVGAN v2 (bigvgan.safetensors + bigvgan.json)."""
+    arrays = load_mlx_safetensors(os.path.join(path, "bigvgan.safetensors"))
+    h = json.load(open(os.path.join(path, "bigvgan.json")))
+    g = arrays.get
+    voc = BigVGAN(h)
+    voc.conv_pre.weight, voc.conv_pre.bias = g("conv_pre.weight"), g("conv_pre.bias")
+    for i in range(len(voc.ups)):
+        voc.ups[i].weight = g(f"ups.{i}.weight")
+        voc.ups[i].bias = g(f"ups.{i}.bias")
+    n_rb = len(voc.resblocks)
+    for b in range(n_rb):
+        rb = voc.resblocks[b]
+        for j in range(len(rb.convs1)):
+            rb.convs1[j].weight = g(f"resblocks.{b}.convs1.{j}.weight")
+            rb.convs1[j].bias = g(f"resblocks.{b}.convs1.{j}.bias")
+            rb.convs2[j].weight = g(f"resblocks.{b}.convs2.{j}.weight")
+            rb.convs2[j].bias = g(f"resblocks.{b}.convs2.{j}.bias")
+        for a, act in enumerate(rb.activations):
+            core = act.act
+            core.alpha = g(f"resblocks.{b}.act.{a}.alpha")
+            if hasattr(core, "beta"):
+                core.beta = g(f"resblocks.{b}.act.{a}.beta")
+    post = voc.activation_post.act
+    post.alpha = g("post.alpha")
+    if hasattr(post, "beta"):
+        post.beta = g("post.beta")
+    voc.conv_post.weight = g("conv_post.weight")
+    if voc.use_bias_at_final:
+        voc.conv_post.bias = g("conv_post.bias")
+    mx.eval(voc.parameters())
+    return voc
+
+
+# ---------------------------------------------------------------------------
+# v3/v4 chunked CFM decode (TTS.py using_vocoder_synthesis)
+# ---------------------------------------------------------------------------
+
+def decode_encp_v3(model: SynthesizerTrnV3, codes: mx.array, text: mx.array,
+                   refer: mx.array, ge: mx.array | None = None,
+                   speed: float = 1.0):
+    """SynthesizerTrnV3.decode_encp — codes (B,1,T), text (B,Tph), refer (B,Cspec,T)."""
+    if ge is None:
+        refer_mask = mx.ones((refer.shape[0], 1, refer.shape[2]), dtype=refer.dtype)
+        ge = model.ref_enc(refer[:, :704] * refer_mask, refer_mask)
+    return model.decode_encp(codes, text, refer=refer, ge=ge, speed=speed)
+
+
+def cfm_chunked_decode_v3(model: SynthesizerTrnV3, fea_ref: mx.array, fea_todo: mx.array,
+                          mel2: mx.array, sample_steps: int = 32,
+                          inference_cfg_rate: float = 0.0,
+                          key: mx.array | None = None) -> mx.array:
+    """TTS.py v3/v4 chunked CFM loop (T_ref=468, T_chunk=934, 100-mel). Returns the
+    predicted mel (B, 100, T_target); denorm NOT applied."""
+    T_min = min(mel2.shape[2], fea_ref.shape[2])
+    mel2 = mel2[:, :, :T_min]
+    fea_ref = fea_ref[:, :, :T_min]
+    T_ref, T_chunk = 468, 934
+    if T_min > T_ref:
+        mel2 = mel2[:, :, -T_ref:]
+        fea_ref = fea_ref[:, :, -T_ref:]
+        T_min = T_ref
+    chunk_len = T_chunk - T_min
+    cfm_resss = []
+    idx = 0
+    while True:
+        fea_todo_chunk = fea_todo[:, :, idx : idx + chunk_len]
+        if fea_todo_chunk.shape[-1] == 0:
+            break
+        idx += chunk_len
+        fea = mx.concatenate([fea_ref, fea_todo_chunk], 2).transpose(0, 2, 1)
+        cfm_res = model.cfm.inference(
+            fea, mx.array([fea.shape[1]]), mel2, sample_steps,
+            inference_cfg_rate=inference_cfg_rate, key=key)
+        cfm_res = cfm_res[:, :, mel2.shape[2]:]
+        mel2 = cfm_res[:, :, -T_min:]
+        fea_ref = fea_todo_chunk[:, :, -T_min:]
+        cfm_resss.append(cfm_res)
+    return mx.concatenate(cfm_resss, 2)
