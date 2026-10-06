@@ -234,11 +234,128 @@ def bench_gpt(component: str, models_root: str, iters: int, out_dir: str) -> dic
 # ---------------------------------------------------------------------------
 
 def capture_sovits(component: str, models_root: str, cpufast_repo: str, out_dir: str) -> None:
-    raise SystemExit("sovits capture: wire up after GPT cells land (uses gpt-s1v3 golden codes)")
+    """Capture fixed decode inputs. Codes come from the matching GPT golden
+    (gpt-s1v1 -> sovits-v1, etc.; v3/v4/v5 family shares gpt-s1v3)."""
+    import mlx.core as mx
+
+    from gsovits_mlx.io import load_mlx_safetensors, release, trim_metal
+    from tools.e2e_v5 import load_audio_official  # official PyAV decode path
+    from gsovits_mlx.text.hubert import HubertModel
+    from gsovits_mlx.text.mel_frontend import spectrogram
+
+    ver = SOVITS_SPEC[component][0]
+    gpt_comp = {"sovits-v1": "gpt-s1v1", "sovits-v2": "gpt-s1v2",
+                "sovits-v2pro": "gpt-s1v2", "sovits-v2proplus": "gpt-s1v2"}.get(
+        component, "gpt-s1v3")
+    gz = np.load(os.path.join(out_dir, f"{gpt_comp}.npz"))
+    phones, prompt = gz["phones"], gz["prompt"]
+
+    wav16k = load_audio_official(DEFAULT_REF_AUDIO, 16000)
+    wav16k = np.concatenate([wav16k, np.zeros(9600, np.float32)])
+    hubert_dir = os.path.join(models_root, "hubert")
+    hb = HubertModel(load_mlx_safetensors(os.path.join(hubert_dir, "hubert.safetensors")),
+                     json.load(open(os.path.join(hubert_dir, "config.json"))))
+    h = hb(mx.array(wav16k[None]))
+    mx.eval(h)
+    from gsovits_mlx.pipeline import _load_sovits_v1v2, load_sovits_v3
+    loader = _load_sovits_v1v2 if ver in ("v1", "v2", "v2Pro", "v2ProPlus") else load_sovits_v3
+    dirname = {"v5dev": "v5dev", "v5turbo": "v5turbo", "v3": "v3", "v4": "v4"}.get(ver, ver)
+    sov, _ = loader(os.path.join(models_root, dirname), ver)
+    codes = sov.extract_latent(mx.transpose(h, (0, 2, 1)))
+    mx.eval(codes)
+    prompt = mx.array(codes.reshape(codes.shape[0], -1), mx.int32)  # authoritative
+    del sov, hb, h
+    release()
+    trim_metal()
+
+    w32 = load_audio_official(DEFAULT_REF_AUDIO, 32000)
+    refer = spectrogram(mx.array(w32[None]), 2048, 640, 2048)
+    mx.eval(refer)
+    # prompt phone boundary for decode_encp (e2e: all_phones[:, :len(p_ids)])
+    n_prompt_phones = int(len(_frontend_inputs(models_root, cpufast_repo)["p_ids"]))
+    np.savez_compressed(os.path.join(out_dir, f"{component}.npz"),
+                        phones=np.asarray(phones), prompt=np.array(prompt),
+                        refer=np.array(refer), w32=w32,
+                        n_prompt_phones=np.int32(n_prompt_phones))
+    json.dump({"phones": int(np.asarray(phones).shape[1]),
+               "codes": int(np.array(prompt).shape[1]),
+               "refer": list(refer.shape)},
+              open(os.path.join(out_dir, f"{component}.meta.json"), "w"), indent=1)
+    print(f"[capture] {component}: codes={np.array(prompt).shape[1]} "
+          f"refer={tuple(refer.shape)}")
 
 
 def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> dict:
-    raise SystemExit("sovits bench: wire up after capture")
+    import mlx.core as mx
+
+    from gsovits_mlx.io import release, trim_metal
+    from gsovits_mlx.pipeline import (_load_sovits_v1v2, denorm_spec, load_sovits_v3,
+                                      load_vocoder_v4, mel_spectrogram, norm_spec)
+    from gsovits_mlx.sovits.cfm import resolve_sampling, synthesize_v5_mel
+    from gsovits_mlx.text.mel_frontend import spectrogram
+
+    ver = SOVITS_SPEC[component][0]
+    z = np.load(os.path.join(out_dir, f"{component}.npz"))
+    dirname = {"v5dev": "v5dev", "v5turbo": "v5turbo"}.get(ver, ver)
+    if ver in ("v1", "v2", "v2Pro", "v2ProPlus"):
+        sov, _ = _load_sovits_v1v2(os.path.join(models_root, dirname), ver)
+    else:
+        sov, _ = load_sovits_v3(os.path.join(models_root, dirname), ver)
+
+    all_phones = mx.array(z["phones"])
+    all_codes = mx.array(z["prompt"])[:, None, :]
+    refer = mx.array(z["refer"])
+    ref_audio_32k = z["w32"]
+
+    result = {"component": component, "iters": iters}
+    golden = None
+    for i in range(iters):
+        t0 = time.perf_counter()
+        if ver in ("v1", "v2", "v2Pro", "v2ProPlus"):
+            raise SystemExit("v1/v2/v2pro cells belong to conv-fp16 (HiFiGAN A/B) per cell split")
+        refer_mask = mx.ones((refer.shape[0], 1, refer.shape[2]), dtype=refer.dtype)
+        ge = sov.ref_enc(refer[:, :704] * refer_mask, refer_mask)
+        if ver in ("v5dev", "v5turbo"):
+            n_prompt = int(z["n_prompt_phones"])
+            fea_ref, ge = sov.decode_encp(mx.array(z["prompt"][None]), all_phones[:, :n_prompt],
+                                          refer=refer, ge=ge)
+            fea_todo, _ = sov.decode_encp(all_codes, all_phones, refer=refer, ge=ge, speed=1.0)
+            mx.eval(fea_ref, fea_todo)
+            del ge, refer_mask
+            mel2 = norm_spec(mel_spectrogram(mx.array(ref_audio_32k[None]), 1280, 100,
+                                             32000, 320, 1280, 0, None, center=False))
+            mx.eval(mel2)
+            steps, cfg = resolve_sampling(ver, None, None)
+            mel = synthesize_v5_mel(sov, fea_ref, fea_todo, mel2, sample_steps=steps,
+                                    cfg_rate=cfg, key=mx.random.key(0))
+            pred = denorm_spec(mel)
+            mx.eval(pred)
+            del fea_ref, fea_todo, mel2, mel
+            voc = load_vocoder_v4(os.path.join(models_root, "v5_vocoder"))
+            audio = voc(pred)
+            mx.eval(audio)
+            del pred
+            out_np = np.array(audio)[0, 0]
+            sr = 48000
+        else:
+            raise SystemExit("v3/v4 sovits cells: wire after v5dev validates the harness")
+        trim_metal()
+        dt = time.perf_counter() - t0
+        result[f"decode_s_{i}"] = round(dt, 3)
+        if i == 0:
+            golden = out_np
+            result["audio_s"] = round(len(out_np) / sr, 3)
+        else:
+            same = out_np.shape == golden.shape and np.array_equal(out_np, golden)
+            result["parity"] = "OK" if same else "FAIL"
+    # seeded-but-mx-random-key run is deterministic: i0 vs i1 must match
+    del sov  # free the DiT after all iterations, not inside the loop
+    release()
+    trim_metal()
+    result.setdefault("parity", "n/a(single-iter)")
+    print(f"[micro] {component}: parity={result['parity']} "
+          f"audio={result.get('audio_s')}s best={min(result[f'decode_s_{i}'] for i in range(iters))}s")
+    return result
 
 
 def main() -> None:
