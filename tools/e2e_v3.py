@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
                    help="Opt in to Metal for ALL stages: requires GSOVITS_GPU_LOCK_OK=1\n                        and a fresh .tmp/gpu.lock.d owner (default-deny; CPU otherwise).")
     p.add_argument("--bench", action="store_true",
                    help="Print per-stage wall times and peak RSS to stderr.")
+    p.add_argument("--frontend-only", action="store_true",
+                   help="Run ONLY the text front-end (phones/bert print; audio"
+                        " stages skipped). CPU-legal smoke mode.")
+    p.add_argument("--cpu-i-know-broken", action="store_true",
+                   help="Force a full pipeline run on CPU anyway (unsupported:"
+                        " v3-family CFM yields all-zero audio; v1/v2 30-100x slow).")
     return p.parse_args()
 
 
@@ -172,6 +178,10 @@ def main() -> None:
         sys.path.insert(0, repo_root)
     from gsovits_mlx.gpu_lock import resolve_device
     resolve_device(flag_gpu=args.gpu, verbose=True)
+    if not args.frontend_only:
+        from gsovits_mlx.gpu_lock import require_gpu_for_pipeline
+        require_gpu_for_pipeline("gpu" if args.gpu else "cpu",
+                                 cpu_ok_flag=args.cpu_i_know_broken)
     # AR sampling draws its inverse-CDF uniform from numpy's global RNG
     # (gsovits_mlx/gpt/t2s.py::_sample); seed it so runs are reproducible.
     np.random.seed(args.seed)
@@ -241,6 +251,18 @@ def main() -> None:
         return p_ids, p_bert, t_ids, t_bert, False
 
     p_ids, p_bert, t_ids, t_bert, cache_hit = frontend_run()
+    if args.frontend_only:
+        import json as _json
+        print(_json.dumps({
+            "prompt_phones": list(p_ids), "target_phones": list(t_ids),
+            "prompt_bert_shape": list(np.asarray(p_bert).shape),
+            "target_bert_shape": list(np.asarray(t_bert).shape),
+            "norm_target": None, "cache_hit": bool(cache_hit),
+            "frontend_s": times.get("frontend")}), flush=True)
+        print(f"[frontend-only] prompt {len(p_ids)} phones / target {len(t_ids)} "
+              f"phones — audio stages skipped (CPU-legal smoke)", file=sys.stderr)
+        return
+
     all_phones = mx.array([list(p_ids) + list(t_ids)], mx.int32)
     # all_bert = concat(prompt_bert, target_bert) along time -- official layout
     all_bert = mx.array(np.concatenate([np.asarray(p_bert), np.asarray(t_bert)], axis=1))[None]  # (1, 1024, Tp+Tt)
@@ -334,6 +356,9 @@ def main() -> None:
 
     # vocoder upsamples 256x per mel frame (24 kHz)
     audio_np = np.array(audio)[0, 0]
+    from gsovits_mlx._audio_check import assert_audible
+    assert_audible(audio_np, context=f"{args.out} pre-write")
+
     sf.write(args.out, audio_np, 24000)
     if args.bench:
         rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

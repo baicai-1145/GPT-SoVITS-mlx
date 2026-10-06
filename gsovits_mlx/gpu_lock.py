@@ -74,3 +74,24 @@ def resolve_device(flag_gpu: bool = False, verbose: bool = False) -> str:
               (f"lock not fresh/ours (owner={owner!r})" if owner else "no .tmp/gpu.lock.d")
         print(f"[device] cpu ({why})", flush=True)
     return "cpu"
+
+
+def require_gpu_for_pipeline(device: str, cpu_ok_flag: bool = False) -> None:
+    """Hard-stop CPU pipeline runs (phase-2 bug: CPU-pinned v3 CFM silently
+    produced a 309 s all-zero wav at 100x slowdown instead of failing fast).
+
+    CPU is not a supported compute path for AR/CFM/decode — for ANY version
+    (v1/v2 render slowly-but-validly, which is a trap, not a feature).
+    Front-end-only smoke stays CPU-legal; call sites pass cpu_ok_flag=True
+    only for explicit --frontend-only / --cpu-i-know-broken runs.
+    """
+    if device != "cpu" or cpu_ok_flag:
+        return
+    raise SystemExit(
+        "[device] REFUSING full-pipeline run on CPU.\n"
+        "  CPU is not a supported compute path for AR/CFM/decode (v3-family"
+        " CFM silently yields all-zero audio; v1/v2 render 30-100x slow).\n"
+        "  * real synthesis: take the gpu.lock and pass --gpu (or set"
+        " GSOVITS_GPU_LOCK_OK=1)\n"
+        "  * front-end smoke only: pass --frontend-only\n"
+        "  * truly force it anyway: pass --cpu-i-know-broken")

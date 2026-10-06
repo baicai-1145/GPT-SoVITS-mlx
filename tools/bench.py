@@ -40,6 +40,8 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 SUPPORTED_VERSIONS = ["v1", "v2", "v2Pro", "v2ProPlus", "v3", "v4", "v5dev", "v5turbo"]
 
 DEFAULT_MODELS_ROOT = "/Volumes/2T/gpt-sovits-models/mlx"
@@ -80,6 +82,10 @@ def parse_args() -> argparse.Namespace:
                         "versions fail fast until their e2e scripts land.")
     p.add_argument("--gpu", action="store_true",
                    help="Opt the e2e children into Metal: sets GSOVITS_GPU_LOCK_OK=1;\n                        children still require a fresh gpu.lock (default-deny).")
+    p.add_argument("--frontend-only", action="store_true",
+                   help="Children run text front-end only (CPU-legal smoke).")
+    p.add_argument("--cpu-i-know-broken", action="store_true",
+                   help="Children force full pipeline on CPU (unsupported; see e2e --help).")
     p.add_argument("--keep-audio", default=None,
                    help="Optional path for the rendered wav of the last repeat.")
     return p.parse_args()
@@ -127,6 +133,10 @@ def run_one(args: argparse.Namespace, out_path: str | None) -> dict:
            "--temperature", str(args.temperature),
            "--repetition-penalty", str(args.repetition_penalty),
            "--seed", str(args.seed), "--bench", "--out", out_path] + extra
+    if args.frontend_only:
+        cmd += ["--frontend-only"]
+    if args.cpu_i_know_broken:
+        cmd += ["--cpu-i-know-broken"]
     if has_v2_args:
         cmd += ["--noise-scale", str(args.noise_scale)]
         if args.early_stop_num is not None:
