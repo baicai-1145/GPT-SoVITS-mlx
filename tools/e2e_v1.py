@@ -62,7 +62,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cpufast-repo",
                    default=os.environ.get("GPT_SOVITS_CPUFAST", DEFAULT_CPUFAST_REPO),
                    help="GPT-SoVITS-CPUFast checkout, used read-only for the text front-end.")
-    p.add_argument("--lang", default="zh", help="Text language for the cleaner (default: zh).")
+    p.add_argument("--lang", default="zh",
+                   help="Text language mode: zh/ja/ko/yue/en/all_zh/all_ja/"
+                        "all_ko/all_yue/auto/auto_yue (default: zh; mixed text"
+                        " under a single-language label takes the label lang).")
+    p.add_argument("--prompt-lang", default=None,
+                   help="Language mode for the reference text (default: --lang).")
+    p.add_argument("--text-split-method", default="cut0",
+                   help="Official cut0..cut5 split method for the target text "
+                        "(default cut0 = no splitting, stage-1 behavior).")
+    p.add_argument("--ref-cache", default=os.environ.get("GSOVITS_REF_CACHE", ""),
+                   help="Enable the (ref_audio, ref_text) disk cache at this "
+                        "dir (or GSOVITS_REF_CACHE; empty = off).")
     p.add_argument("--cleaner-version", default="v1", choices=["v1", "v2"],
                    help="Phone-cleaner version (default: v1).")
     p.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
@@ -79,47 +90,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bench", action="store_true",
                    help="Print per-stage wall times and peak RSS to stderr.")
     return p.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Text front-end (the only piece borrowed from the official CPUFast repo)
-# ---------------------------------------------------------------------------
-
-def init_text_frontend(cpufast_repo: str, bert_path: str):
-    """Import the official cleaner + segmentation helpers (read-only use)."""
-    if not os.path.isdir(cpufast_repo):
-        sys.exit(f"CPUFast repo not found at {cpufast_repo} "
-                 "(set --cpufast-repo or GPT_SOVITS_CPUFAST)")
-    os.chdir(cpufast_repo)
-    sys.path.insert(0, "GPT_SoVITS")
-    sys.path.insert(0, ".")
-    os.environ["bert_path"] = bert_path
-    from text.cleaner import clean_text
-    from text import cleaned_text_to_sequence
-    from TTS_infer_pack.text_segmentation_method import splits
-    return clean_text, cleaned_text_to_sequence, splits
-
-
-def phones_and_bert(clean_text, cleaned_text_to_sequence, splits, text: str,
-                    lang: str, version: str, is_prompt: bool = False):
-    """Phones + BERT feature tuple for one segment.
-
-    Official pre_seg_text rule: the '。' separator is prepended to the TARGET
-    text only (never the prompt) when the text does not already start with a
-    split separator and its first segment is shorter than 4 chars.
-    """
-
-    def _get_first(t: str) -> str:
-        pattern = "[" + "".join(re.escape(sep) for sep in splits) + "]"
-        m = re.match(pattern + "+", t)
-        return m.group() if m else ""
-
-    if not is_prompt and text[0] not in splits and len(_get_first(text)) < 4:
-        text = "。" + text
-
-    phones, word2ph, norm = clean_text(text, lang, version)
-    ids = cleaned_text_to_sequence(phones, version=version)
-    return ids, (ids, word2ph, norm)
 
 
 # ---------------------------------------------------------------------------
@@ -212,51 +182,67 @@ def main() -> None:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-    from gsovits_mlx.text.bert_tokenizer import encode_text, find_tokenizer_json, load_bert_tokenizer
     from gsovits_mlx.io import load_mlx_safetensors
-    from gsovits_mlx.text.bert import BertModel
     from gsovits_mlx.text.hubert import HubertModel
     from gsovits_mlx.text.mel_frontend import spectrogram
     from gsovits_mlx.pipeline import _load_sovits_v1v2, load_gpt
 
+    # resolve --ref-cache BEFORE bootstrap() chdirs into the CPUFast repo
+    if args.ref_cache:
+        args.ref_cache = os.path.abspath(args.ref_cache)
     # --- 1. text front-end: phones + BERT features for prompt and target ---
+    # Official semantics via the vendored CPUFast modules (multi-language,
+    # pre_seg_text rules, non-zh all-zero bert); zh G2PW runs on MLX (no
+    # torch). cut0 + zh defaults keep the stage-1 75/75 parity path exact.
     t0 = time.perf_counter()
-    clean_text, cleaned_text_to_sequence, splits = init_text_frontend(
-        args.cpufast_repo, os.path.join(args.models_root, "..", "pretrained_models",
-                                        "chinese-roberta-wwm-ext-large"))
-    bert_dir = os.path.join(args.models_root, "bert")
-    bert_arrays = load_mlx_safetensors(os.path.join(bert_dir, "bert.safetensors"))
-    bert_arrays = {k: mx.array(np.asarray(v, np.float32)) for k, v in bert_arrays.items()
-                   if "position_ids" not in k}
-    bert_cfg = json.load(open(os.path.join(bert_dir, "config.json")))
-    bert = BertModel(bert_arrays, bert_cfg)
-    tok = load_bert_tokenizer(find_tokenizer_json(args.models_root))
+    from gsovits_mlx.text.preproc import TextFrontend, bootstrap
+    from gsovits_mlx.text import ref_cache
 
-    def bert_feat(seg_info):
-        cols = []
-        for ids, w2p, norm in seg_info:
-            enc = encode_text(tok, norm)
-            f = bert.get_bert_feature(mx.array(enc["input_ids"], mx.int32),
-                                      mx.array(enc["attention_mask"], mx.float32), w2p)
-            mx.eval(f)
-            cols.append(np.array(f))
-        return np.concatenate(cols, axis=1)  # (1024, T)
+    bootstrap(args.cpufast_repo, models_root=args.models_root)
+    # MLX device for the front-end (BERT/G2PW). Default cpu: the e2e GPU
+    # stages run under the gpu.lock discipline; the front-end only needs
+    # Metal for front-end-only speed runs (GSOVITS_FRONTEND_DEVICE=gpu).
+    fe = TextFrontend(models_root=args.models_root, lazy=True,
+                      device=os.environ.get("GSOVITS_FRONTEND_DEVICE", "cpu"))
+    prompt_lang = args.prompt_lang or args.lang
 
-    p_ids, p_info = phones_and_bert(clean_text, cleaned_text_to_sequence, splits,
-                                    args.ref_text, args.lang, args.cleaner_version,
-                                    is_prompt=True)
-    t_ids, t_info = phones_and_bert(clean_text, cleaned_text_to_sequence, splits,
-                                    args.text, args.lang, args.cleaner_version,
-                                    is_prompt=False)
-    p_bert = bert_feat([p_info])
-    t_bert = bert_feat([t_info])
-    all_phones = mx.array([p_ids + t_ids], mx.int32)
+    def frontend_run():
+        cache_key = ref_cache.cache_key(
+            args.ref_audio, args.ref_text, prompt_lang, args.cleaner_version) \
+            if args.ref_cache else None
+        if cache_key:
+            got = ref_cache.get_cached(ref_cache.cache_dir(args.ref_cache), cache_key)
+            if got:
+                _, arrays = got
+                return arrays["p_ids"], arrays["p_bert"], \
+                    arrays["t_ids"], arrays["t_bert"], True
+        p = fe.segment_prompt(args.ref_text, prompt_lang, args.cleaner_version)
+        t = fe.preprocess(args.text, args.lang, args.text_split_method, args.cleaner_version)
+        p_ids, p_bert = p.phones, p.bert
+        t_ids = [ph for r in t for ph in r.phones]
+        t_bert = np.concatenate([r.bert for r in t], axis=1)
+        if cache_key:
+            try:
+                ref_cache.put_cached(
+                    ref_cache.cache_dir(args.ref_cache), cache_key,
+                    {"ref_text": args.ref_text, "lang": args.lang,
+                     "prompt_lang": prompt_lang, "version": args.cleaner_version},
+                    {"p_ids": np.asarray(p_ids, np.int32), "p_bert": p_bert,
+                     "t_ids": np.asarray(t_ids, np.int32), "t_bert": t_bert})
+            except OSError:
+                pass
+        return p_ids, p_bert, t_ids, t_bert, False
+
+    p_ids, p_bert, t_ids, t_bert, cache_hit = frontend_run()
+    all_phones = mx.array([list(p_ids) + list(t_ids)], mx.int32)
     # all_bert = concat(prompt_bert, target_bert) along time -- official layout
-    all_bert = mx.array(np.concatenate([p_bert, t_bert], axis=1))[None]  # (1, 1024, Tp+Tt)
+    all_bert = mx.array(np.concatenate([np.asarray(p_bert), np.asarray(t_bert)], axis=1))[None]  # (1, 1024, Tp+Tt)
     mx.eval(all_phones, all_bert)
     times["frontend"] = time.perf_counter() - t0
+    times["frontend_cache_hit"] = cache_hit
     if args.bench:
         print(f"[bench] frontend: phones={all_phones.shape} bert={all_bert.shape} "
+              f"{'CACHE_HIT ' if times.get('frontend_cache_hit') else ''}"
               f"{times['frontend']:.2f}s", file=sys.stderr)
 
     # --- 2. prompt semantic codes: HuBERT -> SoVITS quantizer ---

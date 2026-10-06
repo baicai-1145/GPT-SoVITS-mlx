@@ -75,16 +75,33 @@ class TextFrontend:
 
     def __init__(self, cpufast_repo: str | None = None,
                  models_root: str = "/Volumes/2T/gpt-sovits-models/mlx",
-                 device: str = "gpu"):
+                 device: str = "gpu", lazy: bool = False):
         self.models_root = models_root
         self.device = device
         if device == "cpu":
             import mlx.core as mx
 
             mx.set_default_device(mx.cpu)
+        else:
+            _assert_gpu_allowed(device)
         self._bert = None      # MLX BertModel
         self._tok = None       # tokenizers.Tokenizer
         self._zero_cache: dict[int, np.ndarray] = {}
+        self._lazy = lazy
+        self._splits = None
+        self._first_pattern = None
+        self._cpufast_repo = cpufast_repo
+        if lazy:
+            # Goal-B first-call latency: defer the vendored-module load (the
+            # heavy part is jieba/pypinyin dict init + English pickle dicts)
+            # until the first get_phones_and_bert call.
+            pass
+        else:
+            self._load_official()
+
+    def _load_official(self, cpufast_repo: str | None = None) -> None:
+        if self._splits is not None:
+            return
         (
             self._clean_text,
             self._clean_text_units,
@@ -93,9 +110,9 @@ class TextFrontend:
             self._get_seg_method,
             self._split_big_text,
             self._lang_texts,
-        ) = vendored_cpufront.front_end(cpufast_repo)
+        ) = vendored_cpufront.front_end(
+            self._cpufast_repo if cpufast_repo is None else cpufast_repo)
         self._first_pattern = "[" + "".join(re.escape(s) for s in self._splits) + "]"
-
     # ------------------------------------------------------------------
     # BERT (lazy; zh segments only)
     # ------------------------------------------------------------------
@@ -192,6 +209,8 @@ class TextFrontend:
                      text_split_method: str = "cut0") -> list:
         """Official TextPreprocessor.pre_seg_text (target text ONLY; the
         prompt path must not call this — see segment_prompt)."""
+        if self._lazy:
+            self._load_official()
         text = text.strip("\n")
         if len(text) == 0:
             return []
@@ -322,6 +341,8 @@ class TextFrontend:
     def get_phones_and_bert(self, text: str, language: str, version: str = "v2",
                             final: bool = False) -> FrontEndResult:
         """Official get_phones_and_bert_with_phone_units (minus phone_units)."""
+        if self._lazy:
+            self._load_official()
         languages = self.V1_LANGUAGES if version == "v1" else self.V2_LANGUAGES
         if language not in languages:
             raise ValueError(
@@ -375,6 +396,8 @@ class TextFrontend:
         separator, then segment_and_extract_feature_for_text
         (get_phones_and_bert, full language-mode semantics; never the
         pre_seg_text '<4-char '。' prefix' rule)."""
+        if self._lazy:
+            self._load_official()
         text = ref_text.strip("\n")
         if not text:
             raise ValueError("empty prompt text")
@@ -394,3 +417,38 @@ def bootstrap(cpufast_repo: str | None = None,
         os.chdir(repo)
     if not os.environ.get("bert_path"):
         os.environ["bert_path"] = os.path.join(models_root, "bert")
+
+
+def _assert_gpu_allowed(device: str) -> None:
+    """GPU-lock discipline (lead mandate, task-2): selecting the Metal device
+    requires holding .tmp/gpu.lock.d (owner file naming this agent/task).
+    The lock dir lives at the MAIN checkout's .tmp (repo-root sibling)."""
+    if device != "gpu":
+        return
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # The worktree lives INSIDE the main checkout's tree
+    # (<main>/.pi/herdr-team/<agent>/worktrees/<name>), so walking up the
+    # ancestors covers both the main checkout's .tmp/gpu.lock.d and any
+    # worktree-local one.
+    seen = []
+    d = here
+    while True:
+        lock = os.path.join(d, ".tmp", "gpu.lock.d")
+        if os.path.isdir(lock):
+            try:
+                owner = open(os.path.join(lock, "owner")).read().strip()
+            except OSError:
+                owner = ""
+            if "perf-frontend" in owner or "task-2" in owner:
+                return
+            raise RuntimeError(
+                f"GPU device requested but gpu.lock is not ours "
+                f"(owner={owner!r}); run CPU-side or claim the lock first")
+        seen.append(d)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    raise RuntimeError(
+        "GPU device requested but no .tmp/gpu.lock.d found (searched: "
+        + ", ".join(seen) + "); claim the lock before Metal runs")

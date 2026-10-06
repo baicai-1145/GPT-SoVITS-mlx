@@ -1,5 +1,5 @@
 {
- "_meta": "digests of (phones int32 bytes + bert fp32 bytes), sha256[:16]; captured against official CPUFast parity 2026-10-07 (7/7 matrix + 23/23 edge cases exact); regression anchor for the vendored front-end",
+ "_meta": "digests of (phones int32 bytes + bert fp32 bytes), sha256[:16]; captured against official CPUFast parity 2026-10-07 (7/7 matrix + 23/23 edge cases exact); regression anchor for the vendored front-end; combined bench anchor (prompt29+target46=75 phones, e2e defaults) = 0ec357bcc77f3154",
  "cells": {
   "{\"text\": \"你好，欢迎来到各自的旅程。今天我们聊聊机器学习。\", \"lang\": \"zh\", \"version\": \"v2\"}": "c44b505bfa883b04",
   "{\"text\": \"Hello, welcome to our journey. Today let's talk about machine learning.\", \"lang\": \"en\", \"version\": \"v2\"}": "b0aad9d0961c8524",
@@ -10,6 +10,7 @@
   "{\"text\": \"今天我们来 discuss AI、機械学習と 한국어 mixing 一起。\", \"lang\": \"auto\", \"version\": \"v2\"}": "4f92d967d6400309",
   "{\"text\": \"在2024年GPT-SoVITS达到了0.15的RTF\", \"lang\": \"all_zh\", \"version\": \"v2\"}": "01522a2ca2b42b67",
   "{\"text\": \"你好。\", \"lang\": \"zh\", \"version\": \"v2\"}": "78bf6eda960efcf3",
-  "{\"text\": \"希望你以后能够做得比我还好哟。\", \"lang\": \"zh\", \"version\": \"v2\", \"kind\": \"prompt\"}": "8c077f274a8073f0"
+  "{\"text\": \"希望你以后能够做得比我还好哟。\", \"lang\": \"zh\", \"version\": \"v2\", \"kind\": \"prompt\"}": "8c077f274a8073f0",
+  "{\"kind\": \"bench_combined\", \"ref_text\": \"希望你以后能够做得比我还好哟。\", \"text\": \"你好，欢迎来到各自的旅程。今天我们聊聊机器学习。\", \"lang\": \"zh\", \"version\": \"v2\"}": "0ec357bcc77f3154"
  }
 }
