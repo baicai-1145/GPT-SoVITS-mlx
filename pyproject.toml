@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "GPT-SoVITS text-to-speech on Apple MLX (v1/v2/v2Pro/v2ProPlus/v3/v4/v5dev/v5turbo)"
 requires-python = ">=3.12"
 dependencies = [
-    "mlx>=0.21",
+    # Pinned exactly: MLX kernel releases change fp ulp behavior, which flips
+    # near-tie AR sampler decisions and shifts seeded e2e anchors (0.32.2 vs
+    # 0.32.3 -> 119 vs 112 tokens on the bench cell). Upgrade = re-render all
+    # anchors in /Volumes/2T/gpt-sovits-models/bench/mlx_seed0/ (see BENCH.md).
+    "mlx==0.32.2",
     "numpy>=1.26",
     "tokenizers>=0.19",
     "soundfile>=0.12",
