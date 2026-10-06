@@ -224,3 +224,6 @@ __pycache__/
 .venv/
 *.wav
 !tests/data/*.wav
+
+# pi team state
+.pi/

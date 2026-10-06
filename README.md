@@ -22,7 +22,7 @@ per-version parity numbers and quirks live in
 Requires Python 3.12+ and an Apple-silicon Mac. With [uv](https://docs.astral.sh/uv/):
 
 ```bash
-uv sync                      # runtime deps: mlx, numpy, transformers, tokenizers, soundfile
+uv sync                      # runtime deps: mlx, numpy, tokenizers, soundfile
 uv sync --extra convert      # + torch (ONLY for weight conversion)
 uv sync --extra dev          # + pytest
 ```

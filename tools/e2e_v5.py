@@ -194,11 +194,14 @@ def load_audio_official(path: str, target_sr: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    args = parse_args()
+    # AR sampling draws its inverse-CDF uniform from numpy's global RNG
+    # (gsovits_mlx/gpt/t2s.py::_sample); seed it so runs are reproducible.
+    np.random.seed(args.seed)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     from gsovits_mlx.sovits.cfm import resolve_sampling
-    args = parse_args()
     version = "v5dev" if args.model == "dev" else "v5turbo"
     steps, cfg = resolve_sampling(version, args.steps, args.cfg_rate)
     if args.out is None:
@@ -211,8 +214,8 @@ def main() -> None:
 
     import mlx.core as mx
     import soundfile as sf
-    from transformers import AutoTokenizer
-
+    
+    from gsovits_mlx.text.bert_tokenizer import encode_text, find_tokenizer_json, load_bert_tokenizer
     from gsovits_mlx.io import load_mlx_safetensors
     from gsovits_mlx.text.bert import BertModel
     from gsovits_mlx.text.hubert import HubertModel
@@ -232,14 +235,12 @@ def main() -> None:
                    if "position_ids" not in k}
     bert_cfg = json.load(open(os.path.join(bert_dir, "config.json")))
     bert = BertModel(bert_arrays, bert_cfg)
-    tok = AutoTokenizer.from_pretrained(os.path.join(args.models_root, "..",
-                                                     "pretrained_models",
-                                                     "chinese-roberta-wwm-ext-large"))
+    tok = load_bert_tokenizer(find_tokenizer_json(args.models_root))
 
     def bert_feat(seg_info):
         cols = []
         for ids, w2p, norm in seg_info:
-            enc = tok(norm, return_tensors="np")
+            enc = encode_text(tok, norm)
             f = bert.get_bert_feature(mx.array(enc["input_ids"], mx.int32),
                                       mx.array(enc["attention_mask"], mx.float32), w2p)
             mx.eval(f)

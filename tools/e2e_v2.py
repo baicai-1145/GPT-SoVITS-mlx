@@ -24,6 +24,7 @@ import re
 import resource
 import sys
 import time
+import types
 
 import numpy as np
 
@@ -75,6 +76,32 @@ def parse_args() -> argparse.Namespace:
 # Text front-end (the only piece borrowed from the official CPUFast repo)
 # ---------------------------------------------------------------------------
 
+def _stub_tts_infer_pack_init(cpufast_repo: str):
+    """Make `import TTS_infer_pack.text_segmentation_method` work without
+    executing the package __init__ (which pulls torch via TTS.py — torch is
+    not installed in the MLX runtime env).
+
+    text_segmentation_method.py itself is stdlib-only (re/typing) and the
+    official module registers the cut0..cut5 split methods via decorators at
+    import time; executing it standalone preserves that.
+    """
+    pkg_name = "TTS_infer_pack"
+    if pkg_name in sys.modules:
+        return
+    pkg_path = os.path.join(os.path.abspath(cpufast_repo), "GPT_SoVITS", pkg_name)
+    pkg = types.ModuleType(pkg_name)
+    pkg.__path__ = [pkg_path]
+    sys.modules[pkg_name] = pkg
+
+    mod_name = pkg_name + ".text_segmentation_method"
+    src = open(os.path.join(pkg_path, "text_segmentation_method.py"),
+               encoding="utf-8").read()
+    mod = types.ModuleType(mod_name)
+    mod.__file__ = os.path.join(pkg_path, "text_segmentation_method.py")
+    exec(compile(src, mod.__file__, "exec"), mod.__dict__)
+    sys.modules[mod_name] = mod
+
+
 def init_text_frontend(cpufast_repo: str, bert_path: str):
     """Import the official cleaner + segmentation helpers (read-only use)."""
     if not os.path.isdir(cpufast_repo):
@@ -84,6 +111,7 @@ def init_text_frontend(cpufast_repo: str, bert_path: str):
     sys.path.insert(0, "GPT_SoVITS")
     sys.path.insert(0, ".")
     os.environ["bert_path"] = bert_path
+    _stub_tts_infer_pack_init(cpufast_repo)
     from text.cleaner import clean_text
     from text import cleaned_text_to_sequence
     from TTS_infer_pack.text_segmentation_method import splits
@@ -187,6 +215,9 @@ def load_audio_official(path: str, target_sr: int) -> np.ndarray:
 
 def main() -> None:
     args = parse_args()
+    # AR sampling draws its inverse-CDF uniform from numpy's global RNG
+    # (gsovits_mlx/gpt/t2s.py::_sample); seed it so runs are reproducible.
+    np.random.seed(args.seed)
     # init_text_frontend() chdirs into the CPUFast repo (its cleaner imports
     # need the CWD); resolve any relative --out before that happens.
     args.out = os.path.abspath(args.out)
@@ -194,13 +225,12 @@ def main() -> None:
     times: dict[str, float] = {}
 
     import mlx.core as mx
-    import numpy as np
     import soundfile as sf
-    from transformers import AutoTokenizer
-
+    
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
+    from gsovits_mlx.text.bert_tokenizer import encode_text, find_tokenizer_json, load_bert_tokenizer
     from gsovits_mlx.io import load_mlx_safetensors
     from gsovits_mlx.text.bert import BertModel
     from gsovits_mlx.text.hubert import HubertModel
@@ -218,14 +248,12 @@ def main() -> None:
                    if "position_ids" not in k}
     bert_cfg = json.load(open(os.path.join(bert_dir, "config.json")))
     bert = BertModel(bert_arrays, bert_cfg)
-    tok = AutoTokenizer.from_pretrained(os.path.join(args.models_root, "..",
-                                                     "pretrained_models",
-                                                     "chinese-roberta-wwm-ext-large"))
+    tok = load_bert_tokenizer(find_tokenizer_json(args.models_root))
 
     def bert_feat(seg_info):
         cols = []
         for ids, w2p, norm in seg_info:
-            enc = tok(norm, return_tensors="np")
+            enc = encode_text(tok, norm)
             f = bert.get_bert_feature(mx.array(enc["input_ids"], mx.int32),
                                       mx.array(enc["attention_mask"], mx.float32), w2p)
             mx.eval(f)
