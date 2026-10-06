@@ -107,13 +107,16 @@ def rope_rotate_half(x: mx.array) -> mx.array:
 
 
 def apply_rope(t: mx.array, freqs: mx.array) -> mx.array:
-    """t: (B, H, T, D); freqs: (T, D/2) raw angles -> rotated.
+    """t: (B, H, T, D); freqs: (T, D/2) RAW fp32 angles -> rotated.
 
     torch packs freqs interleaved ([f0, f0, f1, f1, ...]); we repeat cos/sin
     to the same layout instead of materialising the interleaved angles.
+    Angles stay fp32 (fp16 angles at T>~2048 quantize to >0.5 rad and destroy
+    cos/sin); cos/sin are cast to t.dtype so the attention graph keeps t's
+    precision (fp16 weights -> fp16 GEMMs, fp32 weights -> unchanged).
     """
-    cosv = mx.repeat(mx.cos(freqs), 2, axis=-1)
-    sinv = mx.repeat(mx.sin(freqs), 2, axis=-1)
+    cosv = mx.repeat(mx.cos(freqs), 2, axis=-1).astype(t.dtype)
+    sinv = mx.repeat(mx.sin(freqs), 2, axis=-1).astype(t.dtype)
     return t * cosv[None, None] + rope_rotate_half(t) * sinv[None, None]
 
 
@@ -147,11 +150,16 @@ class Attention(nn.Module):
         q_h = mx.concatenate([apply_rope(q_h[:, :1], rope), q_h[:, 1:]], axis=1)
         k_h = mx.concatenate([apply_rope(k_h[:, :1], rope), k_h[:, 1:]], axis=1)
 
-        if mask is not None:
-            attn_mask = mask[:, None, None, :].astype(mx.float32)  # (B,1,1,T)
-            neg = mx.array(-1e9, mx.float32)
-        out = mx.fast.scaled_dot_product_attention(q_h, k_h, v, scale=1.0 / math.sqrt(self.dim_head),
-                                                   mask=mask[:, None, None, :] if mask is not None else None)
+        # SDPA (softmax/exp + value mix) runs fp32 even under fp16 weights:
+        # it is a small share of block time but the dominant precision
+        # amplifier (task-1: kept v5turbo's 32-step v_pos error just over the
+        # 2e-2 gate in pure fp16). No-op when inputs are fp32.
+        sdpa_dt = mx.float32 if q_h.dtype != mx.float32 else q_h.dtype
+        out = mx.fast.scaled_dot_product_attention(
+            q_h.astype(sdpa_dt), k_h.astype(sdpa_dt), v.astype(sdpa_dt),
+            scale=1.0 / math.sqrt(self.dim_head),
+            mask=(mask[:, None, None, :].astype(sdpa_dt)
+                  if mask is not None else None)).astype(q_h.dtype)
         out = out.transpose(0, 2, 1, 3).reshape(b, t, self.heads * self.dim_head)
         out = out @ self.to_out_0_w.T + self.to_out_0_b
         if mask is not None:
@@ -180,10 +188,16 @@ class AdaLayerNormZero(nn.Module):
         super().__init__()
         self.linear_w = mx.zeros((dim * 6, dim))
         self.linear_b = mx.zeros((dim * 6,))
+        self._cdtype = None
 
     def __call__(self, x: mx.array, emb: mx.array):
-        # x: (B, T, D); emb: (B, D)
-        emb = nn.silu(emb) @ self.linear_w.T + self.linear_b
+        # x: (B, T, D); emb: (B, D). Modulation GEMM runs in the weight dtype;
+        # outputs cast back to the stream dtype (fp32) so downstream multiplies
+        # don't promote. No-ops when weights are fp32.
+        if self._cdtype is None:
+            self._cdtype = self.linear_w.dtype
+        cd = self._cdtype
+        emb = (nn.silu(emb).astype(cd) @ self.linear_w.T + self.linear_b).astype(x.dtype)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [emb[:, i*x.shape[-1]:(i+1)*x.shape[-1]] for i in range(6)]
         norm = _ln_noaffine(x)
         x = norm * (1 + scale_msa[:, None]) + shift_msa[:, None]
@@ -195,17 +209,25 @@ class AdaLayerNormZero_Final(nn.Module):
         super().__init__()
         self.linear_w = mx.zeros((dim * 2, dim))
         self.linear_b = mx.zeros((dim * 2,))
+        self._cdtype = None
 
     def __call__(self, x: mx.array, emb: mx.array) -> mx.array:
-        emb = nn.silu(emb) @ self.linear_w.T + self.linear_b
+        # same mixed-precision treatment as AdaLayerNormZero
+        if self._cdtype is None:
+            self._cdtype = self.linear_w.dtype
+        cd = self._cdtype
+        emb = (nn.silu(emb).astype(cd) @ self.linear_w.T + self.linear_b).astype(x.dtype)
         scale, shift = emb[:, : x.shape[-1]], emb[:, x.shape[-1]:]
         return _ln_noaffine(x) * (1 + scale[:, None]) + shift[:, None]
 
 
 def _ln_noaffine(x: mx.array) -> mx.array:
-    mu = mx.mean(x, axis=-1, keepdims=True)
-    var = mx.mean((x - mu) ** 2, axis=-1, keepdims=True)
-    return (x - mu) / mx.sqrt(var + 1e-6)
+    # fp32-internal: fp16 mean/var over 1024 dims loses too much precision
+    # (task gate: LayerNorm stays fp32 internally; no-op when x is fp32).
+    xf = x.astype(mx.float32)
+    mu = mx.mean(xf, axis=-1, keepdims=True)
+    var = mx.mean((xf - mu) ** 2, axis=-1, keepdims=True)
+    return ((xf - mu) / mx.sqrt(var + 1e-6)).astype(x.dtype)
 
 
 class DiTBlock(nn.Module):
@@ -218,14 +240,22 @@ class DiTBlock(nn.Module):
         self.attn_norm = AdaLayerNormZero(dim)
         self.attn = Attention(dim, heads, dim_head, dropout)
         self.ff = FeedForward(dim=dim, mult=ff_mult, approximate="tanh")
+        self._cdtype = None  # block compute dtype, resolved from weights on first call
 
     def __call__(self, x: mx.array, t: mx.array, mask: mx.array | None, rope: mx.array) -> mx.array:
+        if self._cdtype is None:
+            self._cdtype = self.attn.to_q_w.dtype
+        cd = self._cdtype
+        # Mixed precision (fp16 exports): GEMMs/SDPA run in the weight dtype
+        # while the residual stream + conditioning stay fp32. Per-block input
+        # quantization only — no compounding through the stream/steps. No-op
+        # casts when cd is fp32.
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
-        attn_output = self.attn(norm, mask, rope)
-        x = x + gate_msa[:, None] * attn_output
+        attn_output = self.attn(norm.astype(cd), mask, rope)
+        x = x + (gate_msa[:, None] * attn_output).astype(x.dtype)
         norm = _ln_noaffine(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
-        ff_output = self.ff(norm)
-        x = x + gate_mlp[:, None] * ff_output
+        ff_output = self.ff(norm.astype(cd))
+        x = x + (gate_mlp[:, None] * ff_output).astype(x.dtype)
         return x
 
 
@@ -246,7 +276,9 @@ class TextEmbedding(nn.Module):
             text = mx.zeros_like(text)
         if self.conv_layers > 0:
             idx = get_pos_embed_indices(0, seq_len, self.precompute_max_pos)
-            text = text + self._freqs[idx][None]
+            # _freqs stays fp32 (cos/sin precision); cast the sum back so fp16
+            # activations do not get promoted to fp32 by this add.
+            text = (text + self._freqs[idx][None]).astype(text.dtype)
             for blk in self.text_blocks:
                 text = blk(text)
         return text
@@ -320,27 +352,37 @@ class DiT(nn.Module):
         # cached per seq_len; RAW angles (T, dim_head/2) — apply_rope derives
         # interleaved cos/sin. (torch RotaryEmbedding: inv_freq = theta**-arange(0,d,2)/d,
         # freqs = t[:, None] * inv_freq[None, :], then stack((f,f),-1).reshape.)
+        # The cache ALWAYS stays fp32: fp16 angles at long T quantize coarsely
+        # (ulp ~0.5 rad near 934) and corrupt cos/sin. `dtype` is accepted for
+        # call-site compatibility; cos/sin are cast in apply_rope instead.
         cache = getattr(self, "_rope_cache", None)
-        if cache is None or cache.shape[0] < seq_len or cache.dtype != dtype:
+        if cache is None or cache.shape[0] < seq_len:
             half = self.dim_head // 2
             inv_freq = 1.0 / (10000.0 ** (mx.arange(0, half, dtype=mx.float32) / half))
             t = mx.arange(max(seq_len, 4096), dtype=mx.float32)
-            cache = (t[:, None] * inv_freq[None, :]).astype(dtype)
+            cache = t[:, None] * inv_freq[None, :]
             self._rope_cache = cache
         return cache[:seq_len]
 
     def prepare_static_cache(self, cond0: mx.array, x_lens, text0: mx.array):
-        """Precompute text embedding, static input projection and rope (v5 path)."""
-        text = mx.transpose(text0, (0, 2, 1))
-        cond = mx.transpose(cond0, (0, 2, 1))
+        """Precompute text embedding, static input projection and rope (v5 path).
+
+        Built ONCE per chunk, so the conditioner runs fp32 (upcast inputs):
+        fp16 conditioning costs ~2.6e-3 velocity error at step 0 vs ~1e-4 fp32
+        (probe: .tmp/task1_dtype_probe2.py), which would eat most of the 2e-2
+        parity gate. The 22 transformer blocks still run in the weight dtype
+        (fp16) — that's where the GEMM time goes.
+        """
+        text = mx.transpose(text0, (0, 2, 1)).astype(mx.float32)
+        cond = mx.transpose(cond0, (0, 2, 1)).astype(mx.float32)
         seq_len = cond.shape[1]
         text_embed = self.text_embed(text, seq_len, drop_text=False)
         mel_dim = cond.shape[-1]
-        static = (mx.concatenate([cond, text_embed], axis=-1) @ self.input_embed.proj_w[:, mel_dim:].T
-                  + self.input_embed.proj_b)
+        static = (mx.concatenate([cond, text_embed], axis=-1) @ self.input_embed.proj_w.astype(mx.float32)[:, mel_dim:].T
+                  + self.input_embed.proj_b.astype(mx.float32))
         negative_static = (mx.concatenate([mx.zeros_like(cond), text_embed], axis=-1)
-                           @ self.input_embed.proj_w[:, mel_dim:].T + self.input_embed.proj_b)
-        mask = sequence_mask_2d(x_lens, seq_len)
+                           @ self.input_embed.proj_w.astype(mx.float32)[:, mel_dim:].T + self.input_embed.proj_b.astype(mx.float32))
+        mask = sequence_mask_2d(x_lens, seq_len).astype(static.dtype)
         return {"condition": static, "negative_condition": negative_static, "mask": mask,
                 "rope": self._rope(seq_len, static.dtype)}
 
@@ -353,7 +395,7 @@ class DiT(nn.Module):
         if static_cache is not None:
             mask = static_cache["mask"]
         else:
-            mask = sequence_mask_2d(x_lens, x.shape[1])
+            mask = sequence_mask_2d(x_lens, x.shape[1]).astype(x.dtype)
 
         batch, seq_len = x.shape[0], x.shape[1]
         # torch: t = time_embed(time); dt = d_embed(dt_base) (first call) or dt_cache;
@@ -375,9 +417,25 @@ class DiT(nn.Module):
             text_embed = text_cache if (infer and text_cache is not None) else self.text_embed(
                 text, seq_len, drop_text=drop_text)
             x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
+        # GSOVITS_DIT_FP16_BLOCKS=1 (perf experiments only): run the residual
+        # stream in fp16 as well. Default design: stream/conditioning stay
+        # fp32; each block quantizes only its GEMM/SDPA inputs to the weight
+        # dtype (DiTBlock / AdaLayerNormZero). Gated trajectory diffs (task-1):
+        # full-fp16 stream fails the 2e-2 gate (v5turbo 1.3e-1); block-internal
+        # fp16 with fp32 stream passes.
+        import os as _os
+        if _os.environ.get("GSOVITS_DIT_FP16_BLOCKS", "0") == "1":
+            x = x.astype(self.transformer_blocks[0].attn.to_q_w.dtype)
+        # Keep the modulation stream in the activation dtype: time_embed runs
+        # fp32 internally (sinus emb needs the range), but letting fp32 meet
+        # fp16 here would promote the whole graph back to fp32 via NumPy
+        # promotion rules and forfeit the fp16 GEMM win. No-op when fp32.
+        t = t.astype(x.dtype)
 
         rope = static_cache["rope"] if static_cache is not None else self._rope(seq_len, x.dtype)
 
+        # Mask follows the SDPA compute dtype inside Attention; the fp32
+        # multiplies below just broadcast a 0/1 mask.
         residual = x
         for block in self.transformer_blocks:
             x = block(x, t, mask, rope)

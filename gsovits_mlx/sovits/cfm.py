@@ -51,7 +51,10 @@ class CFM:
         """mu: (B, T, C) condition; prompt: (B, C, T_p) reference mel (normed).
         Returns generated (B, C, T)."""
         B, T = mu.shape[0], mu.shape[1]
-        dtype = mu.dtype
+        # Euler STATE stays fp32 (mixed-precision policy: fp16 GEMMs inside the
+        # DiT, fp32 accumulation between steps) — torch reference accumulates
+        # fp32; fp16 state drifts ~6e-3 over 32 steps.
+        dtype = mx.float32
         x = mx.random.normal((B, self.in_channels, T), key=key).astype(dtype) * temperature
         prompt_len = prompt.shape[-1]
         prompt_x = mx.zeros_like(x)
@@ -106,7 +109,8 @@ class CFMV5:
         steps, cfg = validate_v5_sampling(n_timesteps, inference_cfg_rate)
         batch, frames = mu.shape[0], mu.shape[1]
         prompt_len = prompt.shape[-1]
-        dtype = mu.dtype
+        # Euler STATE stays fp32 (see CFM.inference note).
+        dtype = mx.float32
         x = mx.random.normal((batch, self.in_channels, frames), key=key).astype(dtype) * V5_TEMPERATURE
         x[:, :, :prompt_len] = 0
         prompt_x = mx.zeros_like(x).astype(dtype)
