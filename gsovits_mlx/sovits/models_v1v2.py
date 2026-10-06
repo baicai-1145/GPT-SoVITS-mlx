@@ -267,7 +267,7 @@ class SynthesizerTrn(nn.Module):
         if self.is_v2pro:
             self.sv_emb = ConvlessLinear(20480, gin_channels)
             self.ge_to512 = ConvlessLinear(gin_channels, 512)
-            self.prelu_weight = mx.ones((gin_channels,))
+            self.prelu_weight = mx.ones((1, gin_channels, 1))
         self.quantizer = ResidualVectorQuantizer(mx.zeros((1024, ssl_dim)))
 
     # -- reference embedding ------------------------------------------------

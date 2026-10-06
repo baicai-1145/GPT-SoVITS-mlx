@@ -673,3 +673,36 @@ def convert_bigvgan(gen_pt_path: str, config_path: str, out_dir: str, fp16: bool
     with open(os.path.join(out_dir, "bigvgan.json"), "w") as f:
         json.dump(meta, f, indent=1)
     return len(arrays)
+
+
+# ---------------------------------------------------------------------------
+# ERes2NetV2 speaker encoder (v2Pro/v2ProPlus sv embedding)
+# ---------------------------------------------------------------------------
+
+def convert_sv_encoder(ckpt_path: str, out_dir: str, fp16: bool = False):
+    """pretrained_eres2netv2w24s4ep4.ckpt (plain convs + BN running stats)
+    -> sv.safetensors + sv.json. BN layers are kept UNFOLDED (eval BN applied
+    from running stats at runtime); convs are bias-free."""
+    import torch
+
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    arrays: dict[str, np.ndarray] = {}
+    for k, v in sd.items():
+        v = v.float().numpy()
+        if k.endswith("weight") and v.ndim == 4:
+            # torch conv2d (out, in, kh, kw) -> MLX (out, kh, kw, in)
+            v = np.ascontiguousarray(v.transpose(0, 2, 3, 1))
+            arrays[k] = v
+        elif "num_batches_tracked" in k:
+            continue
+        else:
+            arrays[k] = v
+    if fp16:
+        arrays = {k: v.astype(np.float16) for k, v in arrays.items()}
+    save_safetensors(os.path.join(out_dir, "sv.safetensors"), arrays)
+    meta = {"base_width": 24, "scale": 4, "expansion": 4, "num_blocks": [3, 4, 6, 3],
+            "m_channels": 64, "feat_dim": 80, "embedding_size": 192,
+            "sample_rate": 16000, "num_mel_bins": 80}
+    with open(os.path.join(out_dir, "sv.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+    return len(arrays)

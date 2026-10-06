@@ -330,3 +330,37 @@ e2e: `bench/mlx/v5dev.wav` (8.84 s, 120 AR tokens, cfg 1.3) and
 `bench/mlx/v5turbo.wav` (8.40 s, 109 AR tokens, 4 steps, cfg 0.0), both
 48 kHz, listen-verified intelligible with no chunk-boundary artifacts.
 Wall: ~88 s (dev) / ~59 s (turbo), peak RSS 2.3–4.0 GB.
+
+## v2Pro/v2ProPlus addendum (task-8, e2e_v2pro.py — v2 + sv speaker vector)
+
+The v2Pro ports (`tools/e2e_v2pro.py --model pro|proplus`, weights
+pretrained_models/v2Pro/{s2Gv2Pro,s2Gv2ProPlus}.pth + sv/pretrained_eres2netv2w24s4ep4.ckpt)
+reuse the v2 direct-waveform decode with a speaker-vector condition. Findings:
+
+1. **sv branch.** The 16 kHz reference wav (RAW, no zero_wav padding) goes through a
+   numpy port of torchaudio's kaldi fbank (80 bins, povey window^0.85, snip_edges,
+   preemphasis 0.97, power spectrum, log with float-eps floor; `kaldi_fbank.py`)
+   -> ERes2NetV2 forward3 -> (1, 20480). `SynthesizerTrn.get_ge` adds
+   `sv_emb(Linear 20480->gin)` to the ref_enc ge, applies PReLU, then `ge_to512`
+   (gin->512) feeds enc_p/MRTE while the 1024-dim ge drives flow + dec.
+2. **sv ckpt convs carry biases** (official fusion.py AFF uses bias=True); the
+   first converter/loader draft silently dropped them -> systematic ~1.8e-2
+   per-stage offsets and a 0.3 embedding error. With biases loaded, MLX
+   forward3 matches torch fp32 to **5.7e-6** (full path incl. fbank: 2.7e-5).
+   Debugging gotcha: the ckpt stores fp16 tensors (like the v5 ckpts).
+3. **PReLU broadcast bug.** `nn.prelu(x, w)` with x (B,C,1) and w (C,) broadcasts
+   to (B,C,C) in MLX (aligns trailing dims). prelu_weight must be stored
+   (1, C, 1).
+4. **v2Pro gin_channels is 1024** (sv_emb out, ge, flow/dec condition); enc_p
+   still consumes the 512-dim ge512 — mirrors models.py `ge512 if is_v2pro else ge`.
+
+Parity (torch CPUFast fp32 reference on this machine, ref_zh_3.5s):
+- kaldi fbank vs torchaudio: 4.1e-4 max.
+- ERes2NetV2 forward3 (torch-fbank input): 5.7e-6 max, 4.1e-7 mean.
+- full MLX sv path (numpy fbank + net): 2.7e-5 max.
+- SoVITS decode path unchanged from the verified v2 port (ge shape 1024).
+
+e2e: `bench/mlx/v2pro.wav` (8.84 s, 120 AR tokens) and
+`bench/mlx/v2proplus.wav` (8.76 s, 118 AR tokens), both 32 kHz, listen-verified
+intelligible with clean speaker timbre and no artifacts. Wall ~101 s / ~112 s,
+peak RSS 2.2–3.8 GB.

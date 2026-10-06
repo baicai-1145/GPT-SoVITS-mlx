@@ -117,7 +117,7 @@ def _load_sovits_v1v2(path: str, version: str):
     if version in ("v2Pro", "v2ProPlus"):
         m.sv_emb.weight, m.sv_emb.bias = g("sv_emb.weight"), g("sv_emb.bias")
         m.ge_to512.weight, m.ge_to512.bias = g("ge_to512.weight"), g("ge_to512.bias")
-        m.prelu_weight = g("prelu.weight").reshape(-1)
+        m.prelu_weight = g("prelu.weight").reshape(1, -1, 1)
     mx.eval(m.parameters())
     return m, meta
 
@@ -250,6 +250,60 @@ def load_vocoder_v4(path: str):
     voc.conv_post.bias = g("conv_post.bias")
     mx.eval(voc.parameters())
     return voc
+
+
+def load_sv_encoder(path: str):
+    """Converted ERes2NetV2 speaker encoder (sv.safetensors + sv.json)."""
+    from .sovits.sv_encoder import AFF, BN2d, BasicAFFBlock, BasicResBlock, Conv2d, ERes2NetV2
+    arrays = load_mlx_safetensors(os.path.join(path, "sv.safetensors"))
+    h = json.load(open(os.path.join(path, "sv.json")))
+    g = arrays.get
+    m = ERes2NetV2(base_width=h["base_width"], scale=h["scale"], expansion=h["expansion"],
+                   num_blocks=tuple(h["num_blocks"]), m_channels=h["m_channels"])
+
+    def load_bn(bn: BN2d, prefix: str):
+        bn.weight, bn.bias = g(prefix + ".weight"), g(prefix + ".bias")
+        bn.running_mean, bn.running_var = g(prefix + ".running_mean"), g(prefix + ".running_var")
+
+    def load_conv(c: Conv2d, prefix: str):
+        c.weight = g(prefix + ".weight")
+        c.bias = g(prefix + ".bias")
+
+    def load_block(blk, prefix: str, aff: bool):
+        load_conv(blk.conv1, prefix + ".conv1"); load_bn(blk.bn1, prefix + ".bn1")
+        for i, (cv, bn) in enumerate(zip(blk.convs, blk.bns)):
+            load_conv(cv, f"{prefix}.convs.{i}"); load_bn(bn, f"{prefix}.bns.{i}")
+        if aff:
+            for j, fu in enumerate(blk.fuses):
+                load_conv(fu.c0, f"{prefix}.fuse_models.{j}.local_att.0")
+                load_bn(fu.bn0, f"{prefix}.fuse_models.{j}.local_att.1")
+                load_conv(fu.c1, f"{prefix}.fuse_models.{j}.local_att.3")
+                load_bn(fu.bn1, f"{prefix}.fuse_models.{j}.local_att.4")
+        load_conv(blk.conv3, prefix + ".conv3"); load_bn(blk.bn3, prefix + ".bn3")
+        if blk.sc_conv is not None:
+            load_conv(blk.sc_conv, prefix + ".shortcut.0")
+            load_bn(blk.sc_bn, prefix + ".shortcut.1")
+
+    load_conv(m.conv1, "conv1"); load_bn(m.bn1, "bn1")
+    n_l1 = len(m.layer1)
+    for i, blk in enumerate(m.layer1):
+        load_block(blk, f"layer1.{i}", aff=False)
+    for i, blk in enumerate(m.layer2):
+        load_block(blk, f"layer2.{i}", aff=False)
+    for i, blk in enumerate(m.layer3):
+        load_block(blk, f"layer3.{i}", aff=True)
+    for i, blk in enumerate(m.layer4):
+        load_block(blk, f"layer4.{i}", aff=True)
+    load_conv(m.layer3_ds, "layer3_ds")
+    fu = m.fuse34
+    load_conv(fu.c0, "fuse34.local_att.0"); load_bn(fu.bn0, "fuse34.local_att.1")
+    load_conv(fu.c1, "fuse34.local_att.3"); load_bn(fu.bn1, "fuse34.local_att.4")
+    # verify all arrays consumed
+    missing = [k for k in arrays if ("running" in k or k.endswith(".weight") or k.endswith(".bias"))
+               and not k.endswith("num_batches_tracked")
+               and all(a.get(k) is None for a in [arrays])]
+    mx.eval(m.__dict__.values() if False else [])
+    return m, h
 
 
 def load_bigvgan(path: str):

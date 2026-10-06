@@ -30,23 +30,31 @@ class BN2d:
         self.eps = 1e-5
 
     def __call__(self, x: mx.array) -> mx.array:
-        shape = (1, -1, 1, 1)
+        # input NHWC (B, H, W, C): channel is LAST
+        shape = (1, 1, 1, -1)
         return (x - self.running_mean.reshape(shape)) / mx.sqrt(
             self.running_var.reshape(shape) + self.eps) * self.weight.reshape(shape) + self.bias.reshape(shape)
 
 
 class Conv2d:
-    """torch layout weight (out, in, kh, kw) -> MLX (out, kh, kw, in); input NHWC."""
+    """torch layout weight (out, in, kh, kw) -> MLX (out, kh, kw, in); input NHWC.
+
+    The sv ckpt convs carry biases (official fusion.py AFF uses bias=True); loaded
+    from safetensors by load_sv_encoder."""
 
     def __init__(self, in_c: int, out_c: int, k: int, stride: int = 1, padding: int = 0):
         self.weight = mx.zeros((out_c, k, k, in_c))
+        self.bias = None  # set by loader when the ckpt conv carries one
         self.stride = stride
         self.padding = padding
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.padding:
             x = mx.pad(x, [(0, 0), (self.padding, self.padding), (self.padding, self.padding), (0, 0)])
-        return mx.conv2d(x, self.weight, stride=[self.stride, self.stride])
+        y = mx.conv2d(x, self.weight, stride=[self.stride, self.stride])
+        if self.bias is None:
+            return y
+        return y + self.bias.reshape(1, 1, 1, -1)
 
 
 class AFF:
@@ -178,8 +186,9 @@ class ERes2NetV2:
         return layers
 
     def forward3(self, x: mx.array) -> mx.array:
-        # x: (B, T, 80) kaldi fbank
-        xc = x[:, None, :, :]  # (B, 1, T, 80) NHWC with C=1
+        # x: (B, T, 80) kaldi fbank. torch does (B,T,F)->(B,F,T)->(B,1,F,T) NCHW;
+        # MLX NHWC equivalent is (B, F, T, C=1).
+        xc = mx.transpose(x, (0, 2, 1))[:, :, :, None]  # (B, 80, T, 1)
         out = _relu(self.bn1(self.conv1(xc)))
         for blk in self.layer1:
             out = blk(out)
