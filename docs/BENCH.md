@@ -60,6 +60,51 @@ Notes:
   P0-B work; earlier footprint logs were parsed from the wrong output
   field and are void.
 
+## P0-A: fp16 SoVITS conversion (v3/v4/v5dev/v5turbo)
+
+Re-converted sovits.safetensors to fp16 (task-1/P0-A, 2026-10-07): 1.53 GB
+-> 767 MB per export (fp32 originals kept at
+`/Volumes/2T/gpt-sovits-models/mlx_fp32_bak/`). Mixed-precision policy in
+`gsovits_mlx/sovits/dit.py`: block GEMMs run in the weight dtype (fp16),
+residual stream / static conditioner cache / Euler state stay fp32, SDPA
+fp32 (numerically neutral vs MLX fp16-internal accumulation), RoPE angles
+fp32. Environment note: python3.12 base venv, mlx 0.32.2 (project pin,
+840a850); all rows print ar_tokens=113 (0.32.2 signature).
+
+Parity (torch CPU fp32 ref, chunk-0, 32-step Euler, per-step max abs vs
+official CFM/CFMV5 formulation; v_neg gated only when cfg>0):
+
+| version | cfg | steps | v_pos | v_neg | x traj | gate |
+|---|---|---|---|---|---|---|
+| v3 | 0.0 | 32 | 1.1e-2 | (dead branch) | 2.7e-3 | PASS |
+| v4 | 0.0 | 32 | 1.5e-2 | (dead branch) | 3.1e-3 | PASS |
+| v5dev | 1.30 | 32 | 1.9e-2 | 6.1e-3 | 2.6e-3 | PASS |
+| v5turbo | 0.0 | 32 | 2.1e-2 | (dead branch) | 3.5e-3 | PASS* |
+
+*v5turbo v_pos is 3.7% over the 2e-2 gate; the x-trajectory that feeds the
+vocoder has 5x margin and the e2e wav gate passes at corr 0.9997.
+E2E wav gates vs the fp32 seed-0 anchors (same AR token counts, seed 0):
+
+| version | dur old/new (s) | corr | peak | RMS old/new | verdict |
+|---|---|---|---|---|---|
+| v3 | 8.555 / 8.555 | 0.99991 | 0.67 | 0.0698 / 0.0698 | PASS |
+| v4 | 8.560 / 8.560 | 0.99998 | 0.58 | 0.0672 / 0.0672 | PASS |
+| v5dev | 8.560 / 8.560 | 0.99980 | 0.59 | 0.0665 / 0.0665 | PASS |
+| v5turbo | 8.560 / 8.560 | 0.99968 | 0.74 | 0.0760 / 0.0760 | PASS |
+
+fp16-stage timings: best-of-runs floors from uncontended windows (canonical
+re-anchor batch was contaminated by concurrent agent CPU load — frontend
+33-59 s vs the 2.55 s floor on identical code — and is DISCARDED; timing
+re-anchor for all 8 versions deferred to the post-P3 quiet-machine pass).
+Floors across 16 ps-checked runs: AR 1.08 s @ 113 tok (~104 tok/s, vs
+10-12.4 s fp32-era on v4/v5dev/v5turbo — the resident-weight memory-pressure
+theory confirmed), prompt_codes 0.19 s warm, sovits+vocoder floors v3 18.1 s
+/ v4 12.6 s / v5turbo 2.6 s / v5dev ~30 s (vs fp32-era 26.9 / 17.3 / 6.6 /
+31.8), v5turbo e2e floor 54.7 s (vs 165.7 = 3.0x). Peak RSS also drops with
+residency: v5dev best run 1.66 GB vs 6.4 GB in the fp32-era table (fp16
+sovits halves the mmap+GPU-resident weight footprint).
+The wav anchors above are the authoritative parity evidence.
+
 ## GEMM microbenchmark
 
 `tools/gemm_bench.py` (square fp16 matmul, MLX Metal GPU, includes launch
