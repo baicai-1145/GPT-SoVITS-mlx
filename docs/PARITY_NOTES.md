@@ -7,6 +7,62 @@ machine and diffing against the MLX port, stage by stage. Treat these as the
 authoritative semantics for `gsovits_mlx` inference code and for
 `tools/e2e_v2.py`.
 
+## v1 addendum (task-4, e2e_v1.py)
+
+The v1 port (`tools/e2e_v1.py`, weights s1bert25hz-2kh + s2G488k) reuses the
+whole verified v2 pipeline. Version-specific findings:
+
+1. **v1 keeps the FULL 1025-bin refer spectrogram.** Only v2 crops `:704`:
+   `SynthesizerTrn.__init__` builds `MelStyleEncoder(spec_channels=1025)` for
+   v1 vs `MelStyleEncoder(704)` for v2 (module/models.py), and v1's `get_ge`
+   passes `y` uncropped. `tools/e2e_v1.py` computes the refer spec without the
+   crop; `SynthesizerTrn.get_ge` already branched on `version == "v1"`.
+2. **MelStyleEncoder attention temperature is `sqrt(d_model)`, not
+   `sqrt(d_k)`.** torch `MultiHeadAttention` constructs
+   `ScaledDotProductAttention(temperature=np.power(d_model, 0.5))`
+   (module/modules.py) — nonstandard. The MLX `ScaledMultiHeadAttention`
+   (gsovits_mlx/sovits/mrte.py) originally used the textbook `1/sqrt(d_k)`, a
+   √2 scale error on ge. Fixed in this round: ge max-abs error on the bench ref
+   went 0.256 → 9.5e-7 (v1) / 0.287 → 6.0e-7 (v2). The v2 numbers in the
+   verified list below were measured **before** this fix; the fix only improves
+   them (dec A/B o-diff 1.4e-3 was measured with ge from the torch side, so it
+   is unaffected).
+3. **v1 AR early stop = `hz * max_sec` from the s1 ckpt config.** Official
+   TTS.py passes `self.configs.hz * self.configs.max_sec`; for the v1 pretrained
+   s1bert25hz-2kh (`max_sec: 54`) that is 50×54 = **2700** (v2 5kh ckpt:
+   max_sec 57 → 2850). The AR decode-loop hard cap is `MAX_AR_DECODE_STEPS =
+   1500` regardless of version (AR/models/t2s_model.py) — an internal batched
+   implementation detail, not a per-version audio-length cap.
+4. **The official AR drops the sampled EOS before SoVITS decode**
+   (`y_list[batch_index] = y_buffer[i, : curr_y_len - 1]`). The v1 pretrained
+   sampling streams do hit EOS (seed 0 runs: 114–164 generated tokens); a
+   trailing 1024 is also out of range for the 1024-entry codebook (torch
+   `F.embedding` would throw; MLX gather silently clamps). `tools/e2e_v1.py`
+   strips one trailing EOS token after `gpt.infer`.
+5. **s2G488k.pth pickles a top-level `utils.HParams`.** Its `config` resolves
+   only inside the official repo (`GPT_SoVITS/utils.py`).
+   `tools/convert_sovits.py::_load_sovits_ckpt` now registers a same-named
+   attribute-container shim when `utils` is not importable (the converter's
+   `hps.get(...)` interface is what matters; all v1 hps are present in the
+   ckpt). `convert_sovits_v1v2` needed **no** structural changes: s2G488k is
+   wn-fused-free (raw `weight` on ups/resblocks), keeps `flow.flows.N.pre/post`
+   at flow level (v1-style), and has a bias-free `dec.conv_post` (converted as
+   zero bias).
+6. **s1 2kh has plain (non-adaptive) LayerNorm** — `convert_s1`'s existing
+   `norm1.weight/bias` branch covers it; `n_layer: 24`, `max_sec: 54` land in
+   `gpt.json` verbatim.
+7. **v1 v2 sampler defaults**: same top_k=15 / top_p=1.0 / temperature=1.0 /
+   repetition_penalty=1.35 / noise_scale=0.5 as v2 (CPUFast has no per-version
+   override; `inference.top_k: 5` in the ckpt config is a training-legacy
+   value the runtime ignores).
+
+Verified v1 numbers (this machine, `.tmp/parity_v1.py`, torch fp16-rounded
+weights vs MLX fp16 exports, identical inputs + identical injected decode
+noise): ge 2.2e-7 rel / 9.5e-7 abs, enc_p.x 4.3e-7, enc_p.m_p 4.0e-7,
+enc_p.logs_p 1.3e-6, flow.z 5.8e-5 rel, dec.conv_pre 7.1e-5 rel, dec.o
+0.0132 max-abs (<2e-2 gates), y_mask exact; e2e wav listens clean (prompt
+parroting + target text). Prompt codes 101 frames, phones 29+46 = 75.
+
 ## Verification assets (read-only, under `.tmp/`)
 
 Do not modify or move; they are the regression baseline for future versions.

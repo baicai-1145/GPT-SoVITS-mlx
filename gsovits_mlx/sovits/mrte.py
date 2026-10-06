@@ -94,6 +94,9 @@ class ScaledMultiHeadAttention(nn.Module):
     """modules.ScaledDotProductAttention + MultiHeadAttention wrapper (MelStyleEncoder style).
 
     Parameter names w_qs/w_ks/w_vs/fc match the checkpoint.
+    NOTE on scaling: torch's ScaledDotProductAttention here divides by
+    sqrt(d_model) (temperature=np.power(d_model, 0.5) in MultiHeadAttention),
+    NOT the usual sqrt(d_k). Verified against torch on the v1/v2 refs.
     """
 
     def __init__(self, n_head: int, d_model: int, d_k: int, d_v: int, dropout: float = 0.1):
@@ -105,7 +108,8 @@ class ScaledMultiHeadAttention(nn.Module):
         self.w_ks = LinearNorm(d_model, n_head * d_k)
         self.w_vs = LinearNorm(d_model, n_head * d_v)
         self.fc = LinearNorm(n_head * d_v, d_model)
-        self.scale = 1.0 / math.sqrt(d_k)
+        self.scale = 1.0 / math.sqrt(d_model)  # official temperature = sqrt(d_model)
+        self.d_model = d_model
 
     def __call__(self, x: mx.array, mask: mx.array | None = None) -> mx.array:
         # x: (B, T, C); mask: (B, T) float/bool with 1 = pad (key-side masking)

@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
+import types
 from typing import Callable
 
 import numpy as np
@@ -113,9 +115,64 @@ def convert_s1(ckpt_path: str, out_dir: str, fp16: bool = True):
 # SoVITS v1 / v2 / v2Pro / v2ProPlus
 # ---------------------------------------------------------------------------
 
+def _ensure_hparams_shim():
+    """Legacy pretrained ckpts (s2G488k.pth) unpickle a top-level `utils.HParams`.
+
+    Inside the official repo GPT_SoVITS/utils.py provides that class; standalone
+    runs register a minimal same-named attribute container so torch.load can
+    resolve the pickle reference. Mirrors GPT_SoVITS/utils.py HParams (data in
+    instance attrs, getitem->getattr) plus a dict-like .get used by converters.
+    """
+    try:
+        import importlib
+        importlib.import_module("utils")
+        return
+    except ImportError:
+        pass
+    if "utils" in sys.modules:
+        return
+
+    class HParams:
+        def __init__(self, **kwargs):
+            for k, v in kwargs.items():
+                self[k] = v
+
+        def keys(self):
+            return self.__dict__.keys()
+
+        def items(self):
+            return self.__dict__.items()
+
+        def values(self):
+            return self.__dict__.values()
+
+        def __len__(self):
+            return len(self.__dict__)
+
+        def __getitem__(self, key):
+            return getattr(self, key)
+
+        def __setitem__(self, key, value):
+            setattr(self, key, value)
+
+        def __contains__(self, key):
+            return key in self.__dict__
+
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+        def __repr__(self):
+            return self.__dict__.__repr__()
+
+    shim = types.ModuleType("utils")
+    shim.HParams = HParams
+    sys.modules["utils"] = shim
+
+
 def _load_sovits_ckpt(path: str):
     """Handles the zip-mislabelled checkpoints (PK header check like process_ckpt)."""
     import torch
+    _ensure_hparams_shim()
     from io import BytesIO
     with open(path, "rb") as f:
         meta = f.read(2)
