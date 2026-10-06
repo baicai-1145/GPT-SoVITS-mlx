@@ -7,6 +7,16 @@ macOS, MLX Metal GPU, one version per process, serial. Reference clip
 **seed 0, fully reproducible** (AR sampling seeds numpy's global RNG since
 commit c0d68b5), official AR sampling defaults per version.
 
+**Anchor environment contract**: seeded baselines are only comparable
+within (python 3.12, mlx==0.32.2, numpy==2.5.2, device=GPU-rendered).
+Both mlx and numpy patch releases flip inverse-CDF near-ties in the AR
+sampler — 0.32.2→0.32.3 and numpy 2.5.2→2.5.3 each moved the bench cell
+from 119 to 112 tokens (measured A/B, task-2). Both are pinned exact in
+pyproject.toml; upgrading either requires re-rendering all 8 anchors.
+CPU-pinned runs agree with the GPU-rendered anchors to corr ~0.9999
+(kernel ulps) and pass the corr >0.98 gates; wall-time runs are GPU-only
+under the lock.
+
 Reproduce with:
 
 ```bash
