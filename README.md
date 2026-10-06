@@ -47,6 +47,27 @@ The CPUFast checkout is used read-only for the text front-end
 (`--cpufast-repo`). Benchmark any version with
 `python3 tools/bench.py --version v4 --keep-audio out.wav`.
 
+### Text front-end and languages
+
+The front-end (language segmentation → G2P → BERT features) is the official
+GPT-SoVITS-CPUFast logic, executed from the CPUFast checkout with torch
+replaced by MLX (see `gsovits_mlx/text/`); it needs the `[frontend]` extra
+(`uv sync --extra frontend`). Language modes: `--lang zh/ja/ko/yue/en/all_zh/
+all_ja/all_ko/all_yue/auto/auto_yue` (v1 supports zh/ja/en only). Reference
+text language: `--prompt-lang`; target splitting: `--text-split-method
+cut0..cut5` (default `cut0`). Pass `--ref-cache DIR` (or set
+`GSOVITS_REF_CACHE`) to cache the prompt front-end + HuBERT codes keyed by
+(reference audio mtime+size, text, lang, version) — repeat synthesis with
+the same reference skips the front-end entirely (<50 ms hit).
+
+### GPU lock (multi-agent machines)
+
+All entry scripts default to the **CPU** MLX device; Metal requires an
+explicit opt-in (`--gpu` or `GSOVITS_GPU_LOCK_OK=1`) **and** a fresh
+`.tmp/gpu.lock.d/owner` file (<=45 min old; set `GSOVITS_RUN_TAG` to require
+your tag in it). See `gsovits_mlx/gpu_lock.py`. This keeps GPU work serial
+when several agents share the machine.
+
 ## Converting weights
 
 `tools/convert_sovits.py` (needs `--extra convert`) turns official

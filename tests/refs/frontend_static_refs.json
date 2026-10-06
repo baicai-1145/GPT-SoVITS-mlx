@@ -1,0 +1,16 @@
+{
+ "_meta": "digests of (phones int32 bytes + bert fp32 bytes), sha256[:16]; parity vs official CPUFast torch 2026-10-07 (7/7 matrix + 23/23 edge exact); RE-CAPTURED on the pinned standard env (py3.12, mlx 0.32.2, numpy 2.5.2) — MLX BERT forward fp rounding is numpy-version-sensitive; phones identical across versions, recapture only needed if MLX/np pins move",
+ "cells": {
+  "{\"text\": \"你好，欢迎来到各自的旅程。今天我们聊聊机器学习。\", \"lang\": \"zh\", \"version\": \"v2\"}": "b5d4cc90f8160b2a",
+  "{\"text\": \"Hello, welcome to our journey. Today let's talk about machine learning.\", \"lang\": \"en\", \"version\": \"v2\"}": "b0aad9d0961c8524",
+  "{\"text\": \"こんにちは、私たちの旅へようこそ。今日は機械学習について話しましょう。\", \"lang\": \"ja\", \"version\": \"v2\"}": "01df4e98fca686c0",
+  "{\"text\": \"안녕하세요, 우리의 여정에 오신 것을 환영합니다. 오늘은 기계 학습에 대해 이야기해 봅시다.\", \"lang\": \"ko\", \"version\": \"v2\"}": "0508fd7773305140",
+  "{\"text\": \"你好，歡迎嚟到我哋嘅旅程。今日我哋傾下機器學習。\", \"lang\": \"yue\", \"version\": \"v2\"}": "acce699d2bb9205e",
+  "{\"text\": \"今天天气不错，let's go shopping 吧。\", \"lang\": \"zh\", \"version\": \"v2\"}": "06c273fbd8bc0fdc",
+  "{\"text\": \"今天我们来 discuss AI、機械学習と 한국어 mixing 一起。\", \"lang\": \"auto\", \"version\": \"v2\"}": "69312d8b29efc7e5",
+  "{\"text\": \"在2024年GPT-SoVITS达到了0.15的RTF\", \"lang\": \"all_zh\", \"version\": \"v2\"}": "e46d816a5437378b",
+  "{\"text\": \"你好。\", \"lang\": \"zh\", \"version\": \"v2\"}": "40bb1df286022ff1",
+  "{\"text\": \"希望你以后能够做得比我还好哟。\", \"lang\": \"zh\", \"version\": \"v2\", \"kind\": \"prompt\"}": "9ca7487610660c5e",
+  "{\"kind\": \"bench_combined\", \"ref_text\": \"希望你以后能够做得比我还好哟。\", \"text\": \"你好，欢迎来到各自的旅程。今天我们聊聊机器学习。\", \"lang\": \"zh\", \"version\": \"v2\"}": "d38d0b54acb17bf5"
+ }
+}
