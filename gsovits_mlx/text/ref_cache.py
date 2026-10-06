@@ -34,7 +34,34 @@ import os
 import tempfile
 from typing import Any, Callable
 
-FORMAT_TAG = "gsovits-mlx/refcache-v1"
+FORMAT_TAG = "gsovits-mlx/refcache-v2"
+
+_ENV_FINGERPRINT: str | None = None
+
+
+def env_fingerprint() -> str:
+    """Interpreter/env fingerprint for cache invalidation.
+
+    MLX kernel ulps AND numpy float paths differ across patch versions and
+    flip AR near-ties (see BENCH.md anchor contract: the seeded baselines
+    are only valid within one (python, mlx, numpy, device) quadruple), so
+    cached prompt artifacts (phones/bert/codes) must never be reused across
+    a version change. Cached after first call (importlib.metadata lookups
+    are not free and this sits on the cache-hit path).
+    """
+    global _ENV_FINGERPRINT
+    if _ENV_FINGERPRINT is None:
+        import importlib.metadata as im
+        import sys
+
+        parts = [sys.version.split()[0]]
+        for dist in ("mlx", "mlx-metal", "numpy"):
+            try:
+                parts.append(im.version(dist))
+            except im.PackageNotFoundError:
+                parts.append("-")
+        _ENV_FINGERPRINT = "/".join(parts)
+    return _ENV_FINGERPRINT
 
 
 def cache_key(ref_audio: str, ref_text: str, prompt_lang: str,
@@ -48,6 +75,7 @@ def cache_key(ref_audio: str, ref_text: str, prompt_lang: str,
     h.update(prompt_lang.encode())
     h.update(version.encode())
     h.update(FORMAT_TAG.encode())
+    h.update(env_fingerprint().encode())
     if extra:
         h.update(extra.encode())
     return h.hexdigest()[:32]
@@ -88,7 +116,7 @@ def put_cached(cache_dir_: str, key: str, meta: dict,
 
     d = os.path.join(cache_dir_, "prompt")
     os.makedirs(d, exist_ok=True)
-    meta = dict(meta, format=FORMAT_TAG)
+    meta = dict(meta, format=FORMAT_TAG, env=env_fingerprint())
     fd, tmp_json = tempfile.mkstemp(dir=d, suffix=".json")
     with os.fdopen(fd, "w") as fh:
         json.dump(meta, fh)
