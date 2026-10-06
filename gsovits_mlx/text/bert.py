@@ -57,9 +57,8 @@ class BertLayer:
     def __call__(self, x: mx.array, ext_mask) -> mx.array:
         a = self.attention(self.q_w, self.q_b, self.k_w, self.k_b, self.v_w, self.v_b,
                            x, ext_mask)
-        x = mx.fast.layer_norm(x @ self.o_w.T + self.o_b + x, self.a_ln_w, self.a_ln_b, self.eps)
-        h = x @ self.i_w.T + self.i_b
-        h = nn.gelu_approx(h) if self.act == "gelu" else nn.gelu(h)
+        x = mx.fast.layer_norm(a @ self.o_w.T + self.o_b + x, self.a_ln_w, self.a_ln_b, self.eps)
+        h = nn.gelu(x @ self.i_w.T + self.i_b)
         x = mx.fast.layer_norm(h @ self.o2_w.T + self.o2_b + x, self.o_ln_w, self.o_ln_b, self.eps)
         return x
 
@@ -93,7 +92,7 @@ class BertModel:
         """Returns per-layer outputs [emb, l1, ..., lN]."""
         x = self.embed(input_ids)
         # additive mask: 0 keep, -inf pad (broadcast over heads/queries)
-        m = (1.0 - attention_mask[:, None, None, :].astype(mx.float32)) * -1e9
+        m = (1.0 - attention_mask[:, None, None, :].astype(x.dtype)) * -1e9
         states = [x]
         for layer in self.layers:
             x = layer(x, m)
