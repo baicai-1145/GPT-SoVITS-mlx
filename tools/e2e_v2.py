@@ -270,6 +270,13 @@ def main() -> None:
     all_bert = mx.array(np.concatenate([np.asarray(p_bert), np.asarray(t_bert)], axis=1))[None]  # (1, 1024, Tp+Tt)
     mx.eval(all_phones, all_bert)
     del p_bert, t_bert
+    # Release the whole front-end for the audio stages: the TextFrontend holds
+    # the fp32 BERT (~1.2 GB) and g2pw_mlx keeps its weights in a module-level
+    # global; both are dead weight after this point. g2pw reloads lazily if a
+    # later call needs it (batch/re-entry), so this is safe, not just cheap.
+    del fe, frontend_run
+    import gsovits_mlx.text.g2pw_mlx as _g2pw_mod
+    _g2pw_mod._MODEL = None
     gc.collect()
     trim_metal()
     times["frontend"] = time.perf_counter() - t0

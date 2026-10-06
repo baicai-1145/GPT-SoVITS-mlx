@@ -176,6 +176,37 @@ def load_audio_official(path: str, target_sr: int) -> np.ndarray:
 # Pipeline (pure MLX below this line)
 # ---------------------------------------------------------------------------
 
+def _mem_probe(tag: str) -> None:
+    """One-line physical memory telemetry (GSOVITS_MEM_PROBE=1 only).
+
+    rss = resident; cache = MLX Metal buffer cache (reclaimable wired);
+    active = wired Metal buffers still referenced; footprint = the
+    Activity-Monitor "Memory" caliber via /usr/bin/footprint. Prints to
+    stderr so bench logs capture it alongside the [bench] lines.
+    """
+    if os.environ.get("GSOVITS_MEM_PROBE") != "1":
+        return
+    import mlx.core as mx
+    import subprocess
+
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    try:
+        cache = mx.metal.get_cache_memory()
+        active = mx.metal.get_active_memory()
+    except Exception:
+        cache = active = -1
+    try:
+        out = subprocess.run(["/usr/bin/footprint", str(os.getpid())],
+                             capture_output=True, text=True, timeout=5).stdout
+        m = re.search(r"Footprint:\s+([\d.]+)\s+(B|KB|MB|GB)\b", out)
+        unit = {"B": 1, "KB": 2**10, "MB": 2**20, "GB": 2**30}
+        fp = int(float(m.group(1)) * unit[m.group(2)]) if m else -1
+    except Exception:
+        fp = -1
+    print(f"[mem] {tag}: rss={rss/2**20:.0f}MB cache={cache/2**20:.0f}MB "
+          f"active={active/2**20:.0f}MB footprint={fp/2**20:.0f}MB", file=sys.stderr)
+
+
 def main() -> None:
     args = parse_args()
     # Process-wide device gate (default-deny): pins MLX to CPU unless
@@ -280,6 +311,13 @@ def main() -> None:
     all_bert = mx.array(np.concatenate([np.asarray(p_bert), np.asarray(t_bert)], axis=1))[None]  # (1, 1024, Tp+Tt)
     mx.eval(all_phones, all_bert)
     del p_bert, t_bert
+    # Release the whole front-end for the audio stages: the TextFrontend holds
+    # the fp32 BERT (~1.2 GB) and g2pw_mlx keeps its weights in a module-level
+    # global; both are dead weight after this point. g2pw reloads lazily if a
+    # later call needs it (batch/re-entry), so this is safe, not just cheap.
+    del fe, frontend_run
+    import gsovits_mlx.text.g2pw_mlx as _g2pw_mod
+    _g2pw_mod._MODEL = None
     gc.collect()
     trim_metal()
     times["frontend"] = time.perf_counter() - t0
@@ -288,6 +326,7 @@ def main() -> None:
         print(f"[bench] frontend: phones={all_phones.shape} bert={all_bert.shape} "
               f"{'CACHE_HIT ' if times.get('frontend_cache_hit') else ''}"
               f"{times['frontend']:.2f}s", file=sys.stderr)
+    _mem_probe("after-frontend")
 
     # --- 2. prompt semantic codes: HuBERT -> v5 SoVITS quantizer ---
     t0 = time.perf_counter()
@@ -314,6 +353,7 @@ def main() -> None:
         print(f"[bench] model_load: sovits {times['model_load']:.2f}s", file=sys.stderr)
         print(f"[bench] prompt_codes: {prompt_sem.shape} "
               f"{times['prompt_codes']:.2f}s", file=sys.stderr)
+    _mem_probe("after-prompt_codes")
 
     # --- 3. reference spectrogram: 2048/640/2048, v3 ref_enc crops :704 ---
     t0 = time.perf_counter()
@@ -324,6 +364,7 @@ def main() -> None:
     if args.bench:
         print(f"[bench] refer_spec: {refer.shape} {times['refer_spec']:.2f}s",
               file=sys.stderr)
+    _mem_probe("after-refer_spec")
 
     # --- 4. AR GPT (s1 == s1v3.ckpt conversion): gen semantic tokens ---
     t0 = time.perf_counter()
@@ -341,6 +382,7 @@ def main() -> None:
     if args.bench:
         print(f"[bench] ar: {n_gen} tokens {times['ar']:.2f}s "
               f"({n_gen / times['ar']:.1f} tok/s)", file=sys.stderr)
+    _mem_probe("after-ar")
 
     # --- 5. SoVITS v5 decode: codes -> fea -> CFMV5 rolling chunks -> Generator 48 kHz ---
     t0 = time.perf_counter()
@@ -369,6 +411,7 @@ def main() -> None:
                             key=mx.random.key(args.seed))
     pred = denorm_spec(mel)
     mx.eval(pred)
+    del sov  # DiT weights are dead once pred is realized; vocoder loads next
     del fea_ref, fea_todo, mel2, all_codes, mel
     gc.collect()
     trim_metal()
