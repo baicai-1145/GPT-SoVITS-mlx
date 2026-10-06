@@ -273,11 +273,14 @@ def main() -> None:
                      json.load(open(os.path.join(hubert_dir, "config.json"))))
     h = hb(mx.array(wav16k[None]))
     mx.eval(h)
+    t_load = time.perf_counter()
     sov, _meta = load_sovits_v3(os.path.join(args.models_root, version), version)
+    times["model_load"] = time.perf_counter() - t_load
     prompt_sem = sov.extract_latent(mx.transpose(h, (0, 2, 1)))  # (1, Tp) int
     mx.eval(prompt_sem)
     times["prompt_codes"] = time.perf_counter() - t0
     if args.bench:
+        print(f"[bench] model_load: sovits {times['model_load']:.2f}s", file=sys.stderr)
         print(f"[bench] prompt_codes: {prompt_sem.shape} "
               f"{times['prompt_codes']:.2f}s", file=sys.stderr)
 
