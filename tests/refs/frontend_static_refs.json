@@ -1,0 +1,15 @@
+{
+ "_meta": "digests of (phones int32 bytes + bert fp32 bytes), sha256[:16]; captured against official CPUFast parity 2026-10-07 (7/7 matrix + 23/23 edge cases exact); regression anchor for the vendored front-end",
+ "cells": {
+  "{\"text\": \"你好，欢迎来到各自的旅程。今天我们聊聊机器学习。\", \"lang\": \"zh\", \"version\": \"v2\"}": "c44b505bfa883b04",
+  "{\"text\": \"Hello, welcome to our journey. Today let's talk about machine learning.\", \"lang\": \"en\", \"version\": \"v2\"}": "b0aad9d0961c8524",
+  "{\"text\": \"こんにちは、私たちの旅へようこそ。今日は機械学習について話しましょう。\", \"lang\": \"ja\", \"version\": \"v2\"}": "01df4e98fca686c0",
+  "{\"text\": \"안녕하세요, 우리의 여정에 오신 것을 환영합니다. 오늘은 기계 학습에 대해 이야기해 봅시다.\", \"lang\": \"ko\", \"version\": \"v2\"}": "0508fd7773305140",
+  "{\"text\": \"你好，歡迎嚟到我哋嘅旅程。今日我哋傾下機器學習。\", \"lang\": \"yue\", \"version\": \"v2\"}": "acce699d2bb9205e",
+  "{\"text\": \"今天天气不错，let's go shopping 吧。\", \"lang\": \"zh\", \"version\": \"v2\"}": "b0f12cf78c7b61c7",
+  "{\"text\": \"今天我们来 discuss AI、機械学習と 한국어 mixing 一起。\", \"lang\": \"auto\", \"version\": \"v2\"}": "4f92d967d6400309",
+  "{\"text\": \"在2024年GPT-SoVITS达到了0.15的RTF\", \"lang\": \"all_zh\", \"version\": \"v2\"}": "01522a2ca2b42b67",
+  "{\"text\": \"你好。\", \"lang\": \"zh\", \"version\": \"v2\"}": "78bf6eda960efcf3",
+  "{\"text\": \"希望你以后能够做得比我还好哟。\", \"lang\": \"zh\", \"version\": \"v2\", \"kind\": \"prompt\"}": "8c077f274a8073f0"
+ }
+}
