@@ -218,8 +218,9 @@ def main() -> None:
     device = resolve_device(flag_gpu=args.gpu, verbose=True)
     if not args.frontend_only:
         from gsovits_mlx.gpu_lock import require_gpu_for_pipeline
-        require_gpu_for_pipeline("gpu" if args.gpu else "cpu",
-                                 cpu_ok_flag=args.cpu_i_know_broken)
+        # gate on the RESOLVED device (env opt-in counts as gpu), not the
+        # raw flag — resolve_device already validated lock freshness+tag.
+        require_gpu_for_pipeline(device, cpu_ok_flag=args.cpu_i_know_broken)
     # AR sampling draws its inverse-CDF uniform from numpy's global RNG
     # (gsovits_mlx/gpt/t2s.py::_sample); seed it so runs are reproducible.
     np.random.seed(args.seed)
