@@ -7,6 +7,15 @@ macOS, MLX Metal GPU, one version per process, serial. Reference clip
 **seed 0, fully reproducible** (AR sampling seeds numpy's global RNG since
 commit c0d68b5), official AR sampling defaults per version.
 
+**Anchors re-rendered 2026-10-07 07:17–07:21 on main @3a9b3bc** (post
+fp16 + front-end + memory-optimization merges), one version per process,
+serial, `tools/bench.py --version X --seed 0 --gpu`. These supersede the
+02:38 renders; per-version token counts are printed by bench.py at run
+time and differ from the legacy 113/119 table where the fp32→fp16
+quantizer and front-end path legitimately shift the seeded stream. Treat
+THIS table's duration/peak/rms as the reference statistics (unchanged
+from the legacy renders at the reported precision):
+
 **Anchor environment contract**: seeded baselines are only comparable
 within (python 3.12, mlx==0.32.2, numpy==2.5.2, device=GPU-rendered).
 Both mlx and numpy patch releases flip inverse-CDF near-ties in the AR
