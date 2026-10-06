@@ -98,6 +98,12 @@ def parse_args() -> argparse.Namespace:
 # identical to e2e_v2.py; v4 uses the v2 symbol table and cleaner.
 # ---------------------------------------------------------------------------
 
+try:
+    import av  # PyAV, ships with the official repo's requirements
+except ImportError:  # pragma: no cover
+    av = None
+
+
 def _decode_audio_native(path: str) -> tuple[np.ndarray, int]:
     """Decode to (channels, samples) float32 at the file's native rate (official
     _decode_audio_array). Returns (mono_1d, sr) when the file is mono."""
