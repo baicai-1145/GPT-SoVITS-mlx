@@ -373,8 +373,7 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
             t1 = time.perf_counter()
             mel = cfm_chunked_decode_v3(sov, fea_ref, fea_todo, mel2,
                                         sample_steps=steps, inference_cfg_rate=cfg,
-                                        key=mx.random.key(0),
-                                        T_ref=468, T_chunk=934)
+                                        key=mx.random.key(0))
             pred = denorm_spec(mel)
             mx.eval(pred)
             spans[f"cfm_{i}"] = round(time.perf_counter() - t1, 3)
