@@ -380,7 +380,7 @@ def main() -> None:
     trim_metal()
 
     voc = load_vocoder_v4(os.path.join(args.models_root, "v4_vocoder"))
-    if os.environ.get("GSOVITS_HIFIGAN_FAST") == "1":
+    if os.environ.get("GSOVITS_HIFIGAN_FAST", "1") != "0":
         # task-8: fp16-in compiled vocoder closure; output cast back to
         # fp32 for the audio writers (measured parity in the A/B cell)
         _dt = voc.conv_pre.weight.dtype
