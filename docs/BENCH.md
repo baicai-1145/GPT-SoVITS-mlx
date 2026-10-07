@@ -248,9 +248,13 @@ Stage A (MERGED as 1ce3ff1):
   using paired timing distributions. In-graph performance and parity
   inheritance to cfg>0 versions were not established by the cfg=0 probe.
 - GSOVITS_DIT_STEP_COMPILE=1: whole-step compiled closure (cfg=0 path).
-- The captured four-step turbo trajectory showed fp16-stream drift 3.3e-3.
-  This is evidence for that case, not a general proof for other inputs
-  or 32-step versions.
+- Correctness correction (task-12): the prefold projection omitted the
+  original AdaLN SiLU activation and weight/stream dtype conversions.
+  A CPU production-path comparison failed with gate maxdiff 1.51, so
+  same-code repeatability and the previously cited 3.3e-3 trajectory drift
+  did not establish parity with the original AdaLN path. The repair restores
+  SiLU and those casts; CPU gate/block regressions cover fp32 and mixed
+  precision, but real-model trajectory and waveform gates must be rerun.
 - Single-block and full-step elapsed times were recorded, but no per-op
   decomposition or physical bound follows from multiplying isolated
   microbenchmarks. Effective-q=1 and fixed cost-per-op claims are withdrawn.

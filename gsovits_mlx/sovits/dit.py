@@ -492,7 +492,11 @@ class DiT(nn.Module):
                     mx.stack([b.attn_norm.linear_w for b in self.transformer_blocks]),
                     mx.stack([b.attn_norm.linear_b for b in self.transformer_blocks]))
             W, Bm = self._prefold_w
-            mods = mx.swapaxes(mx.einsum("lod,bd->lbo", W, t), 0, 1) + Bm[None]  # (B, L, 6D)
+            # Match AdaLayerNormZero: activation and GEMM use the weight dtype;
+            # modulation returns to the residual-stream dtype after the bias.
+            activation = nn.silu(t).astype(W.dtype)
+            mods = (mx.swapaxes(mx.einsum("lod,bd->lbo", W, activation), 0, 1)
+                    + Bm[None]).astype(x.dtype)  # (B, L, 6D)
             for i, block in enumerate(self.transformer_blocks):
                 x = block(x, None, mask, rope, precomputed_mods=mods[:, i])
         else:
