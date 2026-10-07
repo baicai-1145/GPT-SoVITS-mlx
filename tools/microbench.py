@@ -20,11 +20,26 @@ SoVITS decoders (fixed codes+refer, ~110 generated tokens):
     sovits-v5turbo                 CFMV5 4-step cfg 0.0
     metric: decode latency (s) + golden-output max|diff| for parity.
 
+Measurement doctrine (task-10, three hard rules)
+------------------------------------------------
+1. SYNCED per-op numbers are NEVER throughput: an isolated `op(); mx.eval()`
+   measures the dispatch+sync floor (~0.6 ms/op on M4 Metal) plus whatever
+   compute. Only pipelined batches count.
+2. "Pipelined" MUST state its queue depth q (ops queued before one eval).
+   Time scales ~1/q while q * dispatch > compute; queue depth is a
+   first-class benchmark parameter, like shape and dtype.
+3. Pipelining amortizes dispatch only across INDEPENDENT ops. A dependency
+   chain (each op feeds the next — every real model graph) runs at
+   effective q=1: per-op cost is compute + one dispatch, no amortization.
+   Isolated per-op eval on Metal overstates op cost ~10x; conversely,
+   per-op micro results do NOT transfer to in-graph chains.
+
 Usage
 -----
   python3 tools/microbench.py capture --component gpt-s1v3   # under lock
   python3 tools/microbench.py bench   --component gpt-s1v3 --iters 3
   python3 tools/microbench.py bench   --all
+  python3 tools/microbench.py gemm --shape 1600x1152x4608 --queue 8
 
 Captured artifacts live in .tmp/mb/<component>.npz (+ .meta.json). bench mode
 asserts parity against the captured golden output before reporting timing.
@@ -409,7 +424,11 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["capture", "bench"])
+    ap.add_argument("mode", choices=["capture", "bench", "gemm"])
+    ap.add_argument("--shape", default="1600x1152x4608",
+                    help="gemm mode: MxKxN (fp16)")
+    ap.add_argument("--queue", type=int, default=8,
+                    help="gemm mode: ops queued per eval (state it!)")
     ap.add_argument("--component", default=None, choices=list(GPT_COMPONENTS) + SOVITS_COMPONENTS)
     ap.add_argument("--all", action="store_true", help="bench every captured component")
     ap.add_argument("--models-root", default=DEFAULT_MODELS_ROOT)
@@ -421,6 +440,39 @@ def main() -> None:
     ap.add_argument("--json-out", default=None, help="append JSON lines here")
     ap.add_argument("--allow-unlocked", action="store_true")
     args = ap.parse_args()
+
+    if args.mode == "gemm":
+        gpu_lock_guard(args.allow_unlocked)
+        import mlx.core as mx
+        M, K, N = (int(v) for v in args.shape.split("x"))
+        a = mx.random.normal((M, K)).astype(mx.float16)
+        b = mx.random.normal((K, N)).astype(mx.float16)
+        r = a @ b
+        mx.eval(r)
+        def once():
+            return a @ b
+        once()
+        out = {"mode": "gemm", "shape": args.shape, "queue": args.queue}
+        # synced (doctrine rule 1: NOT throughput — dispatch floor + compute)
+        best = 1e9
+        for _ in range(6):
+            s = time.perf_counter()
+            rr = once()
+            mx.eval(rr)
+            best = min(best, time.perf_counter() - s)
+        out["synced_ms"] = round(best * 1e3, 3)
+        # pipelined at the stated queue depth (rule 2)
+        q = max(1, args.queue)
+        best = 1e9
+        for _ in range(8):
+            s = time.perf_counter()
+            outs = [once() for _ in range(q)]
+            mx.eval(*outs)
+            best = min(best, (time.perf_counter() - s) / q)
+        out["pipelined_ms"] = round(best * 1e3, 3)
+        out["pipelined_tf"] = round(2 * M * K * N / best / 1e12, 1)
+        print(json.dumps(out))
+        return
 
     gpu_lock_guard(args.allow_unlocked)  # both modes run GPU inference
     os.makedirs(args.out_dir, exist_ok=True)
