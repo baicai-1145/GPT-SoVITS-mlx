@@ -257,3 +257,16 @@ upsample stage - freed multi-GB intermediates otherwise pile up in MLX's
 buffer cache (~2 GB/stage, 12 GB peak). Bitwise-identical output; anchor
 gates re-verified (v3/v5dev/v5turbo corr 1.0000, rms ratio 1.0000).
 Per-resblock flush measured WORSE (6.2 GB, defeats buffer reuse) - reverted.
+
+### task-9: v2ProPlus footprint (sv encoder + HiFiGAN stage trim)
+
+- sv_emb (ERes2NetV2, ~0.5 GB weights + ~0.7 GB forward transients) now
+  rides the ref-prompt cache (same key; payload extended with "sv_emb") and
+  the encoder is freed immediately after extraction.
+- HiFiGAN stage trim (GSOVITS_HIFIGAN_STAGE_TRIM=1): eval + clear_cache per
+  upsample stage in BOTH HiFi-GAN classes (sovits Generator used by
+  v1/v2/v2Pro/v2ProPlus decode, and the standalone GeneratorVocoder used by
+  v4/v5). Off by default pending conv-fp16's task-8 timing/parity A/B;
+  enable for memory-bound runs. With both fixes on:
+  v2ProPlus 6.65 -> 3.07 GB, v2 4.07 -> 1.68 GB (anchor gates corr/rms
+  1.0000 PASS on both).
