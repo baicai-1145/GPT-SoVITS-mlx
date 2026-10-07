@@ -135,11 +135,20 @@ class Attention(nn.Module):
         self.to_out_0_w = mx.zeros((dim, inner))
         self.to_out_0_b = mx.zeros((dim,))
 
+    def _qkv_w(self):
+        # task-10: fused (3*inner, dim) weight + bias, built once.
+        w = getattr(self, "_qkv_w_cache", None)
+        if w is None:
+            w = (mx.concatenate([self.to_q_w, self.to_k_w, self.to_v_w], axis=0),
+                 mx.concatenate([self.to_q_b, self.to_k_b, self.to_v_b], axis=0))
+            self._qkv_w_cache = w
+        return w
+
     def __call__(self, x: mx.array, mask: mx.array | None, rope: mx.array) -> mx.array:
         b, t, _ = x.shape
-        q = x @ self.to_q_w.T + self.to_q_b
-        k = x @ self.to_k_w.T + self.to_k_b
-        v = x @ self.to_v_w.T + self.to_v_b
+        qw, qb = self._qkv_w()
+        qkv = x @ qw.T + qb
+        q, k, v = mx.split(qkv, 3, axis=-1)
         # torch applies apply_rotary_pos_emb BEFORE the head split on the (B, T, inner)
         # tensor; rot_dim = freqs.shape[-1] = dim_head, so only the FIRST dim_head
         # channels (= head 0 after the split) get rotated; heads 1..N-1 are unrotated.
@@ -337,6 +346,7 @@ class DiT(nn.Module):
         self.dim = dim
         self.depth = depth
         self.use_step_embedding = use_step_embedding
+        self._prefold_w = None  # (stacked W, stacked B) constants for GSOVITS_DIT_PREFOLD
         text_dim = text_dim if text_dim is not None else mel_dim
 
         self.time_embed = TimestepEmbedding(dim)
@@ -451,9 +461,13 @@ class DiT(nn.Module):
         # 22 modulation GEMMs batch into ONE einsum upfront (removes ~66
         # kernel launches/step); blocks consume precomputed 6-way params.
         if _os.environ.get("GSOVITS_DIT_PREFOLD", "0") == "1":
-            # shapes: W (L, 6D, D); t (B, D) -> mods (B, L, 6D)
-            W = mx.stack([b.attn_norm.linear_w for b in self.transformer_blocks])
-            Bm = mx.stack([b.attn_norm.linear_b for b in self.transformer_blocks])
+            # shapes: W (L, 6D, D); t (B, D) -> mods (B, L, 6D). The stacked
+            # weights are constants — build once, reuse every step.
+            if self._prefold_w is None:
+                self._prefold_w = (
+                    mx.stack([b.attn_norm.linear_w for b in self.transformer_blocks]),
+                    mx.stack([b.attn_norm.linear_b for b in self.transformer_blocks]))
+            W, Bm = self._prefold_w
             mods = mx.swapaxes(mx.einsum("lod,bd->lbo", W, t), 0, 1) + Bm[None]  # (B, L, 6D)
             for i, block in enumerate(self.transformer_blocks):
                 x = block(x, None, mask, rope, precomputed_mods=mods[:, i])
