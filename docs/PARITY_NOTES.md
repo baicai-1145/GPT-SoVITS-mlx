@@ -364,3 +364,90 @@ e2e: `bench/mlx/v2pro.wav` (8.84 s, 120 AR tokens) and
 `bench/mlx/v2proplus.wav` (8.76 s, 118 AR tokens), both 32 kHz, listen-verified
 intelligible with clean speaker timbre and no artifacts. Wall ~101 s / ~112 s,
 peak RSS 2.2–3.8 GB.
+
+## Phase-2 addendum (front-end unification, env contract, device gate)
+
+Covers main @c12db19: the official multi-language front-end (task-2 +
+follow-up), the unified `tools/e2e.py` CLI (task-6), the device gate
+hardening, and the env-fingerprint ref cache. The per-version parity
+methodology below is the one that made the byte-identity gate pass on all
+8 versions in one window.
+
+### Front-end parity methodology (phase-2)
+
+The official front-end is NOT re-implemented — it is executed. `gsovits_mlx/
+text/vendored_cpufront.py` execs the CPUFast checkout's `GPT_SoVITS/text/**`
+in place (read-only) and substitutes three torch-dependent pieces:
+
+- `text.g2pw.torch_api` ← `g2pw_mlx` (MLX fp32 G2PW; argmax must be
+  token-exact, so the export stays fp32 — fp16 logits can flip near-ties);
+- `text.LangSegmenter` ← a faithful re-port (the official one pulls
+  fast_langdetect; our port keeps identical segmentation on the parity
+  corpus);
+- `TTS_infer_pack` ← a stub (only the segmentation-method table is needed).
+
+Parity evidence: phones 7/7 + 5/5 exact on the zh/en bench sets, 23/23
+mixed-language segments; G2PW polyphone decisions token-exact (fp32);
+BERT features to fp32 ulp. The loader means a CPUFast checkout + data
+files (fast_langdetect `lid.176.bin`, G2PW export) is a runtime
+requirement, documented in the README front-end section.
+
+Byte-exactness traps found by the task-6 8/8 md5 gate:
+
+1. **PyAV is load-bearing.** Without `av`, `load_audio_official` falls
+   back to soundfile + linear resample. That changes HuBERT inputs a few
+   frames → different prompt semantic codes → different AR stream
+   (v2: 112 vs 119 tokens with identical weights/seed). A missing
+   optional dependency silently changes the anchor. Rule: runner envs
+   must have `av==18.1.0`; the e2e scripts warn loudly on fallback.
+2. **Front-end device must equal the process device.** `TextFrontend`
+   computes BERT/G2PW; running it on CPU while the audio stages run on
+   GPU (or vice versa) yields fp16-vs-fp32-flavored checksum differences
+   in `all_bert` and divergent AR sampling. The unified CLI resolves the
+   device once and threads it everywhere (same rule as the wrappers).
+3. **`_load_sovits_v1v2` needs the real version string** (`v2Pro`,
+   `v2ProPlus`) — the `is_v2pro`/sv-embedding branch must activate; a
+   "v2" fallback broadcasts 1024-dim ge against 512-dim buffers.
+
+### Env-contract lessons
+
+The anchor contract quadruple (python 3.12, mlx==0.32.2, numpy==2.5.2,
+device) is now verified from BOTH directions:
+
+- **mlx/numpy pins are semantic, not cosmetic.** 0.32.2→0.32.3 and
+  2.5.2→2.5.3 each flip inverse-CDF near-ties in the AR sampler
+  (bench cell 119 → 112 tokens, measured A/B, task-2). Equal pins +
+  equal inputs + equal device → bit-identical wavs; anything else moves
+  the anchors. Re-render procedure: re-run `bench.py --seed 0` for all 8
+  versions, update BENCH.md's contract line.
+- **The ref cache cannot cross a pin change.** Cache keys embed an
+  environment fingerprint (python/mlx/numpy versions), so a version bump
+  orphans stale entries instead of silently reusing them.
+- **NAS cold reads masquerade as regressions.** /Volumes/2T cold reads
+  drop to 14–68 MB/s; I/O-shaped stages (frontend, model_load) inflate
+  up to 100x (model_load 49.8 s cold vs 0.18 s warm) with zero competing
+  processes. Measurement doctrine: label cache state per I/O stage,
+  re-run once before believing a regression, do ps-clean timing runs on
+  warm caches.
+
+### Device gate (post-hardening)
+
+CPU is not a supported compute path for AR/CFM/decode in any version —
+v3-family CFM silently produces all-zero audio on CPU, and v1/v2 "work"
+at 30–100x slowdown, which is a trap. `require_gpu_for_pipeline` now
+hard-stops pipeline runs that resolve to CPU unless `--frontend-only`
+(front-end smoke, CPU-legal) or `--cpu-i-know-broken` (explicit force).
+Every e2e writer path runs `assert_audible` pre-write: an empty,
+non-finite, near-silent (peak ≤ 0.01) or degenerate wav refuses to be
+written — a silent zero wav can never be saved again (the 309 s all-zero
+v3 incident that motivated this).
+
+### Byte-identity gate (task-6, the closing methodology)
+
+`tools/e2e.py --version X` vs `tools/e2e_v*.py` wrapper runs, seed 0,
+GPU, one process at a time under the lock: all 8 versions md5-identical
+(v1 a8cf1493…, v2 b218b8e1…, v2Pro 28abb525…, v2ProPlus ddf19ef5…,
+v3 2ea7506f…, v4 85951739…, v5dev 3acfa532…, v5turbo eb03e506…), token
+counts 156/119×3/113×4 matching the re-cast anchors. The gate caught
+four real defects (above) before merge — it is now the standard
+acceptance for any refactor that touches entry points.
