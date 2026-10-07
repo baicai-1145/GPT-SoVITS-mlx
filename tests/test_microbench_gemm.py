@@ -111,3 +111,36 @@ def test_bench_gemm_chain_flops_use_actual_shapes():
     res = bench_gemm(mx, M, K, N, q=q, rounds=1)
     expected = 2 * M * K * N + (q - 1) * 2 * M * N * N
     assert res["chain_flops"] == expected
+
+
+# ---------------- legacy entrypoint (tools/gemm_bench.py) ----------------
+
+def test_gemm_bench_legacy_migration():
+    """Legacy CLI must delegate to the corrected helper, not the overwrite loop."""
+    import subprocess
+    code = ("import sys; sys.path.insert(0, 'tools'); "
+            "import gemm_bench; "
+            "assert hasattr(gemm_bench, 'main'); "
+            "assert not any('flops * ' in l or '2.0 * N ** 3 * REPS' in l "
+            "for l in open('tools/gemm_bench.py'))")
+    r = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
+def test_gemm_bench_invalid_args_fail_fast():
+    import subprocess
+    r = subprocess.run([sys.executable, "tools/gemm_bench.py", "0", "8"],
+                       cwd=REPO, capture_output=True, text=True)
+    assert r.returncode != 0 and "positive" in (r.stdout + r.stderr)
+    r = subprocess.run([sys.executable, "tools/gemm_bench.py", "64", "0"],
+                       cwd=REPO, capture_output=True, text=True)
+    assert r.returncode != 0 and ("positive" in (r.stdout + r.stderr) or
+                                  "queue" in (r.stdout + r.stderr))
+
+
+def test_gemm_bench_rejects_reps_as_unaccounted_work():
+    """The core regression: FLOPs must come from the helper's counted work,
+    never from multiplying by a rep count that the graph didn't retain."""
+    src = open(os.path.join(REPO, "tools", "gemm_bench.py")).read()
+    assert "* REPS" not in src and "* reps" not in src
+    assert "indep_batch_flops" in src  # counted work drives the report
