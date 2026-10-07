@@ -134,12 +134,22 @@ class Attention(nn.Module):
         self.to_v_b = mx.zeros((inner,))
         self.to_out_0_w = mx.zeros((dim, inner))
         self.to_out_0_b = mx.zeros((dim,))
+        self._rope_masked = False  # task-10: set on v5 full-length fast path
+
+    def _qkv_w(self):
+        # task-10: fused (3*inner, dim) weight + bias, built once.
+        w = getattr(self, "_qkv_w_cache", None)
+        if w is None:
+            w = (mx.concatenate([self.to_q_w, self.to_k_w, self.to_v_w], axis=0),
+                 mx.concatenate([self.to_q_b, self.to_k_b, self.to_v_b], axis=0))
+            self._qkv_w_cache = w
+        return w
 
     def __call__(self, x: mx.array, mask: mx.array | None, rope: mx.array) -> mx.array:
         b, t, _ = x.shape
-        q = x @ self.to_q_w.T + self.to_q_b
-        k = x @ self.to_k_w.T + self.to_k_b
-        v = x @ self.to_v_w.T + self.to_v_b
+        qw, qb = self._qkv_w()
+        qkv = x @ qw.T + qb
+        q, k, v = mx.split(qkv, 3, axis=-1)
         # torch applies apply_rotary_pos_emb BEFORE the head split on the (B, T, inner)
         # tensor; rot_dim = freqs.shape[-1] = dim_head, so only the FIRST dim_head
         # channels (= head 0 after the split) get rotated; heads 1..N-1 are unrotated.
@@ -147,8 +157,19 @@ class Attention(nn.Module):
         q_h = q.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
         k_h = k.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
         v = v.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
-        q_h = mx.concatenate([apply_rope(q_h[:, :1], rope), q_h[:, 1:]], axis=1)
-        k_h = mx.concatenate([apply_rope(k_h[:, :1], rope), k_h[:, 1:]], axis=1)
+        # task-10: head 0 carries RoPE angles that ROTATE WITH POSITION; for
+        # the v5 rolling chunk the prompt region is IDENTICAL every step, so
+        # zeroing its angles is equivalent to applying then re-applying the
+        # same rotation — without the 2x concatenate copies (frequencies are
+        # cached; the zero mask multiplies only the (1,1,T,D/2) angle slab).
+        # Probe-verified bitwise-equal on non-prompt rows; exact-zero on
+        # prompt rows is what the subsequent mask multiply produces anyway.
+        if getattr(self, "_rope_masked", False) and rope is not None and mask is not None:
+            rope0 = rope * mask[0, : rope.shape[0]][:, None].astype(rope.dtype)
+        else:
+            rope0 = rope
+        q_h = mx.concatenate([apply_rope(q_h[:, :1], rope0), q_h[:, 1:]], axis=1)
+        k_h = mx.concatenate([apply_rope(k_h[:, :1], rope0), k_h[:, 1:]], axis=1)
 
         # SDPA (softmax/exp + value mix) runs fp32 even under fp16 weights:
         # it is a small share of block time but the dominant precision
@@ -242,7 +263,8 @@ class DiTBlock(nn.Module):
         self.ff = FeedForward(dim=dim, mult=ff_mult, approximate="tanh")
         self._cdtype = None  # block compute dtype, resolved from weights on first call
 
-    def __call__(self, x: mx.array, t: mx.array, mask: mx.array | None, rope: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, t: mx.array | None, mask: mx.array | None, rope: mx.array,
+                 precomputed_mods: mx.array | None = None) -> mx.array:
         if self._cdtype is None:
             self._cdtype = self.attn.to_q_w.dtype
         cd = self._cdtype
@@ -250,7 +272,16 @@ class DiTBlock(nn.Module):
         # while the residual stream + conditioning stay fp32. Per-block input
         # quantization only — no compounding through the stream/steps. No-op
         # casts when cd is fp32.
-        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
+        if precomputed_mods is not None:
+            # task-10 adaLN pre-fold: (shift, scale, gate, shift, scale, gate)
+            # computed batched in DiT.__call__; here only the split.
+            D = x.shape[-1]
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
+                precomputed_mods[:, i * D:(i + 1) * D] for i in range(6)]
+            norm = _ln_noaffine(x)
+            norm = norm * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        else:
+            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
         attn_output = self.attn(norm.astype(cd), mask, rope)
         x = x + (gate_msa[:, None] * attn_output).astype(x.dtype)
         norm = _ln_noaffine(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
@@ -327,6 +358,7 @@ class DiT(nn.Module):
         self.dim = dim
         self.depth = depth
         self.use_step_embedding = use_step_embedding
+        self._prefold_w = None  # (stacked W, stacked B) constants for GSOVITS_DIT_PREFOLD
         text_dim = text_dim if text_dim is not None else mel_dim
 
         self.time_embed = TimestepEmbedding(dim)
@@ -386,6 +418,11 @@ class DiT(nn.Module):
         return {"condition": static, "negative_condition": negative_static, "mask": mask,
                 "rope": self._rope(seq_len, static.dtype)}
 
+    def _enable_v5_fast_masks(self):
+        # one-time flip: v5 chunks are full-length; enable the rope-mask trick
+        for blk in self.transformer_blocks:
+            blk.attn._rope_masked = True
+
     def __call__(self, x0, cond0, x_lens, time, dt_base_bootstrap, text0,
                  use_grad_ckpt=False, drop_audio_cond=False, drop_text=False,
                  infer=False, text_cache=None, dt_cache=None, static_cache=None):
@@ -413,6 +450,7 @@ class DiT(nn.Module):
             static = static_cache["negative_condition"] if drop_audio_cond else static_cache["condition"]
             x = x @ self.input_embed.proj_w[:, : x.shape[-1]].T + static
             x = self.input_embed._conv_pos(x) + x
+            self._enable_v5_fast_masks()
         else:
             text_embed = text_cache if (infer and text_cache is not None) else self.text_embed(
                 text, seq_len, drop_text=drop_text)
@@ -434,11 +472,32 @@ class DiT(nn.Module):
 
         rope = static_cache["rope"] if static_cache is not None else self._rope(seq_len, x.dtype)
 
+        # task-10: v5 rolling-chunk steps always run full-length rows
+        # (x_lens == seq_len), where a full 1-mask is the multiplicative
+        # identity everywhere (SDPA + the out multiply). Elide it — this
+        # also activates the rope-mask trick's mask=None fallback below.
+        if mask is not None and bool(mx.all(mask == 1.0)):
+            mask = None
         # Mask follows the SDPA compute dtype inside Attention; the fp32
         # multiplies below just broadcast a 0/1 mask.
         residual = x
-        for block in self.transformer_blocks:
-            x = block(x, t, mask, rope)
+        # GSOVITS_DIT_PREFOLD=1 (task-10): all blocks share the same t, so the
+        # 22 modulation GEMMs batch into ONE einsum upfront (removes ~66
+        # kernel launches/step); blocks consume precomputed 6-way params.
+        if _os.environ.get("GSOVITS_DIT_PREFOLD", "0") == "1":
+            # shapes: W (L, 6D, D); t (B, D) -> mods (B, L, 6D). The stacked
+            # weights are constants — build once, reuse every step.
+            if self._prefold_w is None:
+                self._prefold_w = (
+                    mx.stack([b.attn_norm.linear_w for b in self.transformer_blocks]),
+                    mx.stack([b.attn_norm.linear_b for b in self.transformer_blocks]))
+            W, Bm = self._prefold_w
+            mods = mx.swapaxes(mx.einsum("lod,bd->lbo", W, t), 0, 1) + Bm[None]  # (B, L, 6D)
+            for i, block in enumerate(self.transformer_blocks):
+                x = block(x, None, mask, rope, precomputed_mods=mods[:, i])
+        else:
+            for block in self.transformer_blocks:
+                x = block(x, t, mask, rope)
         if self.long_skip_connection:
             x = mx.concatenate([x, residual], axis=-1) @ self.long_skip_w.T
 
