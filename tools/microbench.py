@@ -91,7 +91,7 @@ def _repo_root() -> str:
         gd = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=here,
                             capture_output=True, text=True, timeout=5).stdout.strip()
         if gd:
-            return os.path.dirname(os.path.abspath(gd))
+            return os.path.dirname(os.path.abspath(os.path.join(here, gd)))
     except Exception:
         pass
     return os.path.dirname(here)
