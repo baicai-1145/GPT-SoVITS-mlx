@@ -135,16 +135,33 @@ class CFMV5:
             mx.eval(*cache.values())
         text_cache = None
         step = 1.0 / steps
+        # GSOVITS_DIT_STEP_COMPILE=1 (task-10 stage A.2): compile the whole
+        # estimator step (loop-invariant inputs captured as closure constants;
+        # only x and time flow through the compiled boundary each step).
+        import os as _os
+        step_fn = None
+        if _os.environ.get("GSOVITS_DIT_STEP_COMPILE", "0") == "1" and cfg <= 1e-5:
+            def _step(xx, tt):
+                v, _, _ = self.estimator(
+                    xx, prompt_x, x_lens, tt, None, condition,
+                    drop_audio_cond=False, drop_text=False, static_cache=cache,
+                    infer=True, text_cache=text_cache,
+                )
+                return mx.transpose(v, (0, 2, 1))
+            step_fn = mx.compile(_step)
         for index in range(steps):
             time = mx.full((batch,), index * step, dtype=dtype)
-            velocity, text_embedding, _ = self.estimator(
-                x, prompt_x, x_lens, time, None, condition,
-                drop_audio_cond=False, drop_text=False, static_cache=cache,
-                infer=True, text_cache=text_cache,
-            )
-            if self.use_conditioner_cache and cache is None:
-                text_cache = text_embedding
-            velocity = mx.transpose(velocity, (0, 2, 1))
+            if step_fn is not None:
+                velocity = step_fn(x, time)
+            else:
+                velocity, text_embedding, _ = self.estimator(
+                    x, prompt_x, x_lens, time, None, condition,
+                    drop_audio_cond=False, drop_text=False, static_cache=cache,
+                    infer=True, text_cache=text_cache,
+                )
+                if self.use_conditioner_cache and cache is None:
+                    text_cache = text_embedding
+                velocity = mx.transpose(velocity, (0, 2, 1))
             if cfg > 1e-5:
                 negative, _, _ = self.estimator(
                     x, prompt_x, x_lens, time, None, condition,
