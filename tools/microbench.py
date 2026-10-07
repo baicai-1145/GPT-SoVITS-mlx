@@ -239,7 +239,7 @@ def capture_sovits(component: str, models_root: str, cpufast_repo: str, out_dir:
     import mlx.core as mx
 
     from gsovits_mlx.io import load_mlx_safetensors, release, trim_metal
-    from tools.e2e_v5 import load_audio_official  # official PyAV decode path
+    from tools.e2e import load_audio_official  # official PyAV decode path
     from gsovits_mlx.text.hubert import HubertModel
     from gsovits_mlx.text.mel_frontend import spectrogram
 
