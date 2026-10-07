@@ -189,6 +189,36 @@ cold-read signature (49.8 s vs 0.18 s warm, no competing process) — treat
 those cells as NAS-bandwidth-bound, not code performance. All FAST-cell
 numbers above are warm-cache compute-only.
 
+### task-8 close-out: all-8 RTF table + v5turbo floor
+
+Decode-stage RTF on the bench cell (FAST default-ON, warm cache, gates
+corr 0.99999-1.0; CFM-side numbers from perf-mem's cell where noted):
+
+| version | decode (s) | decode RTF | vs 0.10 budget |
+|---|---|---|---|
+| v1 | 0.34 | **0.033** | MET |
+| v2 | 0.28 | **0.032** | MET |
+| v2Pro | 0.55 | **0.062** | MET |
+| v2ProPlus | 0.78 | **0.089** | MET |
+| v5turbo | 2.88 | 0.336 | 3.4x over (CFM cell) |
+| v3 | ~18 (fp16 floor) | ~2.1 | floor-bound |
+| v4 | 15.07 | 1.761 | floor-bound |
+| v5dev | 26.96 | 3.150 | floor-bound |
+
+v5turbo floor documentation: 2.88 s stage = ~1.5 s CFM (4 Euler steps,
+perf-mem micro) + 0.42 s compiled fp16 vocoder (my cell, corr 1.0) +
+chunk/eval overhead. Levers attempted: mx.compile est-step closure
+rejected at 1.08x (task-5); full-fp16 est stream fails the 2e-2 gate
+(task-1); vocoder now at its memory-bandwidth floor (641->508 ms fp32->
+fp16, kernels already near IO time per the conv bench). No further lever
+without user-approved scope change (fewer steps / distillation). The
+honest RTF floor for v5turbo on this machine is ~0.30-0.34; v3/v4/v5dev
+are 32-step-CFM floor-bound at RTF ~1.8-3.2 by the same argument.
+
+Default-on note: GSOVITS_HIFIGAN_FAST now defaults ON everywhere
+(opt-out GSOVITS_HIFIGAN_FAST=0); gates re-verified per version before
+the flip (corr 0.99999-1.0, 0 NaN, exact durations).
+
 ## GEMM microbenchmark
 
 `tools/gemm_bench.py` (square fp16 matmul, MLX Metal GPU, includes launch
