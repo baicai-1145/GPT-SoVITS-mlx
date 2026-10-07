@@ -324,8 +324,7 @@ def run_prompt_codes(args, cfg, times):
     if cfg["family"] == "v1v2":
         from gsovits_mlx.pipeline import _load_sovits_v1v2
         sov, _meta = _load_sovits_v1v2(
-            os.path.join(args.models_root, cfg["sovits_dir"]),
-            "v1" if args.version == "v1" else "v2")
+            os.path.join(args.models_root, cfg["sovits_dir"]), args.version)
     else:
         from gsovits_mlx.pipeline import load_sovits_v3
         sov, _meta = load_sovits_v3(
