@@ -221,16 +221,66 @@ def test_gemm_bench_unit_labels_and_bounded_q():
     assert "rounds = reps" in src  # reps -> timing rounds, not batch work
     assert "q = 4" in src  # bounded queue
     assert "gemm_preflight_check" in src  # SHARED preflight, both CLIs
+    # provenance key reflects the full retained-tensor budget
+    wsrc = open(os.path.join(REPO, "tools", "microbench.py")).read()
+    assert "est_tensor_budget_bytes" in wsrc
+    assert "indep_batch_est_bytes" not in wsrc
 
 
 def test_shared_preflight_both_clis():
     """perf-mem: the SAME preflight policy backs both entrypoints; it raises
-    before allocation and the estimate matches the distinct-inputs budget."""
+    before allocation and the estimate matches the full retained-tensor
+    budget (batch + chain weights + chain intermediates)."""
     from tools.microbench import gemm_preflight_bytes, gemm_preflight_check
-    assert gemm_preflight_bytes(1024, 1024, 1024, 4) == 5 * 3 * 1024 * 1024 * 2
+    M = K = N = 1024
+    q = 4
+    batch = (q + 1) * (M * K + K * N + M * N) * 2
+    chain = (K * N + (q - 1) * N * N + q * M * N) * 2
+    assert gemm_preflight_bytes(M, K, N, q) == batch + chain
     with pytest.raises(ValueError):
         gemm_preflight_check(8192, 8192, 8192, 4, budget_mb=64)
     gemm_preflight_check(8192, 8192, 8192, 4, budget_mb=8192)  # passes
+
+
+def test_preflight_rectangular_n_dominates():
+    """Rectangular N >> K (the real-model 800x1152x4608 class): chain
+    weights (q-1)*N*N and q*M*N intermediates must be counted, or the
+    budget undercounts by 2-3x."""
+    from tools.microbench import gemm_preflight_bytes
+    M, K, N, q = 800, 1152, 4608, 8
+    batch_only = (q + 1) * (M * K + K * N + M * N) * 2
+    full = gemm_preflight_bytes(M, K, N, q)
+    chain_part = (K * N + (q - 1) * N * N + q * M * N) * 2
+    assert full == batch_only + chain_part
+    assert chain_part > batch_only  # N>>K: chain dominates; undercount verified
+
+
+def test_preflight_square_pure_arithmetic():
+    """Square shape, hand-computed total: no shape shortcuts."""
+    from tools.microbench import gemm_preflight_bytes
+    # M=K=N=2, q=2 (fp16 = 2 bytes/element):
+    # batch: (q+1)=3 sets x (4 + 4 + 4) elems x 2B = 72
+    # chain: (K*N=4 + (q-1)*N*N=4 + q*M*N=8) elems x 2B = 32
+    assert gemm_preflight_bytes(2, 2, 2, 2) == 72 + 32 == 104
+
+
+def test_preflight_prevents_allocation_failure_path(monkeypatch):
+    """The preflight must engage BEFORE any allocation: with a tiny budget,
+    bench_gemm must fail fast with ValueError and never build arrays."""
+    import tools.microbench as mb
+    mx.set_default_device(mx.cpu)
+    monkeypatch.setenv("GEMM_BENCH_MEM_BUDGET_MB", "0")
+    allocs = []
+    orig_normal = mx.random.normal
+
+    def counting_normal(shape, key=None, **kw):
+        allocs.append(tuple(shape))
+        return orig_normal(shape, key=key, **kw)
+
+    monkeypatch.setattr(mx.random, "normal", counting_normal)
+    with pytest.raises(ValueError, match="exceeds"):
+        mb.bench_gemm(mx, 1024, 1024, 1024, q=4, rounds=1)
+    assert allocs == [], "preflight must run before any array materialization"
 
 
 def test_bench_gemm_exposes_raw_seconds():

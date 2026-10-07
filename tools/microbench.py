@@ -489,7 +489,9 @@ def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
     out = {"mode": "gemm", "shape": f"{M}x{K}x{N}", "dtype": "float16", "queue": q,
            "rounds": rounds, "input_policy": "distinct-materialized",
            "output_policy": "retain-and-eval-all",
-           "indep_batch_est_bytes": (q + 1) * (M * K + K * N + M * N) * 2}
+           # conservative estimate of ALL retained tensors (batch + chain),
+           # not just the independent batch:
+           "est_tensor_budget_bytes": gemm_preflight_bytes(M, K, N, q)}
 
     # q+1 distinct lefts and rights (extra for warmup), all pre-evaluated.
     lefts = _mk_distinct(mx, q + 1, M, K, seed=1)
@@ -569,9 +571,20 @@ def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
 
 
 def gemm_preflight_bytes(M: int, K: int, N: int, q: int) -> int:
-    """Estimated distinct-inputs+outputs bytes for a gemm bench batch
-    (shared by both CLIs; must run BEFORE allocating)."""
-    return (q + 1) * (M * K + K * N + M * N) * 2
+    """CONSERVATIVE estimated tensor budget in bytes for a gemm bench run
+    (shared by both CLIs; must run BEFORE allocating).
+
+    Covers every tensor the helper materializes or retains until eval:
+      independent batch: (q+1) distinct lefts (M*K) + rights (K*N) +
+                         retained outputs (M*N), fp16
+      chain path:        w_first (K*N) + (q-1) rest weights (N*N) +
+                         q reachable chain intermediates (M*N), fp16
+
+    This is an ESTIMATE of retained tensors only — NOT an exact GPU peak:
+    allocator/workspace/Metal cache overheads are not modeled (unproven)."""
+    batch = (q + 1) * (M * K + K * N + M * N) * 2
+    chain = (K * N + (q - 1) * N * N + q * M * N) * 2
+    return batch + chain
 
 
 def gemm_preflight_check(M: int, K: int, N: int, q: int,
