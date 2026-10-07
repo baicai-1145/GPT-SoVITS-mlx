@@ -199,3 +199,61 @@ mx.compile work, flagged to lead). Acceptance cell for P0-B was v5dev.
 Outputs verified byte-identical to main@2e8bddb (seed 0) for v2 and v5dev
 after all memory changes; g2pw/BERT reload lazily if the front-end is ever
 re-entered after teardown.
+
+## Component micro-benchmarks (task-5, `tools/microbench.py`)
+
+Fixed captured inputs (.tmp/mb/, canonical env: PyAV decode, pinned
+quadruple), one component per process under the gpu.lock, golden-parity
+gated (GPT cells: token-exact vs seeded capture; SoVITS cells: run-to-run
+audio identity). Best-of-2/3:
+
+| cell | metric | value |
+|---|---|---|
+| gpt-s1v1 (2kh) | tok/s @115 tok | 107.5 |
+| gpt-s1v2 (5kh) | tok/s @112 tok | 107.8 |
+| gpt-s1v3 (s1v3) | tok/s @101 tok | 107.3 |
+| sovits-v3 (CFM32 + BigVGAN) | decode 8.1 s audio | 17.7 s (cfm 11.6 + voc 5.9) |
+| sovits-v5dev (CFMV5 32-step cfg 1.30) | decode 8.1 s audio | 24.6 s (cfm 23.9 + voc 0.5) |
+| sovits-v5turbo (4-step) | decode 8.1 s audio | 2.1 s (cfm 1.5 + voc 0.5) |
+
+Reconciliation: GPT ~107 tok/s micro == e2e AR stage (~1.2 s @113 tok incl.
+warmup). SoVITS cells are warm-process lower bounds; e2e stage-5 spans run
+~10% higher (v5dev 24.6 vs 27.7 s; v3 CFM shows a larger gap under
+investigation). v1/v2/v2Pro/v2ProPlus HiFiGAN cells + v4 Generator vocoder
+belong to conv-fp16's HiFiGAN A/B (cell split, lead-approved).
+
+### AR optimization record (honest ledger)
+
+- Preallocated KV cache (slice writes, no per-step history concat): parity
+  token-exact, tok/s FLAT (104->104). Kept behind fast_cache=True (default
+  False): strictly less traffic, wins at long T, but SDPA over
+  non-contiguous views flips inverse-CDF near-ties -> never for anchors.
+- mx.compile whole 24-layer AR step (bucketed windows): parity OK, 98.7
+  tok/s - slower than eager at these sizes (JIT never amortizes).
+- GPU-side inverse-CDF sampling (one sync/step): FLAT. The CDF sync and
+  dispatch are not the wall; ~104-108 tok/s is the eager-architecture
+  ceiling on M4 (10 ms/step across 24 layers). The big AR win was task-3's
+  wired-memory release (11.8 -> ~104 tok/s). Next lever would be
+  speculative decoding (out of scope).
+- mx.compile DiT est-call (v5dev, static-cache path): 1.08x on the pair
+  (102->92 ms), trajectory drift 1.27e-2 = 60% of the 2e-2 parity budget.
+  Evaluated-and-rejected: not worth the budget for ~2 s/e2e.
+
+### Footprint after task-5 (canonical env re-sweep, peak KB via bench.py)
+
+| version | footprint peak | note |
+|---|---|---|
+| v1 | 4.30 GB | anchor is a 157-token/10.3 s clip (longer stream) |
+| v2 | 4.07 GB | |
+| v2Pro | 4.32 GB | |
+| v2ProPlus | 6.65 GB | fp32 sv encoder rides the peak (follow-up) |
+| v3 | 4.55 GB | was 12.58: BigVGAN per-stage eval + clear_cache |
+| v4 | 3.41 GB | |
+| v5dev | 3.59 GB | acceptance cell still <4 GB |
+| v5turbo | 3.90 GB | |
+
+BigVGAN fix (gsovits_mlx/vocoder/bigvgan.py): eval + mx.clear_cache() per
+upsample stage - freed multi-GB intermediates otherwise pile up in MLX's
+buffer cache (~2 GB/stage, 12 GB peak). Bitwise-identical output; anchor
+gates re-verified (v3/v5dev/v5turbo corr 1.0000, rms ratio 1.0000).
+Per-resblock flush measured WORSE (6.2 GB, defeats buffer reuse) - reverted.
