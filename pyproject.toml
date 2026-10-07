@@ -13,10 +13,17 @@ dependencies = [
     # Same ulp-flip sensitivity measured for numpy patch releases (2.5.2 ->
     # 2.5.3 flips the same cell 119 -> 112 with mlx identical). Keep exact.
     "numpy==2.5.2",
+    # PyAV: official audio decode. WITHOUT it e2e silently falls back to
+    # soundfile+linear-resample, which shifts prompt codes -> different
+    # seeded AR stream (110 vs 113 tokens measured). Version-sensitive
+    # for the same reason: keep 18.1.0 exact (19.x bundles a different
+    # ffmpeg decode path).
+    "av==18.1.0",
+    # Weight containers: io.py imports safetensors directly; it was
+    # undeclared until this bit a fresh-venv factorial run.
+    "safetensors>=0.8",
     "tokenizers>=0.19",
     "soundfile>=0.12",
-    "safetensors>=0.8.0",
-    "av>=19.0.1",
 ]
 
 [project.optional-dependencies]
