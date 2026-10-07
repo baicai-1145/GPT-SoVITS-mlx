@@ -216,8 +216,16 @@ class Text2SemanticDecoder:
     def infer(self, phones: mx.array, bert_feature: mx.array, prompt: mx.array,
               top_k: int = 15, top_p: float = 1.0, temperature: float = 1.0,
               repetition_penalty: float = 1.35, early_stop_num: int | None = None,
-              key: mx.array | None = None, fast_cache: bool = True) -> mx.array:
-        """Batch=1 AR decode with KV cache. Returns generated semantic tokens (1, T)."""
+              key: mx.array | None = None, fast_cache: bool = False) -> mx.array:
+        """Batch=1 AR decode with KV cache. Returns generated semantic tokens (1, T).
+
+        fast_cache=False (default) is the concat-cache path, bit-identical to
+        the verified streams (anchors/parity gates). fast_cache=True uses
+        preallocated buffers: strictly less memory traffic (wins at long T)
+        but SDPA over non-contiguous views takes a different fp16 kernel path,
+        which flips inverse-CDF near-ties -> different (equally valid) token
+        stream. Never enable it for anchor/parity runs.
+        """
         early_stop_num = early_stop_num if early_stop_num is not None else self.early_stop_num
         if key is None:
             key = mx.random.key(0)
