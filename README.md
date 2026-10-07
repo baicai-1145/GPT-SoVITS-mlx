@@ -29,23 +29,32 @@ uv sync --extra dev          # + pytest
 
 ## Usage
 
-Each family has one end-to-end script under `tools/`:
+One CLI for all versions:
 
 ```bash
-python3 tools/e2e_v2.py \
+python3 tools/e2e.py --version v2 \
     --text "你好，欢迎来到各自的旅程。今天我们聊聊机器学习。" \
     --ref-audio ref_zh_3.5s.wav --ref-text "希望你以后能够做得比我还好哟。" \
     --out out_v2.wav
 
-python3 tools/e2e_v5.py --model turbo ... --out out_v5turbo.wav
-python3 tools/e2e_v2pro.py --model proplus ... --out out_v2proplus.wav
+# v1 | v2 | v2Pro | v2ProPlus | v3 | v4 | v5dev | v5turbo
+python3 tools/e2e.py --version v5turbo ...
+python3 tools/e2e.py --version v2ProPlus ...
 ```
 
-`--models-root` points at the converted MLX exports (default
-`/Volumes/2T/gpt-sovits-models/mlx`): `bert/ hubert/ s1*/ <version>/ [*vocoder/] sv/`.
-The CPUFast checkout is used read-only for the text front-end
-(`--cpufast-repo`). Benchmark any version with
+The old per-version scripts (`tools/e2e_v2.py` etc.) remain as thin
+wrappers that exec `e2e.py` with the version pinned — identical behavior
+and byte-identical outputs; `tools/bench.py` and existing docs keep
+working through them. Useful flags: `--ref-cache DIR` (prompt cache,
+<50 ms repeat runs), `--frontend-only` (CPU-legal front-end smoke),
+`--seed N` (see Reproducibility), `--bench` (per-stage times).
+Benchmark any version with
 `python3 tools/bench.py --version v4 --keep-audio out.wav`.
+
+`--models-root` points at the converted MLX exports (default
+`/Volumes/2T/gpt-sovits-models/mlx`): `bert/ hubert/ s1*/ <version>/
+[*vocoder/] sv/`. The CPUFast checkout is used read-only for the text
+front-end (`--cpufast-repo`).
 
 ### Text front-end and languages
 
