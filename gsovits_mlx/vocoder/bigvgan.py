@@ -236,6 +236,16 @@ class BigVGAN(nn.Module):
             for j in range(self.num_kernels):
                 xs = xs + self.resblocks[i * self.num_kernels + j](x)
             x = xs / self.num_kernels
+            # Realize per stage AND flush the buffer cache (task-5): the
+            # 256x stack frees multi-GB intermediates per stage; without a
+            # flush they pile up in MLX's buffer cache and the physical
+            # footprint grows ~2 GB per stage (measured 12 GB peak on v3).
+            # Placement-only: bitwise identical output.
+            mx.eval(x)
+            try:
+                mx.clear_cache()
+            except AttributeError:
+                mx.metal.clear_cache()
         x = self.activation_post(x)
         x = self.conv_post(x)
         return mx.tanh(x) if self.use_tanh_at_final else mx.clip(x, -1.0, 1.0)
