@@ -418,7 +418,15 @@ def main() -> None:
     trim_metal()
 
     voc = load_vocoder_v4(os.path.join(args.models_root, "v5_vocoder"))
-    audio = voc(pred)
+    if os.environ.get("GSOVITS_HIFIGAN_FAST") == "1":
+        # task-8: fp16-in compiled vocoder closure; output cast back to
+        # fp32 for the audio writers (measured parity in the A/B cell)
+        _dt = voc.conv_pre.weight.dtype
+        if not hasattr(voc, "_fast"):
+            voc._fast = mx.compile(voc)
+        audio = voc._fast(pred.astype(_dt)).astype(mx.float32)
+    else:
+        audio = voc(pred)
     mx.eval(audio)
     del pred
     gc.collect()
