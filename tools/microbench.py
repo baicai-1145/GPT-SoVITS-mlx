@@ -20,19 +20,23 @@ SoVITS decoders (fixed codes+refer, ~110 generated tokens):
     sovits-v5turbo                 CFMV5 4-step cfg 0.0
     metric: decode latency (s) + golden-output max|diff| for parity.
 
-Measurement doctrine (task-10, three hard rules)
-------------------------------------------------
-1. SYNCED per-op numbers are NEVER throughput: an isolated `op(); mx.eval()`
-   measures the dispatch+sync floor (~0.6 ms/op on M4 Metal) plus whatever
-   compute. Only pipelined batches count.
-2. "Pipelined" MUST state its queue depth q (ops queued before one eval).
-   Time scales ~1/q while q * dispatch > compute; queue depth is a
-   first-class benchmark parameter, like shape and dtype.
-3. Pipelining amortizes dispatch only across INDEPENDENT ops. A dependency
-   chain (each op feeds the next — every real model graph) runs at
-   effective q=1: per-op cost is compute + one dispatch, no amortization.
-   Isolated per-op eval on Metal overstates op cost ~10x; conversely,
-   per-op micro results do NOT transfer to in-graph chains.
+Measurement doctrine (task-11 revision; supersedes task-10 notes)
+---------------------------------------------------------------
+1. State WHAT a number is, never assert what it is not:
+   - single-op synced latency (`op(); mx.eval()`) is a valid END-TO-END
+     latency including dispatch + sync; it is not pure kernel throughput.
+   - independent-batch timing (q distinct ops queued, ONE final eval)
+     measures achieved throughput of q pipelined ops; q must be stated.
+   - dependent-chain timing (x @ W1 @ W2 ... finite outputs) measures
+     chained-graph latency; FLOPs must be computed from the ACTUAL shapes
+     of every executed matmul.
+2. Repeated IDENTICAL operands risk runtime common-subexpression
+   elimination. Bench helpers must use DISTINCT materialized inputs and
+   retain + evaluate EVERY timed output. Keeping outputs in the graph is
+   necessary but not sufficient proof of execution count; state the
+   verification used (graph export / profile) when available.
+3. Never sum isolated micro timings into a physical lower bound, and never
+   extrapolate chain behavior from independent-op results (or vice versa).
 
 Usage
 -----
@@ -48,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -353,6 +358,22 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
             pred = denorm_spec(mel)
             mx.eval(pred)
             spans[f"cfm_{i}"] = round(time.perf_counter() - t1, 3)
+            if "dit_config" not in result:
+                est = sov.cfm.estimator
+                attn0 = est.transformer_blocks[0].attn
+                result["dit_config"] = {
+                    "ver": ver,
+                    "dim": int(est.dim),
+                    "n_blocks": len(est.transformer_blocks),
+                    "heads": int(attn0.heads),
+                    "dim_head": int(attn0.dim_head),
+                    "mu_shape": [int(v) for v in fea_todo.shape],
+                    "steps": int(steps),
+                    "cfg_rate": float(cfg),
+                    "weight_dtype": str(attn0.to_q_w.dtype),
+                    "mu_ref_T": int(fea_ref.shape[-1]),
+                    "mu_todo_T": int(fea_todo.shape[-1]),
+                }
             del fea_ref, fea_todo, mel2, mel
             voc = load_vocoder_v4(os.path.join(models_root, "v5_vocoder"))
             t2 = time.perf_counter()
@@ -421,6 +442,116 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
     return result
 
 
+
+# ---------------------------------------------------------------------------
+# gemm bench helpers (task-11). CPU-testable: pure functions, no side effects
+# beyond the arrays they build. Every timed output is retained AND evaluated;
+# inputs are DISTINCT materialized arrays so identical-work elimination
+# cannot drop them from the graph or the run.
+# ---------------------------------------------------------------------------
+
+def gemm_parse_shape(shape: str) -> tuple:
+    parts = shape.lower().split("x")
+    if len(parts) != 3:
+        raise ValueError(f"shape must be MxKxN, got {shape!r}")
+    dims = tuple(int(v) for v in parts)
+    if any(v <= 0 for v in dims):
+        raise ValueError(f"shape dimensions must be positive, got {shape!r}")
+    return dims
+
+
+def gemm_validate_queue(q: int) -> int:
+    if int(q) != q or q < 1:
+        raise ValueError(f"queue must be a positive integer, got {q!r}")
+    return int(q)
+
+
+def gemm_flops(shapes) -> int:
+    """FLOPs for the matmuls ACTUALLY executed. shapes: iterable of (M,K,N)."""
+    return sum(2 * m * k * n for (m, k, n) in shapes)
+
+
+def _mk_distinct(mx, n, rows, cols, seed):
+    """n DISTINCT materialized fp16 arrays (seeded per index)."""
+    mats = []
+    for i in range(n):
+        key = mx.random.key(seed * 100_003 + i)
+        mats.append(mx.random.normal((rows, cols), key=key).astype(mx.float16))
+    mx.eval(*mats)
+    return mats
+
+
+def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
+    import time as _time
+
+    dtype = mx.float16
+    out = {"mode": "gemm", "shape": f"{M}x{K}x{N}", "dtype": "float16", "queue": q,
+           "rounds": rounds, "input_policy": "distinct-materialized",
+           "output_policy": "retain-and-eval-all"}
+
+    # q+1 distinct lefts and rights (extra for warmup), all pre-evaluated.
+    lefts = _mk_distinct(mx, q + 1, M, K, seed=1)
+    rights = _mk_distinct(mx, q + 1, K, N, seed=2)
+
+    def round_outputs():
+        """q DISTINCT matmuls (lefts[i] @ rights[i]), outputs retained."""
+        return [lefts[i] @ rights[i] for i in range(q)]
+
+    # warm both paths once
+    mx.eval(*round_outputs())
+
+    # (a) single-op synced latency: valid END-TO-END latency (dispatch+sync
+    # included), best-of-rounds. Uses the distinct operands, single op.
+    best = math.inf
+    for _ in range(rounds):
+        s = _time.perf_counter()
+        r = lefts[q] @ rights[q]
+        mx.eval(r)
+        best = min(best, _time.perf_counter() - s)
+    out["single_op_synced_ms"] = round(best * 1e3, 3)
+
+    # (b) independent-batch achieved throughput: q distinct matmuls queued,
+    # ONE final eval of ALL retained outputs. Work = q x (2MKN) exactly.
+    best = math.inf
+    for _ in range(rounds):
+        s = _time.perf_counter()
+        outs = round_outputs()
+        mx.eval(*outs)
+        best = min(best, _time.perf_counter() - s)
+    out["indep_batch_total_ms"] = round(best * 1e3, 3)
+    out["indep_batch_flops"] = gemm_flops([(M, K, N)] * q)
+    out["indep_batch_tf"] = round(out["indep_batch_flops"] / best / 1e12, 2)
+
+    # (c) dependent-chain latency: x @ W1 @ W2 ... compatible matrices, q
+    # links, every intermediate retained and evaluated once at the end.
+    # FLOPs from the ACTUAL per-link shapes: first link (M,K,N), then
+    # (M,N,N) for each following link.
+    w_first = _mk_distinct(mx, 1, K, N, seed=31)[0]
+    chain_rest = _mk_distinct(mx, q - 1, N, N, seed=32) if q > 1 else []
+    x0 = lefts[q]
+    chain_shapes = [(M, K, N)] + [(M, N, N)] * (q - 1)
+
+    def chain_outputs():
+        acc = x0 @ w_first
+        for w in chain_rest:
+            acc = acc @ w
+        return acc
+
+    r = chain_outputs()
+    mx.eval(r)
+    best = math.inf
+    for _ in range(rounds):
+        s = _time.perf_counter()
+        acc = chain_outputs()
+        mx.eval(acc)
+        best = min(best, _time.perf_counter() - s)
+    out["chain_total_ms"] = round(best * 1e3, 3)
+    out["chain_links"] = q
+    out["chain_flops"] = gemm_flops(chain_shapes)
+    out["chain_tf"] = round(out["chain_flops"] / best / 1e12, 2)
+    out["chain_shapes"] = [f"{m}x{k}x{n}" for (m, k, n) in chain_shapes]
+    return out
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -444,34 +575,17 @@ def main() -> None:
     if args.mode == "gemm":
         gpu_lock_guard(args.allow_unlocked)
         import mlx.core as mx
-        M, K, N = (int(v) for v in args.shape.split("x"))
-        a = mx.random.normal((M, K)).astype(mx.float16)
-        b = mx.random.normal((K, N)).astype(mx.float16)
-        r = a @ b
-        mx.eval(r)
-        def once():
-            return a @ b
-        once()
-        out = {"mode": "gemm", "shape": args.shape, "queue": args.queue}
-        # synced (doctrine rule 1: NOT throughput — dispatch floor + compute)
-        best = 1e9
-        for _ in range(6):
-            s = time.perf_counter()
-            rr = once()
-            mx.eval(rr)
-            best = min(best, time.perf_counter() - s)
-        out["synced_ms"] = round(best * 1e3, 3)
-        # pipelined at the stated queue depth (rule 2)
-        q = max(1, args.queue)
-        best = 1e9
-        for _ in range(8):
-            s = time.perf_counter()
-            outs = [once() for _ in range(q)]
-            mx.eval(*outs)
-            best = min(best, (time.perf_counter() - s) / q)
-        out["pipelined_ms"] = round(best * 1e3, 3)
-        out["pipelined_tf"] = round(2 * M * K * N / best / 1e12, 1)
-        print(json.dumps(out))
+        try:
+            M, K, N = gemm_parse_shape(args.shape)
+            q = gemm_validate_queue(args.queue)
+            res = bench_gemm(mx, M, K, N, q,
+                             rounds=int(os.environ.get("MICROBENCH_GEMM_ROUNDS", "8")))
+        except ValueError as e:
+            sys.exit(f"gemm: {e}")
+        print(json.dumps(res))
+        if args.json_out:
+            with open(args.json_out, "a") as f:
+                f.write(json.dumps(res) + "\n")
         return
 
     gpu_lock_guard(args.allow_unlocked)  # both modes run GPU inference
