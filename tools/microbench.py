@@ -528,11 +528,17 @@ def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
     # (c) dependent-chain latency: x @ W1 @ W2 ... compatible matrices, q
     # links, every intermediate retained and evaluated once at the end.
     # FLOPs from the ACTUAL per-link shapes: first link (M,K,N), then
-    # (M,N,N) for each following link.
-    w_first = _mk_distinct(mx, 1, K, N, seed=31)[0]
-    chain_rest = _mk_distinct(mx, q - 1, N, N, seed=32) if q > 1 else []
+    # (M,N,N) for each following link. Chain weights are scaled by
+    # 1/sqrt(fan_in) and materialized OUTSIDE the timed region: unscaled
+    # N(0,1) weights overflow fp16 by link ~5 (lead repro), so every output
+    # is finite-checked OUTSIDE the timing loop.
+    w_first = (mx.random.normal((K, N), key=mx.random.key(31)) * (K ** -0.5)
+               ).astype(mx.float16)
+    chain_rest = [(mx.random.normal((N, N), key=mx.random.key(32 + i))
+                   * (N ** -0.5)).astype(mx.float16) for i in range(q - 1)]
     x0 = lefts[q]
     chain_shapes = [(M, K, N)] + [(M, N, N)] * (q - 1)
+    mx.eval(w_first, *chain_rest)
 
     def chain_outputs():
         acc = x0 @ w_first
@@ -542,6 +548,8 @@ def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
 
     r = chain_outputs()
     mx.eval(r)
+    if not bool(mx.all(mx.isfinite(r))):
+        raise ValueError("gemm chain output not finite (scaling/overflow bug)")
     best = math.inf
     for _ in range(rounds):
         s = _time.perf_counter()

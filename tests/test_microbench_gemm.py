@@ -154,11 +154,56 @@ def test_gemm_bench_rejects_reps_as_unaccounted_work():
 
 def test_chain_q8_production_finite():
     """Lead repro: unscaled normal chain weights overflow fp16 by link 5.
-    Production helper must scale by 1/sqrt(fan_in) and stay finite at q=8."""
+    Production helper must scale by 1/sqrt(fan_in) and stay finite at q=8.
+    Asserts the actual FINITE VALUES, not just timing keys."""
     mx.set_default_device(mx.cpu)
     res = bench_gemm(mx, 64, 64, 64, q=8, rounds=2)
     assert res["chain_links"] == 8
-    assert res["chain_total_ms"] > 0  # and did not raise on finiteness
+    assert res["chain_total_ms"] > 0
+    # recompute the chain with the helper's own scaling and assert finite
+    # VALUES (red on the unscaled defect: NaN by link 5)
+    w_first = (mx.random.normal((64, 64), key=mx.random.key(31)) * (64 ** -0.5)).astype(mx.float16)
+    rest = [(mx.random.normal((64, 64), key=mx.random.key(32 + i)) * (64 ** -0.5)).astype(mx.float16)
+            for i in range(7)]
+    a = mx.random.normal((64, 64), key=mx.random.key(1)).astype(mx.float16)
+    acc = a @ w_first
+    for w in rest:
+        acc = acc @ w
+    mx.eval(acc)
+    assert bool(mx.all(mx.isfinite(acc))), "chain output not finite"
+
+
+def test_chain_defect_red_unscaled_overflows():
+    """RED side of red-green: the ACTUAL defect — unscaled N(0,1) fp16 chain
+    weights produce non-finite output at q=8 (verified NaN). If this ever
+    passes, fp16 got wider or MLX changed semantics; revisit scaling."""
+    mx.set_default_device(mx.cpu)
+    def mk(seed):
+        return mx.random.normal((64, 64), key=mx.random.key(seed)).astype(mx.float16)
+    a = mk(1)
+    ws = [mk(31)] + [mk(32 + i) for i in range(7)]
+    acc = a @ ws[0]
+    for w in ws[1:]:
+        acc = acc @ w
+    mx.eval(acc)
+    assert not bool(mx.all(mx.isfinite(acc))), "unscaled chain unexpectedly finite"
+
+
+def test_bench_gemm_raises_on_unscaled_chain(monkeypatch):
+    """The helper's own guard: make weights effectively unscaled (multiply
+    normal draws by 2**8) so even fan-in scaling cannot keep the q=8 chain
+    finite; bench_gemm MUST raise ValueError from the isfinite guard.
+    Proves the guard sits on the execution path, not decorative."""
+    import tools.microbench as mb
+    mx.set_default_device(mx.cpu)
+    orig_normal = mx.random.normal
+
+    def hot_normal(shape, key=None, **kw):
+        return orig_normal(shape, key=key, **kw) * 256.0
+
+    monkeypatch.setattr(mx.random, "normal", hot_normal)
+    with pytest.raises(ValueError, match="not finite"):
+        bench_gemm(mx, 64, 64, 64, q=8, rounds=1)
 
 
 def test_chain_large_n_finite():
