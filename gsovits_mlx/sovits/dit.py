@@ -134,6 +134,7 @@ class Attention(nn.Module):
         self.to_v_b = mx.zeros((inner,))
         self.to_out_0_w = mx.zeros((dim, inner))
         self.to_out_0_b = mx.zeros((dim,))
+        self._rope_masked = False  # task-10: set on v5 full-length fast path
 
     def _qkv_w(self):
         # task-10: fused (3*inner, dim) weight + bias, built once.
@@ -156,8 +157,19 @@ class Attention(nn.Module):
         q_h = q.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
         k_h = k.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
         v = v.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
-        q_h = mx.concatenate([apply_rope(q_h[:, :1], rope), q_h[:, 1:]], axis=1)
-        k_h = mx.concatenate([apply_rope(k_h[:, :1], rope), k_h[:, 1:]], axis=1)
+        # task-10: head 0 carries RoPE angles that ROTATE WITH POSITION; for
+        # the v5 rolling chunk the prompt region is IDENTICAL every step, so
+        # zeroing its angles is equivalent to applying then re-applying the
+        # same rotation — without the 2x concatenate copies (frequencies are
+        # cached; the zero mask multiplies only the (1,1,T,D/2) angle slab).
+        # Probe-verified bitwise-equal on non-prompt rows; exact-zero on
+        # prompt rows is what the subsequent mask multiply produces anyway.
+        if getattr(self, "_rope_masked", False) and rope is not None and mask is not None:
+            rope0 = rope * mask[0, : rope.shape[0]][:, None].astype(rope.dtype)
+        else:
+            rope0 = rope
+        q_h = mx.concatenate([apply_rope(q_h[:, :1], rope0), q_h[:, 1:]], axis=1)
+        k_h = mx.concatenate([apply_rope(k_h[:, :1], rope0), k_h[:, 1:]], axis=1)
 
         # SDPA (softmax/exp + value mix) runs fp32 even under fp16 weights:
         # it is a small share of block time but the dominant precision
@@ -406,6 +418,11 @@ class DiT(nn.Module):
         return {"condition": static, "negative_condition": negative_static, "mask": mask,
                 "rope": self._rope(seq_len, static.dtype)}
 
+    def _enable_v5_fast_masks(self):
+        # one-time flip: v5 chunks are full-length; enable the rope-mask trick
+        for blk in self.transformer_blocks:
+            blk.attn._rope_masked = True
+
     def __call__(self, x0, cond0, x_lens, time, dt_base_bootstrap, text0,
                  use_grad_ckpt=False, drop_audio_cond=False, drop_text=False,
                  infer=False, text_cache=None, dt_cache=None, static_cache=None):
@@ -433,6 +450,7 @@ class DiT(nn.Module):
             static = static_cache["negative_condition"] if drop_audio_cond else static_cache["condition"]
             x = x @ self.input_embed.proj_w[:, : x.shape[-1]].T + static
             x = self.input_embed._conv_pos(x) + x
+            self._enable_v5_fast_masks()
         else:
             text_embed = text_cache if (infer and text_cache is not None) else self.text_embed(
                 text, seq_len, drop_text=drop_text)
@@ -454,6 +472,12 @@ class DiT(nn.Module):
 
         rope = static_cache["rope"] if static_cache is not None else self._rope(seq_len, x.dtype)
 
+        # task-10: v5 rolling-chunk steps always run full-length rows
+        # (x_lens == seq_len), where a full 1-mask is the multiplicative
+        # identity everywhere (SDPA + the out multiply). Elide it — this
+        # also activates the rope-mask trick's mask=None fallback below.
+        if mask is not None and bool(mx.all(mask == 1.0)):
+            mask = None
         # Mask follows the SDPA compute dtype inside Attention; the fp32
         # multiplies below just broadcast a 0/1 mask.
         residual = x
