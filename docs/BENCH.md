@@ -7,31 +7,46 @@ macOS, MLX Metal GPU, one version per process, serial. Reference clip
 **seed 0, fully reproducible** (AR sampling seeds numpy's global RNG since
 commit c0d68b5), official AR sampling defaults per version.
 
+**Acceptance status**: the user target is complete synthesis RTF <=0.10
+for all eight versions. Decode-only RTF excludes frontend, prompt
+preparation and AR, and does not demonstrate that target. These tables
+retain historical measurements, not a declaration of completion.
+
+**Measurement correction (post-task-10)**: the lead's GEMM probe and
+`tools/gemm_bench.py` overwrote lazy matmul outputs, evaluated only the
+final result, then counted all loop iterations as executed work. CPU graph
+export verified one reachable Matmul for an eight-iteration overwrite
+loop, versus eight when outputs are retained. The reported 0.66ms/25.9
+TFLOP/s and inverse-queue-depth explanation are withdrawn. Neither these
+numbers nor isolated operator timings establish a DiT physical lower
+bound. Task-11 revalidates execution counts and real-graph timings.
+
 **Anchors re-rendered 2026-10-07 07:17–07:21 on main @3a9b3bc** (post
 fp16 + front-end + memory-optimization merges), one version per process,
 serial, `tools/bench.py --version X --seed 0 --gpu`. These supersede the
-02:38 renders; per-version token counts are printed by bench.py at run
-time and differ from the legacy 113/119 table where the fp32→fp16
-quantizer and front-end path legitimately shift the seeded stream. Treat
-THIS table's duration/peak/rms as the reference statistics (unchanged
-from the legacy renders at the reported precision):
+02:38 renders. Subsequent same-code environment comparisons traced the
+110-vs-113 token discrepancy to missing PyAV and the fallback resampler;
+the earlier attribution to frontend or quantizer dtype is withdrawn.
+Compare token counts using the same version, inputs and decoding path.
+Matching duration/peak/RMS alone does not prove sample identity.
 
 **Anchor environment contract**: seeded baselines are only comparable
-within (python 3.12, mlx==0.32.2, numpy==2.5.2, device=GPU-rendered).
+within (python 3.12, mlx==0.32.2, numpy==2.5.2, av==18.1.0 using the
+PyAV decoding path, device=GPU-rendered).
 Both mlx and numpy patch releases flip inverse-CDF near-ties in the AR
 sampler — 0.32.2→0.32.3 and numpy 2.5.2→2.5.3 each moved the bench cell
 from 119 to 112 tokens (measured A/B, task-2). Both are pinned exact in
 pyproject.toml; upgrading either requires re-rendering all 8 anchors.
-CPU-pinned runs agree with the GPU-rendered anchors to corr ~0.9999
-(kernel ulps) and pass the corr >0.98 gates; wall-time runs are GPU-only
-under the lock.
+Full-pipeline CPU runs are unsupported and are not comparable baselines;
+frontend-only CPU smoke checks remain supported. GPU measurements require
+the shared lock and exactly one active GPU task machine-wide.
 
 Reproduce with:
 
 ```bash
-python3 tools/bench.py --version v2pro --keep-audio out.wav   # any of:
+python3 tools/bench.py --version v2pro --keep-audio out.wav --seed 0 --gpu
 # v1 | v2 | v2Pro | v2ProPlus | v3 | v4 | v5dev | v5turbo
-python3 tools/gemm_bench.py 4096 20                            # GEMM microbench
+# GEMM throughput commands are being revalidated in task-11; see correction above.
 ```
 
 ## Seeded baseline — phase-2 starting point (main @62134f9, fp32 sovits)
@@ -156,7 +171,7 @@ Assigned cell (lead split): v1/v2/v2Pro/v2ProPlus decoders + v4/v5 48kHz
 Generator vocoder. Mechanism shipped: `GSOVITS_HIFIGAN_FAST=1` — cast the
 decoder/vocoder input to the weight dtype (flow emits fp32; with fp16
 weights every conv otherwise re-promotes) + `mx.compile`d closure, output
-cast back to fp32 for consumers. Env-gated, default OFF.
+cast back to fp32 for consumers. Default ON; GSOVITS_HIFIGAN_FAST=0 opts out.
 
 | version | decode before | decode FAST | e2e wav gate | decode RTF |
 |---|---|---|---|---|
@@ -165,11 +180,12 @@ cast back to fp32 for consumers. Env-gated, default OFF.
 | v2Pro | — | 0.55 s | PASS corr 1.00000 | 0.062 |
 | v2ProPlus | — | 0.78 s | PASS corr 1.00000 | 0.089 |
 | v5turbo (voc part) | 0.53 s | ~0.42 s | PASS corr 1.00000 | (CFM-side pending perf-mem) |
-| v4 (voc part) | — | wired | PASS corr 1.00000 | floor-bound (32-step CFM) |
+| v4 (voc part) | — | wired | PASS corr 1.00000 | decode >0.10; lower bound unproven |
 
-Four versions (v1/v2/v2Pro/v2ProPlus) reach RTF <= 0.10 on decode.
-v4/v5dev stay floor-bound by the 32-step CFM (DiT cell, perf-mem); v5turbo
-needs the CFM side for 0.10 (4-step floor ~1.5 s measured by perf-mem).
+Four versions (v1/v2/v2Pro/v2ProPlus) measured decode RTF <= 0.10.
+This is not complete synthesis RTF. The CFM versions exceeded 0.10 in
+these measurements; neither their theoretical floor nor their remaining
+optimization headroom has been established.
 
 Rejected arms (measured): stage-trim +11% on v2 decode (758.9 vs 681.1 ms)
 — keep OFF for speed, ON for footprint; compile on the fp32-input path
@@ -189,94 +205,95 @@ cold-read signature (49.8 s vs 0.18 s warm, no competing process) — treat
 those cells as NAS-bandwidth-bound, not code performance. All FAST-cell
 numbers above are warm-cache compute-only.
 
-### task-8 close-out: all-8 RTF table + v5turbo floor
+### task-8: historical decode RTF, not complete synthesis acceptance
 
 Decode-stage RTF on the bench cell (FAST default-ON, warm cache, gates
 corr 0.99999-1.0; CFM-side numbers from perf-mem's cell where noted):
 
-| version | decode (s) | decode RTF | vs 0.10 budget |
+| version | decode (s) | decode RTF | decode-only comparison |
 |---|---|---|---|
-| v1 | 0.34 | **0.033** | MET |
-| v2 | 0.28 | **0.032** | MET |
-| v2Pro | 0.55 | **0.062** | MET |
-| v2ProPlus | 0.78 | **0.089** | MET |
-| v5turbo | 2.88 | 0.336 | 3.4x over (CFM cell) |
-| v3 | ~18 (fp16 floor) | ~2.1 | floor-bound |
-| v4 | 15.07 | 1.761 | floor-bound |
-| v5dev | 26.96 | 3.150 | floor-bound |
+| v1 | 0.34 | **0.033** | <0.10 on decode only |
+| v2 | 0.28 | **0.032** | <0.10 on decode only |
+| v2Pro | 0.55 | **0.062** | <0.10 on decode only |
+| v2ProPlus | 0.78 | **0.089** | <0.10 on decode only |
+| v5turbo | 2.88 | 0.336 | >0.10 in this run |
+| v3 | ~18 | ~2.1 | >0.10 in this run |
+| v4 | 15.07 | 1.761 | >0.10 in this run |
+| v5dev | 26.96 | 3.150 | >0.10 in this run |
 
-v5turbo floor documentation: 2.88 s stage = ~1.5 s CFM (4 Euler steps,
-perf-mem micro) + 0.42 s compiled fp16 vocoder (my cell, corr 1.0) +
-chunk/eval overhead. Levers attempted: mx.compile est-step closure
-rejected at 1.08x (task-5); full-fp16 est stream fails the 2e-2 gate
-(task-1); vocoder now at its memory-bandwidth floor (641->508 ms fp32->
-fp16, kernels already near IO time per the conv bench). No further lever
-without user-approved scope change (fewer steps / distillation). The
-honest RTF floor for v5turbo on this machine is ~0.30-0.34; v3/v4/v5dev
-are 32-step-CFM floor-bound at RTF ~1.8-3.2 by the same argument.
+The 2.88 s v5turbo stage is an observed decode time, not a physical floor.
+The ~1.5 s CFM and ~0.42 s vocoder figures came from separate component
+experiments and cannot be added to attribute the residual without matched
+inputs and measurement boundaries. Small or negative gains in tested
+optimizations do not prove further optimization is impossible. The claimed
+bandwidth floor and requirement to change steps or distill the model are
+withdrawn pending corrected profiling. Original step counts, sampling
+semantics and quality gates remain unchanged.
 
 Default-on note: GSOVITS_HIFIGAN_FAST now defaults ON everywhere
 (opt-out GSOVITS_HIFIGAN_FAST=0); gates re-verified per version before
 the flip (corr 0.99999-1.0, 0 NaN, exact durations).
 
-### task-10: v5turbo DiT step — Stage A/B/C ledger
+### task-10: Stage A/B/C ledger, conclusions under revalidation
 
-Target was est-step 236ms -> <60ms. Terminal finding: the target is NOT
-reachable on this MLX without upstream-class fused GEMM kernels; honest
-floors documented below.
+Target was est-step 236ms -> <60ms. It was not demonstrated by the tested
+prototypes. The claim that it is unreachable without upstream-class fused
+GEMM kernels is withdrawn: the reference benchmark counted unevaluated
+lazy work. Task-11 reopens measurement before further optimization.
 
-Stage A (pure-Python, MERGED as 1ce3ff1, all env-gated):
-- GSOVITS_DIT_PREFOLD=1: batched adaLN (one einsum for all blocks' 6-way
-  modulation), fused QKV (3 GEMMs -> 1/block), rope-mask trick (no
-  concatenate copies), full-length mask elision. Interleaved-sandwich
-  measurement (one process, alternating arms, min-of-12): 1.08x vs eager.
-  Free to inherit: v5dev/v3/v4 (~8%/step x their step counts).
+Stage A (MERGED as 1ce3ff1):
+- GSOVITS_DIT_PREFOLD=1: batched adaLN, fused QKV, rope-mask trick and
+  full-length mask elision. Historical same-process, alternating,
+  min-of-12 comparison reported 1.08x vs eager; this needs revalidation
+  using paired timing distributions. In-graph performance and parity
+  inheritance to cfg>0 versions were not established by the cfg=0 probe.
 - GSOVITS_DIT_STEP_COMPILE=1: whole-step compiled closure (cfg=0 path).
-- fp16 residual stream is SAFE at turbo's 4 steps: trajectory drift 3.3e-3
-  (10x under the 2.5e-2 gate; task-1's rejection was 32-step-specific).
-- Decisive diagnostic: single compiled BLOCK = 14.5ms; x22 = the whole
-  step. ~770 sequential ops at q=1-effective (dependency chains cannot
-  pipeline — see doctrine rule 3).
+- The captured four-step turbo trajectory showed fp16-stream drift 3.3e-3.
+  This is evidence for that case, not a general proof for other inputs
+  or 32-step versions.
+- Single-block and full-step elapsed times were recorded, but no per-op
+  decomposition or physical bound follows from multiplying isolated
+  microbenchmarks. Effective-q=1 and fixed cost-per-op claims are withdrawn.
 
-Stage B (custom metal kernels, TIMEBOX VERDICT: STOP):
-- Attempt 1 (naive per-thread GEMM+epilogue): 0.13x vs MLX matmul —
-  hand-rolled GEMM loses 8x; real fusion means reimplementing accelerated
-  GEMM = upstream PR material (mx.fast.metal_kernel + simdgroup MMA).
-- Attempt 2 (elementwise boundary fusion — cast/gate/residual-add in one
-  kernel): 2.41x on its micro (0.56 -> 0.23ms), but the addressable share
-  is ~12ms of a ~320ms step (~2%). Not worth the complexity; prototype in
-  .tmp/task10_stageb2.py.
-- SDPA accounting: SDPA ~ free (stub-by-subtraction delta -0.44ms, i.e.
-  overlapped/zero); GEMMs ARE the block (10.28 of 10.23ms).
+Stage B (two tested prototypes were not adopted):
+- Naive GEMM+epilogue: 0.13x vs MLX matmul. This implementation lost about
+  8x and did not meet its correctness pre-gate. It does not establish a
+  limit on other fused implementations.
+- Elementwise cast/gate/residual fusion: 2.41x on its micro (0.56 ->
+  0.23ms), max difference 4.8e-7. Its full-step significance is unresolved;
+  the ~2% estimate is withdrawn. Prototype: .tmp/task10_stageb2.py.
+- SDPA stub subtraction produced a -0.44ms delta. The stub changes the
+  graph and the delta is within measurement variation; this cannot prove
+  SDPA is free or that GEMMs account for the whole block.
 
-Stage C (MERGED): microbench gemm mode with stated queue depth +
-measurement doctrine (synced per-op is never throughput; pipelined must
-state q; dependency chains run at effective q=1). gemm_bench.py's 45-49
-TF/s labels contradict its own time column ~20x — audited, superseded by
-`tools/microbench.py gemm`.
+Stage C (being corrected in task-11): synchronized single-op timing is
+valid end-to-end latency including dispatch and synchronization, not pure
+GPU kernel timing. Independent-batch throughput must execute every counted
+operation; repeated identical operands may allow elimination. Dependent
+chains must be measured separately. No inverse-q law, fixed dispatch
+penalty or effective-q theorem has been demonstrated.
 
-v5turbo RTF row (machine-state band across the session, warm):
-  decode 2.6-3.3 s -> RTF 0.32-0.41 (floor on this MLX; was 0.336 pre-task-10
-  at best-of-machine-state). The 60ms/0.12 target requires fused-qkv+LN
-  metal kernels competitive with MLX's own matmul — upstream-class work,
-  out of scope per the stage-B timebox. En route fixes: microbench import,
-  _dec_fast-style closure pattern, doctrine docs.
+Historical v5turbo decode-only row: 2.6-3.3 s -> decode RTF 0.32-0.41.
+These are observed samples, not a hardware or MLX lower bound, and exclude
+AR/frontend work. Complete synthesis RTF <=0.10 remains unmet. Task-11
+will report decode, resident-model synthesis and cold-start time separately,
+with actual shapes, packages and workload provenance.
 
 ## GEMM microbenchmark
 
-`tools/gemm_bench.py` (square fp16 matmul, MLX Metal GPU, includes launch
-overhead; treat as an upper bound):
+**Withdrawn throughput results**: `tools/gemm_bench.py` counted REPS
+matmuls but only evaluated the final lazy result. The elapsed times below
+are historical provenance only; the inflated throughput labels have been
+removed and must not be used as a hardware peak or comparison baseline.
+Task-11 verifies actual work counts before reporting replacement results.
 
-| size | reps | time | throughput |
+| size | legacy reps | elapsed (historical) | throughput status |
 |---|---|---|---|
-| 1024^3 | 50 | 0.002–0.004 s | 26.1–54.7 TFLOP/s |
-| 4096^3 | 20 | 0.056–0.060 s | 45.9–49.5 TFLOP/s |
+| 1024^3 | 50 | 0.002–0.004 s | invalid: only final matmul evaluated |
+| 4096^3 | 20 | 0.056–0.060 s | invalid: only final matmul evaluated |
 
-M4 GPU fp16 is bandwidth/FMA bound around ~50 TFLOP/s peak for these shapes;
-real pipelines (attention, dynamic shapes, per-stage launches) land well
-below this, which is why the AR decoder (per-token sequential) runs at
-~26–37 tok/s in the stage-1 codebase (the seeded table above supersedes
-those stage splits).
+The ~50 TFLOP/s peak and AR bottleneck explanation previously inferred
+from this table are unsupported. No replacement peak is asserted here.
 
 ## Memory footprint (task-3, post P0-B)
 
@@ -300,8 +317,9 @@ DiT model freed before the vocoder.
 
 v5dev before/after on identical seed/text/ref (main@2e8bddb -> task-3):
 footprint 9.64 -> 3.68 GB, RSS 6.03 -> 1.96 GB, wall 187 -> 28.8 s. The
-wall gain is the same fix: with wired memory released at stage boundaries
-Metal stops throttling (AR 11.8 -> 89 tok/s).
+runs also observed AR 11.8 -> 89 tok/s. They do not establish GPU clock
+throttling as the cause; memory, I/O and execution-state effects need
+separate measurements.
 
 v3 outlier: the transient 12.6 GB spike is the BigVGAN vocoder graph (256x
 upsample, fp32 by design for audio fidelity). Not a leak - RSS stays 3.4 GB;
