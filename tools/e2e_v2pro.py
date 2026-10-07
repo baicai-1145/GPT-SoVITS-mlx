@@ -178,6 +178,31 @@ def load_audio_official(path: str, target_sr: int) -> np.ndarray:
 # Pipeline (pure MLX below this line)
 # ---------------------------------------------------------------------------
 
+def _mem_probe(tag: str) -> None:
+    """One-line physical memory telemetry (GSOVITS_MEM_PROBE=1 only)."""
+    if os.environ.get("GSOVITS_MEM_PROBE") != "1":
+        return
+    import mlx.core as mx
+    import subprocess
+    import re as _re
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    try:
+        cache = mx.get_cache_memory() / 2**20
+        active = mx.get_active_memory() / 2**20
+    except Exception:
+        cache = active = -1
+    try:
+        out = subprocess.run(["/usr/bin/footprint", str(os.getpid())],
+                             capture_output=True, text=True, timeout=5).stdout
+        m = _re.search(r"Footprint:\s+([\d.]+)\s+(B|KB|MB|GB)\b", out)
+        unit = {"B": 1, "KB": 2**10, "MB": 2**20, "GB": 2**30}
+        fp = int(float(m.group(1)) * unit[m.group(2)]) if m else -1
+    except Exception:
+        fp = -1
+    print(f"[mem] {tag}: rss={rss/2**20:.0f}MB cache={cache:.0f}MB "
+          f"active={active:.0f}MB footprint={fp/2**20:.0f}MB", file=sys.stderr)
+
+
 def main() -> None:
     args = parse_args()
     # Process-wide device gate (default-deny): pins MLX to CPU unless
@@ -290,6 +315,7 @@ def main() -> None:
     gc.collect()
     trim_metal()
     times["frontend"] = time.perf_counter() - t0
+    _mem_probe("after-frontend")
     times["frontend_cache_hit"] = cache_hit
     if args.bench:
         print(f"[bench] frontend: phones={all_phones.shape} bert={all_bert.shape} "
@@ -322,18 +348,55 @@ def main() -> None:
     # prompt_semantic (codes[0, 0] on the torch (B, 1, T) layout).
     prompt_sem = mx.array(codes.reshape(codes.shape[0], -1), mx.int32)  # (1, Tp)
     times["prompt_codes"] = time.perf_counter() - t0
+    _mem_probe("after-prompt_codes")
     if args.bench:
         print(f"[bench] model_load: sovits {times['model_load']:.2f}s", file=sys.stderr)
         print(f"[bench] prompt_codes: {prompt_sem.shape} "
               f"{times['prompt_codes']:.2f}s", file=sys.stderr)
 
     # v2Pro: ERes2NetV2 speaker vector — official uses the RAW 16 kHz ref audio
-    # (no zero_wav padding) for compute_embedding3
-    sv_model, _sv_h = load_sv_encoder(os.path.join(args.models_root, "sv"))
-    feat = fbank(load_audio_official(args.ref_audio, 16000))
-    sv_emb = sv_model.forward3(mx.array(feat[None]))  # (1, 20480)
-    mx.eval(sv_emb)
+    # (no zero_wav padding) for compute_embedding3. sv_emb depends only on the
+    # ref audio, so it rides the ref-prompt cache (same key: payload extended
+    # with "sv_emb"; entries without it are a miss). The encoder (~0.5 GB
+    # weights + ~0.7 GB forward transients) is freed IMMEDIATELY after the
+    # extraction — it used to stay resident through the whole decode
+    # (task-9: v2ProPlus footprint 6.65 -> ~4 GB).
+    _sv_cached = None
+    sv_cache_key = ref_cache.cache_key(
+        args.ref_audio, args.ref_text, prompt_lang, args.cleaner_version) \
+        if args.ref_cache else None
+    if sv_cache_key:
+        got = ref_cache.get_cached(ref_cache.cache_dir(args.ref_cache), sv_cache_key)
+        if got:
+            _sv_cached = got[1].get("sv_emb")
+    t0 = time.perf_counter()
+    if _sv_cached is not None:
+        sv_emb = mx.array(_sv_cached)
+        times["sv_emb_cache_hit"] = True
+    else:
+        sv_model, _sv_h = load_sv_encoder(os.path.join(args.models_root, "sv"))
+        feat = fbank(load_audio_official(args.ref_audio, 16000))
+        sv_emb = sv_model.forward3(mx.array(feat[None]))  # (1, 20480)
+        mx.eval(sv_emb)
+        del sv_model, feat  # free before decode; encoder reloads lazily if ever needed
+        gc.collect()
+        trim_metal()
+        if sv_cache_key:
+            try:
+                got = ref_cache.get_cached(ref_cache.cache_dir(args.ref_cache), sv_cache_key)
+                meta, arrays = got if got else ({}, {})
+                meta.setdefault("ref_text", args.ref_text)
+                meta.setdefault("lang", args.lang)
+                meta.setdefault("prompt_lang", prompt_lang)
+                meta.setdefault("version", args.cleaner_version)
+                arrays = dict(arrays)
+                arrays["sv_emb"] = np.array(sv_emb, np.float32)
+                ref_cache.put_cached(ref_cache.cache_dir(args.ref_cache), sv_cache_key,
+                                     meta, arrays)
+            except OSError:
+                pass
     times["sv_emb"] = time.perf_counter() - t0
+    _mem_probe("after-sv")
     if args.bench:
         print(f"[bench] sv_emb: {sv_emb.shape} {times['sv_emb']:.2f}s", file=sys.stderr)
 
@@ -363,6 +426,7 @@ def main() -> None:
     gc.collect()
     trim_metal()
     times["ar"] = time.perf_counter() - t0
+    _mem_probe("after-ar")
     n_gen = seq.shape[1]
     if args.bench:
         print(f"[bench] ar: {n_gen} tokens {times['ar']:.2f}s "
@@ -376,6 +440,7 @@ def main() -> None:
                                key=mx.random.key(args.seed))
     mx.eval(audio)
     times["sovits"] = time.perf_counter() - t0
+    _mem_probe("after-decode")
 
     n_out = int(y_mask.shape[2] * 960)  # 2*480 samples per semantic frame
     # Realize the audio BEFORE dropping the intermediates, then convert to

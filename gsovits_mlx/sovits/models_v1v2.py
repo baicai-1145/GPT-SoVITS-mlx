@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -123,6 +124,12 @@ class Generator(nn.Module):
         x = self.conv_pre(x)
         if g is not None:
             x = x + self.cond(g)
+        # GSOVITS_HIFIGAN_STAGE_TRIM=1: eval + clear_cache per upsample stage.
+        # Same disease/cure as the BigVGAN fix (6124273): freed transients
+        # otherwise pile into MLX's buffer cache (measured ~5 GB on the
+        # v2ProPlus 8.8 s stream). Placement-only; off by default pending
+        # conv-fp16's task-8 A/B (timing + parity).
+        trim = os.environ.get("GSOVITS_HIFIGAN_STAGE_TRIM") == "1"
         for i in range(self.num_upsamples):
             x = nn.leaky_relu(x, self.LRELU_SLOPE)
             x = self.ups[i](x)
@@ -130,6 +137,12 @@ class Generator(nn.Module):
             for j in range(self.num_kernels):
                 xs = xs + self.resblocks[i * self.num_kernels + j](x)
             x = xs / self.num_kernels
+            if trim:
+                mx.eval(x)
+                try:
+                    mx.clear_cache()
+                except AttributeError:
+                    mx.metal.clear_cache()
         x = nn.leaky_relu(x)
         x = self.conv_post(x)
         return mx.tanh(x)
