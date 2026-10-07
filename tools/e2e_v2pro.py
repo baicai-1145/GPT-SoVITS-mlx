@@ -268,8 +268,11 @@ def main() -> None:
             got = ref_cache.get_cached(ref_cache.cache_dir(args.ref_cache), cache_key)
             if got:
                 _, arrays = got
-                return arrays["p_ids"], arrays["p_bert"], \
-                    arrays["t_ids"], arrays["t_bert"], True
+                # np int arrays -> python ints: mx.array(list, mx.int32)
+                # rejects numpy scalar members (pre-existing crash on the
+                # cache-hit path, task-8)
+                return [int(v) for v in arrays["p_ids"]], arrays["p_bert"], \
+                    [int(v) for v in arrays["t_ids"]], arrays["t_bert"], True
         p = fe.segment_prompt(args.ref_text, prompt_lang, args.cleaner_version)
         t = fe.preprocess(args.text, args.lang, args.text_split_method, args.cleaner_version)
         p_ids, p_bert = p.phones, p.bert
@@ -362,8 +365,10 @@ def main() -> None:
     # extraction — it used to stay resident through the whole decode
     # (task-9: v2ProPlus footprint 6.65 -> ~4 GB).
     _sv_cached = None
+    # include the pro/proplus variant: sv embeddings are model-specific
     sv_cache_key = ref_cache.cache_key(
-        args.ref_audio, args.ref_text, prompt_lang, args.cleaner_version) \
+        args.ref_audio, args.ref_text, prompt_lang,
+        f"{args.cleaner_version}-{args.model}") \
         if args.ref_cache else None
     if sv_cache_key:
         got = ref_cache.get_cached(ref_cache.cache_dir(args.ref_cache), sv_cache_key)
