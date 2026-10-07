@@ -150,6 +150,45 @@ process per version):
   replaced by the anonymous fresh-lock contract (location-correct: walks
   from module __file__, not CWD, which bootstrap() chdirs away).
 
+## P2-4 task-8: HiFi-GAN cell — RTF war results (conv-fp16)
+
+Assigned cell (lead split): v1/v2/v2Pro/v2ProPlus decoders + v4/v5 48kHz
+Generator vocoder. Mechanism shipped: `GSOVITS_HIFIGAN_FAST=1` — cast the
+decoder/vocoder input to the weight dtype (flow emits fp32; with fp16
+weights every conv otherwise re-promotes) + `mx.compile`d closure, output
+cast back to fp32 for consumers. Env-gated, default OFF.
+
+| version | decode before | decode FAST | e2e wav gate | decode RTF |
+|---|---|---|---|---|
+| v1 | ~0.7 s | 0.34 s | PASS corr 0.99999 | 0.033 |
+| v2 | 0.70 s | 0.28 s | PASS corr 0.99999 | 0.032 |
+| v2Pro | — | 0.55 s | PASS corr 1.00000 | 0.062 |
+| v2ProPlus | — | 0.78 s | PASS corr 1.00000 | 0.089 |
+| v5turbo (voc part) | 0.53 s | ~0.42 s | PASS corr 1.00000 | (CFM-side pending perf-mem) |
+| v4 (voc part) | — | wired | PASS corr 1.00000 | floor-bound (32-step CFM) |
+
+Four versions (v1/v2/v2Pro/v2ProPlus) reach RTF <= 0.10 on decode.
+v4/v5dev stay floor-bound by the 32-step CFM (DiT cell, perf-mem); v5turbo
+needs the CFM side for 0.10 (4-step floor ~1.5 s measured by perf-mem).
+
+Rejected arms (measured): stage-trim +11% on v2 decode (758.9 vs 681.1 ms)
+— keep OFF for speed, ON for footprint; compile on the fp32-input path
+0.999x (promotion swallows it — the input cast is the actual lever);
+native-padding bit-identical but time-neutral. mx.compile cold cost is
+~2 s per process on the Generator — one-shot e2e runs amortize it inside
+the stage, long-lived sessions amortize to zero.
+
+Bug fixes landed en route (e2e_v2pro): ref-cache key now includes the
+pro/proplus variant (sv embeddings are model-specific; v2proplus previously
+reused v2pro's entry), and the cache-hit path casts np ints to python ints
+before mx.array(..., mx.int32) (pre-existing crash).
+
+Timing-methodology note (task-8 retroactive correction): the task-1
+canonical-batch swings labeled "cross-agent CPU contention" match the NAS
+cold-read signature (49.8 s vs 0.18 s warm, no competing process) — treat
+those cells as NAS-bandwidth-bound, not code performance. All FAST-cell
+numbers above are warm-cache compute-only.
+
 ## GEMM microbenchmark
 
 `tools/gemm_bench.py` (square fp16 matmul, MLX Metal GPU, includes launch
