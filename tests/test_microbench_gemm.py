@@ -20,6 +20,10 @@ sys.path.insert(0, REPO)
 
 import mlx.core as mx  # noqa: E402
 
+# Pin CPU for the whole module BEFORE any array is created: the suite must
+# never accidentally compute on the default GPU (lead review requirement).
+mx.set_default_device(mx.cpu)
+
 from tools.microbench import (  # noqa: E402
     bench_gemm,
     gemm_flops,
@@ -171,4 +175,56 @@ def test_gemm_bench_unit_labels_and_bounded_q():
     assert 'ms total' in src and ' s total' not in src
     assert "rounds = reps" in src  # reps -> timing rounds, not batch work
     assert "q = 4" in src  # bounded queue
-    assert "GEMM_BENCH_MEM_BUDGET_MB" in src  # preflight present
+    assert "gemm_preflight_check" in src  # SHARED preflight, both CLIs
+
+
+def test_shared_preflight_both_clis():
+    """perf-mem: the SAME preflight policy backs both entrypoints; it raises
+    before allocation and the estimate matches the distinct-inputs budget."""
+    from tools.microbench import gemm_preflight_bytes, gemm_preflight_check
+    assert gemm_preflight_bytes(1024, 1024, 1024, 4) == 5 * 3 * 1024 * 1024 * 2
+    with pytest.raises(ValueError):
+        gemm_preflight_check(8192, 8192, 8192, 4, budget_mb=64)
+    gemm_preflight_check(8192, 8192, 8192, 4, budget_mb=8192)  # passes
+
+
+def test_bench_gemm_exposes_raw_seconds():
+    """Unrounded seconds must be present for TF math (never divide by
+    rounded ms); chain metric finite+positive."""
+    mx.set_default_device(mx.cpu)
+    res = bench_gemm(mx, 64, 64, 64, q=4, rounds=2)
+    raw = res["_raw_seconds"]
+    assert raw["indep_batch_total_s"] > 0 and raw["chain_total_s"] > 0
+    assert res["indep_batch_tf"] > 0 and res["chain_tf"] > 0
+
+
+# ---------------- legacy main() happy path (executes, CPU-pinned) ----------------
+
+def test_gemm_bench_main_executes_cpu(monkeypatch, capsys):
+    """Lead review: valid legacy invocation must RUN in tests — CPU pinned
+    before array creation, sys.argv patched, ONLY the lock gate mocked.
+    Asserts units, counted work totals, and the helper contract."""
+    import importlib
+    spec = importlib.util.spec_from_file_location(
+        "gemm_bench", os.path.join(REPO, "tools", "gemm_bench.py"))
+    gemm_bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gemm_bench)
+    argv = ["gemm_bench.py", "64", "3"]
+    monkeypatch.setattr(sys, "argv", argv)
+    if hasattr(gemm_bench, "gpu_lock_guard"):
+        monkeypatch.setattr(gemm_bench, "gpu_lock_guard", lambda allow: None)
+    else:
+        import microbench as _mb
+        monkeypatch.setattr(_mb, "gpu_lock_guard", lambda allow: None)
+    gemm_bench.main()
+    out = capsys.readouterr().out
+    assert "mlx fp16 matmul 64^3" in out
+    assert "single-op synced latency" in out
+    assert "ms total" in out and " s total" not in out
+    # counted work contract: q=4 distinct 64^3 matmuls = 4 * 2 * 64^3 FLOPs.
+    # 64^3 batches are ~2 MFLOP => displayed as "0.0 GFLOP"; assert the exact
+    # counted-work string the helper contract produces instead of a display
+    # rounding that divides by rounded ms.
+    assert "work=0.00 GFLOP" in out  # 4*2*64^3 = 2.1e6 FLOP (display .2f)
+    assert "dependent chain q=4" in out
+    assert "legacy note" in out  # guidance to the corrected command

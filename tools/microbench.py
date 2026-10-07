@@ -484,6 +484,7 @@ def _mk_distinct(mx, n, rows, cols, seed):
 def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
     import time as _time
 
+    gemm_preflight_check(M, K, N, q)
     dtype = mx.float16
     out = {"mode": "gemm", "shape": f"{M}x{K}x{N}", "dtype": "float16", "queue": q,
            "rounds": rounds, "input_policy": "distinct-materialized",
@@ -520,6 +521,7 @@ def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
         mx.eval(*outs)
         best = min(best, _time.perf_counter() - s)
     out["indep_batch_total_ms"] = round(best * 1e3, 3)
+    _indep_raw = best
     out["indep_batch_flops"] = gemm_flops([(M, K, N)] * q)
     out["indep_batch_tf"] = round(out["indep_batch_flops"] / best / 1e12, 2)
 
@@ -547,11 +549,35 @@ def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
         mx.eval(acc)
         best = min(best, _time.perf_counter() - s)
     out["chain_total_ms"] = round(best * 1e3, 3)
+    _chain_raw = best
     out["chain_links"] = q
     out["chain_flops"] = gemm_flops(chain_shapes)
     out["chain_tf"] = round(out["chain_flops"] / best / 1e12, 2)
     out["chain_shapes"] = [f"{m}x{k}x{n}" for (m, k, n) in chain_shapes]
+    # unrounded seconds for downstream TF math (never divide by rounded ms)
+    out["_raw_seconds"] = {"indep_batch_total_s": _indep_raw,
+                           "chain_total_s": _chain_raw}
     return out
+
+
+def gemm_preflight_bytes(M: int, K: int, N: int, q: int) -> int:
+    """Estimated distinct-inputs+outputs bytes for a gemm bench batch
+    (shared by both CLIs; must run BEFORE allocating)."""
+    return (q + 1) * (M * K + K * N + M * N) * 2
+
+
+def gemm_preflight_check(M: int, K: int, N: int, q: int,
+                         budget_mb: int | None = None) -> None:
+    """Fail fast with guidance when the estimated batch exceeds the budget."""
+    if budget_mb is None:
+        budget_mb = int(os.environ.get("GEMM_BENCH_MEM_BUDGET_MB", "4096"))
+    est = gemm_preflight_bytes(M, K, N, q)
+    budget = budget_mb * 1024 * 1024
+    if est > budget:
+        raise ValueError(
+            f"gemm bench: estimated {est / 1e6:.0f} MB exceeds "
+            f"GEMM_BENCH_MEM_BUDGET_MB={budget_mb}; reduce q or N "
+            f"(use tools/microbench.py gemm --shape {M}x{K}x{N} --queue <smaller-q>)")
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,

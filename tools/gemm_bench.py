@@ -37,13 +37,12 @@ def main() -> None:
     q = 4  # bounded queue depth; use tools/microbench.py gemm --queue for more
     shape = gemm_parse_shape(f"{N}x{N}x{N}")
 
-    # memory preflight: distinct materialized inputs+outputs at q entries
-    est_bytes = (q + 1) * 3 * N * N * 2
-    budget = int(os.environ.get("GEMM_BENCH_MEM_BUDGET_MB", "4096")) * 1024 * 1024
-    if est_bytes > budget:
-        sys.exit(f"gemm_bench: estimated {est_bytes / 1e6:.0f} MB exceeds "
-                 f"GEMM_BENCH_MEM_BUDGET_MB={budget // 1024 // 1024}; "
-                 f"use tools/microbench.py gemm --shape {N}x{N}x{N} --queue {q}")
+    # shared memory preflight (same policy as microbench gemm mode)
+    from microbench import gemm_preflight_check
+    try:
+        gemm_preflight_check(N, N, N, q)
+    except ValueError as e:
+        sys.exit(f"gemm_bench: {e}")
 
     try:
         import mlx.core as mx
@@ -53,19 +52,24 @@ def main() -> None:
     from microbench import gpu_lock_guard
     gpu_lock_guard(False)
 
+    # Keep RAW unrounded seconds: TF divides by the unrounded measurement,
+    # never by a display-rounded ms (perf-mem finding).
     res = bench_gemm(mx, *shape, q=q, rounds=rounds)
-    f = res["single_op_synced_ms"] * 1e-3
-    tot = res["indep_batch_total_ms"] * 1e-3
+    raw = res.pop("_raw_seconds", {}) or {}
+    tot_s = raw.get("indep_batch_total_s")
+    chain_s = raw.get("chain_total_s")
     fl = res["indep_batch_flops"]
     print(f"mlx fp16 matmul {N}^3:")
     print(f"  single-op synced latency : {res['single_op_synced_ms']:.3f} ms "
           f"(end-to-end incl. dispatch+sync)")
-    print(f"  independent batch q={q}   : {res["indep_batch_total_ms"]:.3f} ms total, "
-          f"{fl / tot / 1e12:.1f} TFLOP/s achieved (work={fl / 1e9:.1f} GFLOP, "
+    indep_tf = fl / tot_s / 1e12 if tot_s else 0.0
+    print(f"  independent batch q={q}   : {res['indep_batch_total_ms']:.3f} ms total, "
+          f"{indep_tf:.3f} TFLOP/s achieved (work={fl / 1e9:.2f} GFLOP, "
           f"outputs retained+evaluated)")
+    chain_tf = res["chain_flops"] / chain_s / 1e12 if chain_s else 0.0
+    assert res["chain_total_ms"] > 0 and chain_tf > 0, "chain metric not finite+positive"
     print(f"  dependent chain q={q}     : {res['chain_total_ms']:.3f} ms total, "
-          f"{res['chain_flops'] / (res['chain_total_ms'] * 1e-3) / 1e12:.1f} TFLOP/s "
-          f"(per-link FLOPs counted)")
+          f"{chain_tf:.3f} TFLOP/s (per-link FLOPs counted)")
     print("legacy note: the old REP-multiplied GFLOP/s figure was invalid "
           "(one reachable matmul); see tools/microbench.py gemm for full modes")
 
