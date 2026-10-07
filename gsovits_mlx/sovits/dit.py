@@ -242,7 +242,8 @@ class DiTBlock(nn.Module):
         self.ff = FeedForward(dim=dim, mult=ff_mult, approximate="tanh")
         self._cdtype = None  # block compute dtype, resolved from weights on first call
 
-    def __call__(self, x: mx.array, t: mx.array, mask: mx.array | None, rope: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, t: mx.array | None, mask: mx.array | None, rope: mx.array,
+                 precomputed_mods: mx.array | None = None) -> mx.array:
         if self._cdtype is None:
             self._cdtype = self.attn.to_q_w.dtype
         cd = self._cdtype
@@ -250,7 +251,16 @@ class DiTBlock(nn.Module):
         # while the residual stream + conditioning stay fp32. Per-block input
         # quantization only — no compounding through the stream/steps. No-op
         # casts when cd is fp32.
-        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
+        if precomputed_mods is not None:
+            # task-10 adaLN pre-fold: (shift, scale, gate, shift, scale, gate)
+            # computed batched in DiT.__call__; here only the split.
+            D = x.shape[-1]
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
+                precomputed_mods[:, i * D:(i + 1) * D] for i in range(6)]
+            norm = _ln_noaffine(x)
+            norm = norm * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        else:
+            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
         attn_output = self.attn(norm.astype(cd), mask, rope)
         x = x + (gate_msa[:, None] * attn_output).astype(x.dtype)
         norm = _ln_noaffine(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
@@ -437,8 +447,19 @@ class DiT(nn.Module):
         # Mask follows the SDPA compute dtype inside Attention; the fp32
         # multiplies below just broadcast a 0/1 mask.
         residual = x
-        for block in self.transformer_blocks:
-            x = block(x, t, mask, rope)
+        # GSOVITS_DIT_PREFOLD=1 (task-10): all blocks share the same t, so the
+        # 22 modulation GEMMs batch into ONE einsum upfront (removes ~66
+        # kernel launches/step); blocks consume precomputed 6-way params.
+        if _os.environ.get("GSOVITS_DIT_PREFOLD", "0") == "1":
+            # shapes: W (L, 6D, D); t (B, D) -> mods (B, L, 6D)
+            W = mx.stack([b.attn_norm.linear_w for b in self.transformer_blocks])
+            Bm = mx.stack([b.attn_norm.linear_b for b in self.transformer_blocks])
+            mods = mx.swapaxes(mx.einsum("lod,bd->lbo", W, t), 0, 1) + Bm[None]  # (B, L, 6D)
+            for i, block in enumerate(self.transformer_blocks):
+                x = block(x, None, mask, rope, precomputed_mods=mods[:, i])
+        else:
+            for block in self.transformer_blocks:
+                x = block(x, t, mask, rope)
         if self.long_skip_connection:
             x = mx.concatenate([x, residual], axis=-1) @ self.long_skip_w.T
 
