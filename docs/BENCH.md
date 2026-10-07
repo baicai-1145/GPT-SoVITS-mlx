@@ -299,6 +299,45 @@ Task-11 verifies actual work counts before reporting replacement results.
 The ~50 TFLOP/s peak and AR bottleneck explanation previously inferred
 from this table are unsupported. No replacement peak is asserted here.
 
+### Corrected calibration (task-11)
+
+One GPU process used the reviewed helper at `f0cbf96`, in worktree
+`48756a0`. All inputs were distinct and pre-materialized; all counted
+outputs were retained and evaluated. Each entry is best-of-8, with queues
+visited in order 1, 2, 4, 8. These are achieved timings, not hardware peaks,
+confidence intervals, complete DiT costs or synthesis acceptance results.
+The M=800 rows are calibration shapes, not measured inference lengths.
+
+| shape (M x K x N) | synced single ms (range) | batch q=1 total ms | batch q=8 total ms | achieved TF/s q=1 -> q=8 |
+|---|---|---|---|---|
+| 800 x 1152 x 4608 | 3.444-3.534 | 3.627 | 26.220 | 2.342 -> 2.591 |
+| 800 x 1024 x 2048 | 1.466-1.550 | 1.490 | 10.440 | 2.252 -> 2.571 |
+| 800 x 2048 x 1024 | 1.488-1.540 | 1.490 | 10.497 | 2.251 -> 2.557 |
+| 800 x 1024 x 3072 | 2.095-2.183 | 2.127 | 15.606 | 2.367 -> 2.580 |
+| 4096 x 4096 x 4096 | 50.323-50.493 | 50.405 | 414.194 | 2.727 -> 2.655 |
+
+Per-operation batch time drops 8.26-12.40% for the M=800 cases from q=1
+to q=8; the square case increases 2.72%. This ordered best-of-8 sweep does
+not identify the cause of those changes. It shows no spurious eightfold
+inverse-q gain, but does not prove dispatch amortization is absent or
+that the workload is memory-bandwidth limited.
+
+Dependent rectangular chains change shape after link 1: subsequent
+links multiply `(M,N)` by `(N,N)`. The user-shape q=8 chain takes 97.490ms
+for 3.625 times the independent-batch FLOPs, not eight copies of the
+original GEMM. Only K=N keeps the same per-link work. No per-link latency
+equality or general dependency-cost theorem follows from these rows.
+
+Local raw data: `.tmp/wt-task11/.tmp/task11_calibration.jsonl` (20 rows).
+Launcher and limitations: `.tmp/task11_calib_provenance.md` and
+`.tmp/task11_calib_stdout.log`; preserved launcher SHA-256:
+`161a60d24e4fcfcc89d008ae277f6be044ba05488f88fb17c8cdb216b5b793eb`.
+The environment child probe failed; the base interpreter and package
+pins were checked separately, not embedded per row. No programmatic
+capture session was started, so no runtime kernel trace was obtained.
+The installed `mx.metal.start_capture` and `stop_capture` bindings are
+callable; successful capture remains untested, not proven unsupported.
+
 ## Memory footprint (task-3, post P0-B)
 
 Peak physical footprint = /usr/bin/footprint on the e2e child (Activity-Monitor
