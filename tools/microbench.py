@@ -443,6 +443,7 @@ def main() -> None:
 
     if args.mode == "gemm":
         gpu_lock_guard(args.allow_unlocked)
+        import mlx.core as mx
         M, K, N = (int(v) for v in args.shape.split("x"))
         a = mx.random.normal((M, K)).astype(mx.float16)
         b = mx.random.normal((K, N)).astype(mx.float16)
