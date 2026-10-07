@@ -219,6 +219,49 @@ Default-on note: GSOVITS_HIFIGAN_FAST now defaults ON everywhere
 (opt-out GSOVITS_HIFIGAN_FAST=0); gates re-verified per version before
 the flip (corr 0.99999-1.0, 0 NaN, exact durations).
 
+### task-10: v5turbo DiT step — Stage A/B/C ledger
+
+Target was est-step 236ms -> <60ms. Terminal finding: the target is NOT
+reachable on this MLX without upstream-class fused GEMM kernels; honest
+floors documented below.
+
+Stage A (pure-Python, MERGED as 1ce3ff1, all env-gated):
+- GSOVITS_DIT_PREFOLD=1: batched adaLN (one einsum for all blocks' 6-way
+  modulation), fused QKV (3 GEMMs -> 1/block), rope-mask trick (no
+  concatenate copies), full-length mask elision. Interleaved-sandwich
+  measurement (one process, alternating arms, min-of-12): 1.08x vs eager.
+  Free to inherit: v5dev/v3/v4 (~8%/step x their step counts).
+- GSOVITS_DIT_STEP_COMPILE=1: whole-step compiled closure (cfg=0 path).
+- fp16 residual stream is SAFE at turbo's 4 steps: trajectory drift 3.3e-3
+  (10x under the 2.5e-2 gate; task-1's rejection was 32-step-specific).
+- Decisive diagnostic: single compiled BLOCK = 14.5ms; x22 = the whole
+  step. ~770 sequential ops at q=1-effective (dependency chains cannot
+  pipeline — see doctrine rule 3).
+
+Stage B (custom metal kernels, TIMEBOX VERDICT: STOP):
+- Attempt 1 (naive per-thread GEMM+epilogue): 0.13x vs MLX matmul —
+  hand-rolled GEMM loses 8x; real fusion means reimplementing accelerated
+  GEMM = upstream PR material (mx.fast.metal_kernel + simdgroup MMA).
+- Attempt 2 (elementwise boundary fusion — cast/gate/residual-add in one
+  kernel): 2.41x on its micro (0.56 -> 0.23ms), but the addressable share
+  is ~12ms of a ~320ms step (~2%). Not worth the complexity; prototype in
+  .tmp/task10_stageb2.py.
+- SDPA accounting: SDPA ~ free (stub-by-subtraction delta -0.44ms, i.e.
+  overlapped/zero); GEMMs ARE the block (10.28 of 10.23ms).
+
+Stage C (MERGED): microbench gemm mode with stated queue depth +
+measurement doctrine (synced per-op is never throughput; pipelined must
+state q; dependency chains run at effective q=1). gemm_bench.py's 45-49
+TF/s labels contradict its own time column ~20x — audited, superseded by
+`tools/microbench.py gemm`.
+
+v5turbo RTF row (machine-state band across the session, warm):
+  decode 2.6-3.3 s -> RTF 0.32-0.41 (floor on this MLX; was 0.336 pre-task-10
+  at best-of-machine-state). The 60ms/0.12 target requires fused-qkv+LN
+  metal kernels competitive with MLX's own matmul — upstream-class work,
+  out of scope per the stage-B timebox. En route fixes: microbench import,
+  _dec_fast-style closure pattern, doctrine docs.
+
 ## GEMM microbenchmark
 
 `tools/gemm_bench.py` (square fp16 matmul, MLX Metal GPU, includes launch
