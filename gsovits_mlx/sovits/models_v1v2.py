@@ -327,7 +327,9 @@ class SynthesizerTrn(nn.Module):
                 self._dec_fast = mx.compile(self.dec)
             zin = zin.astype(self.dec.conv_pre.weight.dtype)
             gin_fast = ge.astype(self.dec.conv_pre.weight.dtype) if ge is not None else None
-            o = self._dec_fast(zin, gin_fast)
+            # cast back: downstream (sf.write, wav gates, e2e consumers) all
+            # expect fp32 audio; ~1 ms at 0.7 M samples
+            o = self._dec_fast(zin, gin_fast).astype(mx.float32)
         else:
             o = self.dec(zin, g=ge)
         return o, y_mask
