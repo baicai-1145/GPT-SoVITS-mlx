@@ -144,3 +144,31 @@ def test_gemm_bench_rejects_reps_as_unaccounted_work():
     src = open(os.path.join(REPO, "tools", "gemm_bench.py")).read()
     assert "* REPS" not in src and "* reps" not in src
     assert "indep_batch_flops" in src  # counted work drives the report
+
+
+# ---------------- review fixes (lead r2 findings) ----------------
+
+def test_chain_q8_production_finite():
+    """Lead repro: unscaled normal chain weights overflow fp16 by link 5.
+    Production helper must scale by 1/sqrt(fan_in) and stay finite at q=8."""
+    mx.set_default_device(mx.cpu)
+    res = bench_gemm(mx, 64, 64, 64, q=8, rounds=2)
+    assert res["chain_links"] == 8
+    assert res["chain_total_ms"] > 0  # and did not raise on finiteness
+
+
+def test_chain_large_n_finite():
+    """Real-model-scale N: overflow would occur even earlier unscaled."""
+    mx.set_default_device(mx.cpu)
+    res = bench_gemm(mx, 8, 64, 512, q=8, rounds=1)
+    assert res["chain_flops"] == 2 * 8 * 64 * 512 + 7 * 2 * 8 * 512 * 512
+
+
+def test_gemm_bench_unit_labels_and_bounded_q():
+    """Lead review: chain/batch lines must say ms (not s); q must be bounded;
+    reps are timing rounds; memory preflight must engage before allocation."""
+    src = open(os.path.join(REPO, "tools", "gemm_bench.py")).read()
+    assert 'ms total' in src and ' s total' not in src
+    assert "rounds = reps" in src  # reps -> timing rounds, not batch work
+    assert "q = 4" in src  # bounded queue
+    assert "GEMM_BENCH_MEM_BUDGET_MB" in src  # preflight present

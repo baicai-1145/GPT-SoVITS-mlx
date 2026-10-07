@@ -27,13 +27,23 @@ def main() -> None:
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 1024
     reps = int(sys.argv[2]) if len(sys.argv) > 2 else 50
 
-    # The old CLI conflated "reps" with "work". Treat reps as the queue
-    # depth q (counted work) and fail fast on values that would silently
-    # regress to the overwrite bug semantics.
+    # Lead review fix: reps used to map onto the batch queue depth q, which
+    # made the legacy default (50) allocate unbounded multi-GB batches at
+    # large N. reps now means TIMING ROUNDS; q is bounded and preflighted.
     if N <= 0:
         sys.exit("gemm_bench: N must be positive")
-    q = gemm_validate_queue(reps)
+    rounds = reps if 1 <= reps <= 512 else sys.exit(
+        "gemm_bench: reps must be a positive number of timing rounds in 1..512")
+    q = 4  # bounded queue depth; use tools/microbench.py gemm --queue for more
     shape = gemm_parse_shape(f"{N}x{N}x{N}")
+
+    # memory preflight: distinct materialized inputs+outputs at q entries
+    est_bytes = (q + 1) * 3 * N * N * 2
+    budget = int(os.environ.get("GEMM_BENCH_MEM_BUDGET_MB", "4096")) * 1024 * 1024
+    if est_bytes > budget:
+        sys.exit(f"gemm_bench: estimated {est_bytes / 1e6:.0f} MB exceeds "
+                 f"GEMM_BENCH_MEM_BUDGET_MB={budget // 1024 // 1024}; "
+                 f"use tools/microbench.py gemm --shape {N}x{N}x{N} --queue {q}")
 
     try:
         import mlx.core as mx
@@ -43,17 +53,17 @@ def main() -> None:
     from microbench import gpu_lock_guard
     gpu_lock_guard(False)
 
-    res = bench_gemm(mx, *shape, q=q, rounds=8)
+    res = bench_gemm(mx, *shape, q=q, rounds=rounds)
     f = res["single_op_synced_ms"] * 1e-3
     tot = res["indep_batch_total_ms"] * 1e-3
     fl = res["indep_batch_flops"]
     print(f"mlx fp16 matmul {N}^3:")
     print(f"  single-op synced latency : {res['single_op_synced_ms']:.3f} ms "
           f"(end-to-end incl. dispatch+sync)")
-    print(f"  independent batch q={q}   : {tot:.3f} s total, "
+    print(f"  independent batch q={q}   : {res["indep_batch_total_ms"]:.3f} ms total, "
           f"{fl / tot / 1e12:.1f} TFLOP/s achieved (work={fl / 1e9:.1f} GFLOP, "
           f"outputs retained+evaluated)")
-    print(f"  dependent chain q={q}     : {res['chain_total_ms']:.3f} s total, "
+    print(f"  dependent chain q={q}     : {res['chain_total_ms']:.3f} ms total, "
           f"{res['chain_flops'] / (res['chain_total_ms'] * 1e-3) / 1e12:.1f} TFLOP/s "
           f"(per-link FLOPs counted)")
     print("legacy note: the old REP-multiplied GFLOP/s figure was invalid "

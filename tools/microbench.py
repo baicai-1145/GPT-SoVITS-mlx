@@ -487,7 +487,8 @@ def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
     dtype = mx.float16
     out = {"mode": "gemm", "shape": f"{M}x{K}x{N}", "dtype": "float16", "queue": q,
            "rounds": rounds, "input_policy": "distinct-materialized",
-           "output_policy": "retain-and-eval-all"}
+           "output_policy": "retain-and-eval-all",
+           "indep_batch_est_bytes": (q + 1) * (M * K + K * N + M * N) * 2}
 
     # q+1 distinct lefts and rights (extra for warmup), all pre-evaluated.
     lefts = _mk_distinct(mx, q + 1, M, K, seed=1)
