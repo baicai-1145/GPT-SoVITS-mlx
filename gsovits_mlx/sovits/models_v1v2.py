@@ -322,7 +322,8 @@ class SynthesizerTrn(nn.Module):
         # fp32 (measured: v2 decode 645ms compiled-fp16-in vs 681ms
         # fp32-in; fp16 w with fp32 in = 0.999x). Compiled warm is a
         # further ~5% over eager fp16; gates: corr 0.9995+ vs seed-0.
-        if os.environ.get("GSOVITS_HIFIGAN_FAST") == "1":
+        # default ON (gates: corr 0.99999-1.0 across the cell); opt out with =0
+        if os.environ.get("GSOVITS_HIFIGAN_FAST", "1") != "0":
             if self._dec_fast is None:
                 self._dec_fast = mx.compile(self.dec)
             zin = zin.astype(self.dec.conv_pre.weight.dtype)
