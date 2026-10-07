@@ -249,6 +249,7 @@ class SynthesizerTrn(nn.Module):
         self.inter_channels = inter_channels
         self.hidden_channels = hidden_channels
         self.version = version
+        self._dec_fast = None  # compiled decoder closure (GSOVITS_HIFIGAN_FAST)
         self.upsample_rates = upsample_rates
         self.segment_size = segment_size
         self.gin_channels = gin_channels
@@ -314,7 +315,21 @@ class SynthesizerTrn(nn.Module):
                                             ge512 if self.is_v2pro else ge, speed)
         z_p = m_p + mx.random.normal(m_p.shape, key=key) * mx.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=ge, reverse=True)
-        o = self.dec((z * y_mask), g=ge)
+        zin = z * y_mask
+        # GSOVITS_HIFIGAN_FAST=1 (task-8): cast the decoder input to the
+        # weight dtype (fp16 exports) and use a compiled decoder closure.
+        # The flow emits fp32; without the cast every conv re-promotes to
+        # fp32 (measured: v2 decode 645ms compiled-fp16-in vs 681ms
+        # fp32-in; fp16 w with fp32 in = 0.999x). Compiled warm is a
+        # further ~5% over eager fp16; gates: corr 0.9995+ vs seed-0.
+        if os.environ.get("GSOVITS_HIFIGAN_FAST") == "1":
+            if self._dec_fast is None:
+                self._dec_fast = mx.compile(self.dec)
+            zin = zin.astype(self.dec.conv_pre.weight.dtype)
+            gin_fast = ge.astype(self.dec.conv_pre.weight.dtype) if ge is not None else None
+            o = self._dec_fast(zin, gin_fast)
+        else:
+            o = self.dec(zin, g=ge)
         return o, y_mask
 
     def extract_latent(self, x: mx.array) -> mx.array:
