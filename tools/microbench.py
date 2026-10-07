@@ -263,7 +263,12 @@ def capture_sovits(component: str, models_root: str, cpufast_repo: str, out_dir:
     sov, _ = loader(os.path.join(models_root, dirname), ver)
     codes = sov.extract_latent(mx.transpose(h, (0, 2, 1)))
     mx.eval(codes)
-    prompt = mx.array(codes.reshape(codes.shape[0], -1), mx.int32)  # authoritative
+    prompt_sem = mx.array(codes.reshape(codes.shape[0], -1), mx.int32)  # authoritative
+    # full decode stream = prompt codes + the GPT golden generation (e2e:
+    # all_codes = concat(prompt_sem, seq))
+    gen = mx.array(gz["golden"], mx.int32)
+    codes_full = mx.concatenate([prompt_sem, gen], axis=1)
+    mx.eval(codes_full)
     del sov, hb, h
     release()
     trim_metal()
@@ -274,14 +279,13 @@ def capture_sovits(component: str, models_root: str, cpufast_repo: str, out_dir:
     # prompt phone boundary for decode_encp (e2e: all_phones[:, :len(p_ids)])
     n_prompt_phones = int(len(_frontend_inputs(models_root, cpufast_repo)["p_ids"]))
     np.savez_compressed(os.path.join(out_dir, f"{component}.npz"),
-                        phones=np.asarray(phones), prompt=np.array(prompt),
+                        phones=np.asarray(phones), prompt=np.array(codes_full),
                         refer=np.array(refer), w32=w32,
                         n_prompt_phones=np.int32(n_prompt_phones))
-    json.dump({"phones": int(np.asarray(phones).shape[1]),
-               "codes": int(np.array(prompt).shape[1]),
+    json.dump({"codes": int(np.array(codes_full).shape[1]),
                "refer": list(refer.shape)},
               open(os.path.join(out_dir, f"{component}.meta.json"), "w"), indent=1)
-    print(f"[capture] {component}: codes={np.array(prompt).shape[1]} "
+    print(f"[capture] {component}: codes={np.array(codes_full).shape[1]} "
           f"refer={tuple(refer.shape)}")
 
 
@@ -309,6 +313,7 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
 
     result = {"component": component, "iters": iters}
     golden = None
+    spans: dict[str, float] = {}
     for i in range(iters):
         t0 = time.perf_counter()
         if ver in ("v1", "v2", "v2Pro", "v2ProPlus"):
@@ -321,24 +326,67 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
                                           refer=refer, ge=ge)
             fea_todo, _ = sov.decode_encp(all_codes, all_phones, refer=refer, ge=ge, speed=1.0)
             mx.eval(fea_ref, fea_todo)
+            spans[f"encp_{i}"] = round(time.perf_counter() - t0, 3)
             del ge, refer_mask
             mel2 = norm_spec(mel_spectrogram(mx.array(ref_audio_32k[None]), 1280, 100,
                                              32000, 320, 1280, 0, None, center=False))
             mx.eval(mel2)
             steps, cfg = resolve_sampling(ver, None, None)
+            t1 = time.perf_counter()
             mel = synthesize_v5_mel(sov, fea_ref, fea_todo, mel2, sample_steps=steps,
                                     cfg_rate=cfg, key=mx.random.key(0))
             pred = denorm_spec(mel)
             mx.eval(pred)
+            spans[f"cfm_{i}"] = round(time.perf_counter() - t1, 3)
             del fea_ref, fea_todo, mel2, mel
             voc = load_vocoder_v4(os.path.join(models_root, "v5_vocoder"))
+            t2 = time.perf_counter()
             audio = voc(pred)
             mx.eval(audio)
+            spans[f"vocoder_{i}"] = round(time.perf_counter() - t2, 3)
             del pred
             out_np = np.array(audio)[0, 0]
             sr = 48000
         else:
-            raise SystemExit("v3/v4 sovits cells: wire after v5dev validates the harness")
+            # v3 cell: decode_encp(3.875x interp) -> CFM 32-step cfg 0.0 ->
+            # BigVGAN 24 kHz (mel_fn: 100-mel 1024/256 @ 24 kHz on 24k ref).
+            from gsovits_mlx.pipeline import cfm_chunked_decode_v3, load_bigvgan
+            n_prompt = int(z["n_prompt_phones"])
+            fea_ref, ge = sov.decode_encp(mx.array(z["prompt"][None]), all_phones[:, :n_prompt],
+                                          refer=refer, ge=ge)
+            fea_todo, _ = sov.decode_encp(all_codes, all_phones, refer=refer, ge=ge, speed=1.0)
+            mx.eval(fea_ref, fea_todo)
+            spans[f"encp_{i}"] = round(time.perf_counter() - t0, 3)
+            del ge, refer_mask
+            # mel2: v3 prompt mel is 100-mel 1024/256 @ 24 kHz (e2e_v3 stage 5)
+            import soundfile as sf
+            ref24, _sr = sf.read("/Volumes/2T/gpt-sovits-models/bench/ref_zh_3.5s.wav",
+                                 dtype="float32", always_2d=True)
+            ref24 = ref24.mean(axis=1)
+            from gsovits_mlx.pipeline import resample_linear
+            ref24 = ref24 if _sr == 24000 else resample_linear(ref24, _sr, 24000)
+            from gsovits_mlx.text.mel_frontend import mel_spectrogram as _mel
+            mel2 = norm_spec(_mel(mx.array(ref24[None]), 1024, 100, 24000, 256, 1024,
+                                  0, None, center=False))
+            mx.eval(mel2)
+            steps, cfg = resolve_sampling("v3", None, None)
+            t1 = time.perf_counter()
+            mel = cfm_chunked_decode_v3(sov, fea_ref, fea_todo, mel2,
+                                        sample_steps=steps, inference_cfg_rate=cfg,
+                                        key=mx.random.key(0),
+                                        T_ref=468, T_chunk=934)
+            pred = denorm_spec(mel)
+            mx.eval(pred)
+            spans[f"cfm_{i}"] = round(time.perf_counter() - t1, 3)
+            del fea_ref, fea_todo, mel2, mel
+            voc = load_bigvgan(os.path.join(models_root, "bigvgan"))
+            t2 = time.perf_counter()
+            audio = voc(pred)
+            mx.eval(audio)
+            spans[f"vocoder_{i}"] = round(time.perf_counter() - t2, 3)
+            del pred
+            out_np = np.array(audio)[0, 0]
+            sr = 24000
         trim_metal()
         dt = time.perf_counter() - t0
         result[f"decode_s_{i}"] = round(dt, 3)
@@ -349,6 +397,7 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
             same = out_np.shape == golden.shape and np.array_equal(out_np, golden)
             result["parity"] = "OK" if same else "FAIL"
     # seeded-but-mx-random-key run is deterministic: i0 vs i1 must match
+    result.update(spans)
     del sov  # free the DiT after all iterations, not inside the loop
     release()
     trim_metal()
