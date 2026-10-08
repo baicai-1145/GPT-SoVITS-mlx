@@ -166,6 +166,176 @@ _S2_MODEL_HPS_KEYS_V3 = (
     "long_skip_connection")
 
 
+def s2v3_model_to_arrays(model, merged_dit: dict | None = None) -> dict:
+    """SynthesizerTrnV3 MODULE -> convert_sovits_v3v5 name/layout dict.
+
+    Inverse of gsovits_mlx.pipeline.load_sovits_v3 + tools/
+    convert_sovits.py::convert_sovits_v3v5: emits the exact safetensors
+    names the inference loader consumes. Module weights keep the converted
+    (safetensors) layout — load_sovits_v3 assigns arrays into module attrs
+    unchanged — so this is a pure renaming pass. ``merged_dit`` optionally
+    overrides DiT weights with MERGED LoRA values keyed by convert-style
+    names (``dit.blocks.<i>.attn.to_q.w`` etc., from
+    lora.merged_training_weights). The frozen quantizer codebook is
+    embedded so the export is self-contained (bitwise the base value).
+    """
+    out: dict = {}
+
+    def conv(weight):
+        # pipeline.load_sovits_v3 assigns converted arrays UNCHANGED into the
+        # module attrs (the MLX layers consume torch (out, in, k) via internal
+        # transposes), so the module weight layout EQUALS the safetensors
+        # layout: pass through untouched.
+        return weight
+
+    # quantizer codebook (frozen; embed for a self-contained export)
+    out["quantizer.codebook"] = model.quantizer.embed
+
+    ep = model.enc_p
+    out["enc_p.ssl_proj.weight"] = conv(ep.ssl_proj.weight)
+    out["enc_p.ssl_proj.bias"] = ep.ssl_proj.bias
+    out["enc_p.text_embedding"] = ep.text_embedding
+    out["enc_p.proj.weight"] = conv(ep.proj.weight)
+    out["enc_p.proj.bias"] = ep.proj.bias
+    for enc, prefix in ((ep.encoder_ssl, "enc_ssl"),
+                        (ep.encoder_text, "enc_text"),
+                        (ep.encoder2, "enc2")):
+        for i, at in enumerate(enc.attn_layers):
+            d = f"enc_p.{prefix}.{i}."
+            for nm in ("conv_q", "conv_k", "conv_v", "conv_o"):
+                out[f"{d}attn.{nm}.weight"] = conv(getattr(at, nm).weight)
+                out[f"{d}attn.{nm}.bias"] = getattr(at, nm).bias
+            if getattr(at, "emb_rel_k", None) is not None:
+                out[f"{d}attn.emb_rel_k"] = at.emb_rel_k
+                out[f"{d}attn.emb_rel_v"] = at.emb_rel_v
+            n1, n2 = enc.norm_layers_1[i], enc.norm_layers_2[i]
+            out[f"{d}norm1"] = n1.gamma
+            out[f"{d}norm1.b"] = n1.beta
+            out[f"{d}norm2"] = n2.gamma
+            out[f"{d}norm2.b"] = n2.beta
+            ffn = enc.ffn_layers[i]
+            out[f"{d}ffn.conv1.weight"] = conv(ffn.conv_1.weight)
+            out[f"{d}ffn.conv1.bias"] = ffn.conv_1.bias
+            out[f"{d}ffn.conv2.weight"] = conv(ffn.conv_2.weight)
+            out[f"{d}ffn.conv2.bias"] = ffn.conv_2.bias
+    mr = ep.mrte
+    for nm in ("c_pre", "text_pre", "c_post"):
+        out[f"enc_p.mrte.{nm}.weight"] = conv(getattr(mr, nm).weight)
+        out[f"enc_p.mrte.{nm}.bias"] = getattr(mr, nm).bias
+    ca = mr.cross_attention
+    for nm in ("conv_q", "conv_k", "conv_v", "conv_o"):
+        out[f"enc_p.mrte.cross_attn.{nm}.weight"] = conv(getattr(ca, nm).weight)
+        out[f"enc_p.mrte.cross_attn.{nm}.bias"] = getattr(ca, nm).bias
+
+    re_ = model.ref_enc
+    out["ref_enc.spectral.0.weight"] = re_.spectral_0.weight
+    out["ref_enc.spectral.0.bias"] = re_.spectral_0.bias
+    out["ref_enc.spectral.3.weight"] = re_.spectral_1.weight
+    out["ref_enc.spectral.3.bias"] = re_.spectral_1.bias
+    for i, t in enumerate((re_.temporal_0, re_.temporal_1)):
+        out[f"ref_enc.temporal.{i}.w1"] = t.w_1
+        out[f"ref_enc.temporal.{i}.b1"] = t.b_1
+    sa = re_.slf_attn
+    out["ref_enc.slf_attn.w_qs"] = sa.w_qs.weight
+    out["ref_enc.slf_attn.w_qs.b"] = sa.w_qs.bias
+    out["ref_enc.slf_attn.w_ks"] = sa.w_ks.weight
+    out["ref_enc.slf_attn.w_ks.b"] = sa.w_ks.bias
+    out["ref_enc.slf_attn.w_vs"] = sa.w_vs.weight
+    out["ref_enc.slf_attn.w_vs.b"] = sa.w_vs.bias
+    out["ref_enc.slf_attn.fc"] = sa.fc.weight
+    out["ref_enc.slf_attn.fc.b"] = sa.fc.bias
+    out["ref_enc.fc"] = re_.fc.weight
+    out["ref_enc.fc.b"] = re_.fc.bias
+
+    if getattr(model, "ssl_proj", None) is not None:
+        out["ssl_proj.weight"] = conv(model.ssl_proj.weight)
+        out["ssl_proj.bias"] = model.ssl_proj.bias
+
+    out["bridge.weight"] = conv(model.bridge_0.weight)
+    out["bridge.bias"] = model.bridge_0.bias
+    wn = model.wns1
+    out["wns1.pre.weight"] = conv(wn.pre.weight)
+    out["wns1.pre.bias"] = wn.pre.bias
+    out["wns1.proj.weight"] = conv(wn.proj.weight)
+    out["wns1.proj.bias"] = wn.proj.bias
+    out["wns1.cond"] = wn.enc.cond_layer.weight
+    out["wns1.cond.b"] = wn.enc.cond_layer.bias
+    for wi in range(len(wn.enc.in_layers)):
+        out[f"wns1.in.{wi}"] = wn.enc.in_layers[wi].weight
+        out[f"wns1.in.{wi}.b"] = wn.enc.in_layers[wi].bias
+        out[f"wns1.skip.{wi}"] = wn.enc.res_skip_layers[wi].weight
+        out[f"wns1.skip.{wi}.b"] = wn.enc.res_skip_layers[wi].bias
+    out["linear_mel.weight"] = conv(model.linear_mel.weight)
+    out["linear_mel.bias"] = model.linear_mel.bias
+
+    dit = model.cfm.estimator
+    d = "dit."
+    out[d + "time_embed.0.w"] = dit.time_embed.time_mlp_0_w
+    out[d + "time_embed.0.b"] = dit.time_embed.time_mlp_0_b
+    out[d + "time_embed.2.w"] = dit.time_embed.time_mlp_2_w
+    out[d + "time_embed.2.b"] = dit.time_embed.time_mlp_2_b
+    if dit.use_step_embedding:
+        out[d + "d_embed.0.w"] = dit.d_embed.time_mlp_0_w
+        out[d + "d_embed.0.b"] = dit.d_embed.time_mlp_0_b
+        out[d + "d_embed.2.w"] = dit.d_embed.time_mlp_2_w
+        out[d + "d_embed.2.b"] = dit.d_embed.time_mlp_2_b
+    for i, blk in enumerate(dit.text_embed.text_blocks):
+        b = f"dit.text.{i}."
+        out[b + "dw"] = blk.dw
+        out[b + "dw_b"] = blk.dw_b
+        out[b + "norm_w"] = blk.norm_w
+        out[b + "norm_b"] = blk.norm_b
+        out[b + "pw1.w"] = blk.pwconv1_w
+        out[b + "pw1.b"] = blk.pwconv1_b
+        out[b + "pw2.w"] = blk.pwconv2_w
+        out[b + "pw2.b"] = blk.pwconv2_b
+        out[b + "grn.gamma"] = blk.grn_gamma
+        out[b + "grn.beta"] = blk.grn_beta
+    ie = dit.input_embed
+    out[d + "in.proj.w"] = ie.proj_w
+    out[d + "in.proj.b"] = ie.proj_b
+    out[d + "in.conv_pos_0.w"] = ie.conv_pos_0_w
+    out[d + "in.conv_pos_0.b"] = ie.conv_pos_0_b
+    out[d + "in.conv_pos_1.w"] = ie.conv_pos_1_w
+    out[d + "in.conv_pos_1.b"] = ie.conv_pos_1_b
+    for i, blk in enumerate(dit.transformer_blocks):
+        b = f"dit.blocks.{i}."
+        out[b + "attn_norm.w"] = blk.attn_norm.linear_w
+        out[b + "attn_norm.b"] = blk.attn_norm.linear_b
+        out[b + "attn.to_q.w"] = blk.attn.to_q_w
+        out[b + "attn.to_q.b"] = blk.attn.to_q_b
+        out[b + "attn.to_k.w"] = blk.attn.to_k_w
+        out[b + "attn.to_k.b"] = blk.attn.to_k_b
+        out[b + "attn.to_v.w"] = blk.attn.to_v_w
+        out[b + "attn.to_v.b"] = blk.attn.to_v_b
+        out[b + "attn.to_out.w"] = blk.attn.to_out_0_w
+        out[b + "attn.to_out.b"] = blk.attn.to_out_0_b
+        out[b + "ff.0.w"] = blk.ff.ff_0_0_w
+        out[b + "ff.0.b"] = blk.ff.ff_0_0_b
+        out[b + "ff.2.w"] = blk.ff.ff_2_w
+        out[b + "ff.2.b"] = blk.ff.ff_2_b
+    if getattr(dit, "long_skip_w", None) is not None:
+        out[d + "long_skip"] = dit.long_skip_w
+    out[d + "norm_out.w"] = dit.norm_out.linear_w
+    out[d + "norm_out.b"] = dit.norm_out.linear_b
+    out[d + "proj_out.w"] = dit.proj_out_w
+    out[d + "proj_out.b"] = dit.proj_out_b
+
+    if merged_dit:
+        out.update(merged_dit)
+    return out
+
+
+def save_s2v3_merged(weights_dir: str, model, merged_dit: dict | None,
+                     model_hps: dict, version: str) -> str:
+    """Convenience: s2v3_model_to_arrays + save_s2_inference (fp16 export)."""
+    arrays = s2v3_model_to_arrays(model, merged_dit)
+    return save_s2_inference(weights_dir, arrays, {"model_hps_source": {
+        "model": model_hps, "data": {"sampling_rate": 32000}}}, version,
+        dit_depth=len(model.cfm.estimator.transformer_blocks),
+        dit_text_blocks=len(model.cfm.estimator.text_embed.text_blocks))
+
+
 def save_s2_inference(weights_dir: str, model_class_weights: dict, meta: dict,
                       version: str, dit_depth: int | None = None,
                       dit_text_blocks: int | None = None) -> str:

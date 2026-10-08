@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""s2 v3/v4/v5dev/v5turbo CFM+LoRA trainer (MLX port of s2_train_v3_lora.py).
+
+Official semantics (GPT-SoVITS-cuda_graph_accel_v5, read-only reference):
+
+* data: TextAudioSpeakerLoaderV3 (v3) / V4 (v4/v5dev/v5turbo) + collate
+  V3/V4 (gsovits_mlx/train/s2_v3_data.py; exp_dir from tools/prepare_data.py).
+* model: SynthesizerTrnV3.forward with freeze_quantizer=True — CFM MSE loss
+  on the flow-matching velocity; ssl_proj/quantizer/enc_p frozen;
+  ref_enc/bridge/wns1/linear_mel train full-model. LoRA rank-32 (default)
+  adapters on the DiT attention to_k/to_q/to_v/to_out.0 (scaling 1.0,
+  peft-default init); base DiT frozen. --no-lora trains the DiT full-model.
+* loop: AdamW(lr 1e-4, betas (0.8, 0.99), eps 1e-9) on TRAINABLE params
+  only, fp16 GradScaler, ExponentialLR gamma=0.999875 per epoch, no
+  discriminator. Checkpoints + merged-weight sovits export
+  (pipeline.load_sovits_v3-loadable) under --out.
+
+Usage:
+  python3 tools/train_s2_v3.py --version v3 --exp-dir .tmp/train_data/exp \
+      --out .tmp/train_s2_v3_smoke --steps 200 --batch-size 3 --gpu
+
+GPU lock discipline: --gpu (or GSOVITS_GPU_LOCK_OK=1) with .tmp/gpu.lock.d
+held; CPU runs are allowed for smoke tests (numerically valid, slower).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import time
+
+DEFAULT_MODELS_ROOT = os.environ.get(
+    "GSOVITS_MODELS_ROOT",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 "models_local"))
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", required=True,
+                   choices=["v3", "v4", "v5dev", "v5turbo"])
+    p.add_argument("--exp-dir", required=True,
+                   help="preprocessing exp_dir (2-name2text.txt, 4-cnhubert/,"
+                        " 5-wav32k/) from tools/prepare_data.py")
+    p.add_argument("--models-root", default=DEFAULT_MODELS_ROOT)
+    p.add_argument("--sovits-dir", default=None,
+                   help="weights subdir under --models-root (default: version)")
+    p.add_argument("--out", required=True, help="output dir (ckpts + export)")
+    p.add_argument("--steps", type=int, default=200,
+                   help="optimizer steps for a smoke run (0 = whole epochs)")
+    p.add_argument("--epochs", type=int, default=1)
+    p.add_argument("--batch-size", type=int, default=3,
+                   help="official default minmem//8 (24GB->3)")
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lora-rank", type=int, default=32)
+    p.add_argument("--no-lora", action="store_true",
+                   help="train the DiT base weights too (experiment)")
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--loss-log", default=None)
+    p.add_argument("--resume", default=None, help="resume checkpoint dir")
+    p.add_argument("--export-only", default=None,
+                   help="skip training; merge LoRA from this resume dir and"
+                        " export (pass the checkpoint dir)")
+    p.add_argument("--max-batch-mel", type=int, default=None,
+                   help="skip batches whose collated mel width exceeds this"
+                        " (smoke memory aid; frames)")
+    p.add_argument("--gpu", action="store_true")
+    return p
+
+
+def main(argv=None) -> None:
+    args = build_argparser().parse_args(argv)
+
+    from gsovits_mlx.gpu_lock import resolve_device
+    resolve_device(args.gpu, verbose=True)
+
+    import numpy as np
+    import mlx.core as mx
+    from mlx.utils import tree_map, tree_flatten
+    from gsovits_mlx.pipeline import load_sovits_v3
+    from gsovits_mlx.train.lora import inject_lora
+    from gsovits_mlx.train.s2_cfm import S2V3TrainModel
+    from gsovits_mlx.train.s2_v3_data import (TextAudioSpeakerLoaderV3V4,
+                                              bucket_batches, collate_for)
+    from gsovits_mlx.train.optim import AdamW
+    from gsovits_mlx.train.mixed_precision import GradScaler
+    from gsovits_mlx.train.loop import Trainer
+    from gsovits_mlx.train.ckpt import save_resume
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    rng = random.Random(args.seed + 1)   # CFM python rng (2-step branch)
+
+    # -- model ------------------------------------------------------------------
+    sovits_dir = os.path.join(args.models_root, args.sovits_dir or args.version)
+    model, meta = load_sovits_v3(sovits_dir, args.version)
+    # training runs on an fp32 tree (the Trainer casts fp16 per forward)
+    model.update(tree_map(lambda v: v.astype(mx.float32)
+                          if hasattr(v, "dtype") else v, model.parameters()))
+
+    adapters = None if args.no_lora else \
+        inject_lora(model.cfm.estimator, rank=args.lora_rank, seed=args.seed)
+    tm = S2V3TrainModel(model, args.version, lora_adapters=adapters, rng=rng)
+    params = tm.trainable_params()
+    opt = AdamW([dict(params)], lr=args.lr, betas=(0.8, 0.99), eps=1e-9,
+                weight_decay=0.0)
+    # the optimizer owns the fp32 MASTERS (its param_groups copy); keep the
+    # adapter objects synced so checkpoints/exports read current values
+    masters = opt.param_groups[0]["params"]
+
+    def sync_adapters():
+        if tm.use_lora:
+            for a in tm.adapters:
+                a.lora_A = masters[f"{a.name}.lora_A"]
+                a.lora_B = masters[f"{a.name}.lora_B"]
+
+    n_par = sum(p.size for p in masters.values())
+    print(f"trainable: {len(masters)} tensors, {n_par/1e6:.2f}M params "
+          f"(lora={not args.no_lora}, rank={args.lora_rank})", flush=True)
+    scaler = GradScaler()
+
+    os.makedirs(args.out, exist_ok=True)
+    loss_log = args.loss_log or os.path.join(args.out, "loss.jsonl")
+
+    # -- export-only path ----------------------------------------------------------
+    if args.export_only:
+        from gsovits_mlx.train.ckpt import load_resume
+        man = load_resume(args.export_only, masters, [opt])
+        tm.apply_params(masters)
+        sync_adapters()
+        out = export_merged(args, tm, meta, args.export_only.rstrip("/")
+                            + "_export")
+        print(f"export-only: merged weights -> {out}")
+        return
+
+    # -- data -----------------------------------------------------------------------
+    dataset = TextAudioSpeakerLoaderV3V4(args.exp_dir, args.version)
+    collate = collate_for(args.version)
+
+    # -- loss/grad plumbing ------------------------------------------------------------
+    batch_holder = {}
+
+    def loss_of(pdict: dict) -> mx.array:
+        tm.apply_params(pdict)
+        b = batch_holder["b"]
+        loss, _ = tm.forward(
+            mx.array(b.ssl), mx.array(b.spec), mx.array(b.mel),
+            mx.array(b.ssl_lengths), mx.array(b.spec_lengths),
+            mx.array(b.text.astype(np.int32)), mx.array(b.text_lengths),
+            mx.array(b.mel_lengths, dtype=mx.float32))
+        return loss
+
+    def forward_fn(p16, batch):
+        batch_holder["b"] = batch
+        return loss_of(p16)
+
+    value_and_grad = mx.value_and_grad(loss_of)
+
+    def backward_fn(p16, loss):
+        _, grads = value_and_grad(masters)
+        return grads
+
+    trainer = Trainer(None, [opt], scaler=scaler, log_interval=1,
+                      loss_log_path=loss_log)
+
+    start_step = 0
+    if args.resume:
+        from gsovits_mlx.train.ckpt import load_resume as _lr
+        man = _lr(args.resume, masters, [opt])
+        tm.apply_params(masters)
+        sync_adapters()
+        start_step = man["step"]
+        trainer.step = start_step
+        print(f"resumed at step {start_step}")
+
+    # -- loop ------------------------------------------------------------------------
+    t0 = time.time()
+    step = start_step
+    max_steps = args.steps if args.steps > 0 else None
+    stop = False
+    for epoch in range(args.epochs):
+        if stop:
+            break
+        for bidx in bucket_batches(dataset.lengths, args.batch_size,
+                                   seed=args.seed + epoch):
+            batch = collate([dataset[i] for i in bidx])
+            if args.max_batch_mel and batch.mel.shape[-1] > args.max_batch_mel:
+                continue
+            loss = trainer.train_step(batch, forward_fn, backward_fn)
+            sync_adapters()
+            step += 1
+            if step % 10 == 0:
+                el = time.time() - t0
+                print(f"step {step} loss {loss:.4f} "
+                      f"({el/max(step-start_step,1):.2f}s/step)", flush=True)
+            if max_steps and step - start_step >= max_steps:
+                stop = True
+                break
+        # per-epoch ExponentialLR (official scheduler_g.step() per epoch)
+        for g in opt.param_groups:
+            g["lr"] *= 0.999875
+
+    trainer.stop_footprint_sampler()
+    mem = trainer.memory_report()
+
+    save_resume(os.path.join(args.out, "resume_ckpt"), masters, [opt],
+                step=trainer.step, epoch=trainer.epoch,
+                extra={"version": args.version, "lora": not args.no_lora,
+                       "lora_rank": args.lora_rank})
+    export_merged(args, tm, meta)
+
+    with open(os.path.join(args.out, "memory_report.json"), "w") as f:
+        json.dump({k: int(v) for k, v in mem.items()}, f, indent=1)
+    print(json.dumps(mem, indent=1))
+    print(f"done: {trainer.step} steps in {time.time()-t0:.1f}s -> {args.out}",
+          flush=True)
+
+
+def export_merged(args, tm, meta, out_dir: str | None = None) -> str:
+    """Merge LoRA into the base DiT weights; write a loadable sovits dir."""
+    from gsovits_mlx.train.ckpt import save_s2v3_merged
+    from gsovits_mlx.train.lora import merged_training_weights
+
+    out = out_dir or os.path.join(args.out, "export_merged")
+    merged = merged_training_weights(tm.model.cfm.estimator, tm.adapters) \
+        if tm.use_lora else None
+    save_s2v3_merged(out, tm.model, merged, dict(meta["model_hps"]),
+                     args.version)
+    print(f"exported merged weights -> {out}", flush=True)
+    return out
+
+
+if __name__ == "__main__":
+    main()
