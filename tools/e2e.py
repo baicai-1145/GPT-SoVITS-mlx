@@ -29,7 +29,7 @@ import time
 
 import numpy as np
 
-DEFAULT_MODELS_ROOT = "/Volumes/2T/gpt-sovits-models/mlx"
+DEFAULT_MODELS_ROOT = os.environ.get("GSOVITS_MODELS_ROOT", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models_local"))
 DEFAULT_CPUFAST_REPO = "/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-CPUFast"
 
 DEFAULT_TOP_K = 15
@@ -371,17 +371,58 @@ def run_ar(args, cfg, times, all_phones_mx, all_bert_mx, prompt_sem):
     return seq, seq.shape[1]
 
 
-def decode_v1v2(args, cfg, times, sov, all_phones_mx, refer, prompt_sem, seq, sv_emb=None):
+def decode_v1v2(args, cfg, times, sov, target_phones_mx, refer, prompt_sem, seq, sv_emb=None):
     import mlx.core as mx
 
-    all_codes = mx.concatenate([prompt_sem, seq], axis=1)[:, None, :]
+    codes = seq[:, None, :]
     kwargs = dict(sv_emb_raw=sv_emb) if sv_emb is not None else {}
-    audio, y_mask = sov.decode(all_codes, all_phones_mx, refer,
+    audio, y_mask = sov.decode(codes, target_phones_mx, refer,
                                noise_scale=args.noise_scale,
                                key=mx.random.key(args.seed), **kwargs)
     mx.eval(audio)
     n_out = int(y_mask.shape[2] * 960)  # 2*480 samples per semantic frame
     return np.array(audio)[0, 0][:n_out]
+
+
+def decode_v1v2_concat(args, cfg, times, sov, seg_codes, seg_phones, refer,
+                       prompt_sem, sv_emb=None):
+    """Time-concat parallel decode for v1/v2 (official 并行合成 method 2).
+
+    All segments' semantic codes are concatenated along TIME into one
+    sequence; phones likewise; ONE sov.decode call; audio sliced back per
+    segment by frame counts (official: tokens*2*upsample; here y_mask
+    segments x 960). Segment boundaries share conv receptive-field context
+    with neighbors, so per-seg output is NOT bit-equal to independent
+    decode — the official production path accepts this and ships it.
+    Returns list of per-segment wav arrays (np.float32).
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    T = sum(c.shape[2] for c in seg_codes)
+    codes = mx.concatenate(seg_codes, axis=2)  # (1,1,T)
+    phones = mx.concatenate(seg_phones, axis=1)
+    kwargs = dict(sv_emb_raw=sv_emb) if sv_emb is not None else {}
+    audio, y_mask = sov.decode(codes, phones, refer,
+                               noise_scale=args.noise_scale,
+                               key=mx.random.key(args.seed), **kwargs)
+    mx.eval(audio)
+    wav = np.array(audio)[0, 0]  # actual output; sample-per-frame varies
+    n_total = len(wav)            # by version (v1 960, v2 640)
+    # Slice back proportionally by token share (official slices by
+    # tokens*2*upsample_rate; the y_mask frame accounting differs by
+    # path so token-proportional is the robust equivalent).
+    T_total = sum(c.shape[2] for c in seg_codes)
+    out = []
+    pos = 0
+    for i, c in enumerate(seg_codes):
+        if i == len(seg_codes) - 1:
+            out.append(wav[pos:])
+        else:
+            n_samples = int(round(n_total * c.shape[2] / T_total))
+            out.append(wav[pos : pos + n_samples])
+            pos += n_samples
+    return out
 
 
 def decode_v3family(args, cfg, times, sov, all_phones_mx, refer, prompt_sem, seq, p_ids):
@@ -393,12 +434,13 @@ def decode_v3family(args, cfg, times, sov, all_phones_mx, refer, prompt_sem, seq
 
     t0 = time.perf_counter()
     steps, cfg_rate = resolve_sampling(args.version, args.steps, args.cfg_rate)
-    all_codes = mx.concatenate([prompt_sem, seq], axis=1)[:, None, :]
+    codes = seq[:, None, :]
+    target_phones = all_phones_mx[:, len(p_ids):]
     refer_mask = mx.ones((refer.shape[0], 1, refer.shape[2]), dtype=refer.dtype)
     ge = sov.ref_enc(refer[:, :704] * refer_mask, refer_mask)
     fea_ref, ge = sov.decode_encp(mx.array([prompt_sem]), all_phones_mx[:, :len(p_ids)],
                                   refer=refer, ge=ge)
-    fea_todo, _ = sov.decode_encp(all_codes, all_phones_mx, refer=refer, ge=ge,
+    fea_todo, _ = sov.decode_encp(codes, target_phones, refer=refer, ge=ge,
                                   speed=1.0)
     mx.eval(fea_ref, fea_todo)
 
@@ -423,7 +465,9 @@ def decode_v3family(args, cfg, times, sov, all_phones_mx, refer, prompt_sem, seq
                                 sample_steps=steps, cfg_rate=cfg_rate, key=key)
         pred = denorm_spec(mel)
         mx.eval(pred)
-        voc = load_vocoder_v4(os.path.join(args.models_root, cfg["vocoder_dir"]))
+        voc_dtype = mx.float16 if os.environ.get("GSOVITS_V5_VOCODER_FP16", "1") != "0" else None
+        voc = load_vocoder_v4(os.path.join(args.models_root, cfg["vocoder_dir"]),
+                             dtype=voc_dtype)
     else:
         from gsovits_mlx.pipeline import cfm_chunked_decode_v3
         pred = cfm_chunked_decode_v3(sov, fea_ref, fea_todo, mel2,
@@ -437,7 +481,7 @@ def decode_v3family(args, cfg, times, sov, all_phones_mx, refer, prompt_sem, seq
         else:
             from gsovits_mlx.pipeline import load_vocoder_v4
             voc = load_vocoder_v4(os.path.join(args.models_root, cfg["vocoder_dir"]))
-    audio = voc(pred)
+    audio = voc(pred) if args.version == "v3" else voc.infer(pred)
     mx.eval(audio)
     times["sovits_vocoder"] = time.perf_counter() - t0
     return np.array(audio)[0, 0], steps, cfg_rate
@@ -458,6 +502,17 @@ def main() -> None:
         sys.path.insert(0, repo_root)
     from gsovits_mlx.gpu_lock import resolve_device
     device = resolve_device(flag_gpu=args.gpu, verbose=True)
+    if device == "gpu":
+        try:
+            import mlx.core as mx
+            # Whole-process footprint cap (2026-10-08): MLX Metal buffer cache
+            # grows unbounded by default and shows up in phys_footprint as the
+            # 7-11GB end-of-run spike. Cap the cache; MLX evicts evictable
+            # buffers instead of accumulating. Override: GSOVITS_METAL_LIMIT_MB.
+            lim = int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "3072"))
+            mx.metal.set_memory_limit(lim * 1024 * 1024)
+        except Exception as e:  # noqa: BLE001 - older mlx lacks the API
+            print(f"[mem] metal memory limit not set: {e}", file=sys.stderr)
     if not args.frontend_only:
         from gsovits_mlx.gpu_lock import require_gpu_for_pipeline
         # gate on the RESOLVED device (env opt-in counts as gpu), not the
@@ -532,7 +587,7 @@ def main() -> None:
     # --- 5. SoVITS decode ---
     t0 = time.perf_counter()
     if cfg["family"] == "v1v2":
-        audio_np = decode_v1v2(args, cfg, times, sov, all_phones_mx, refer,
+        audio_np = decode_v1v2(args, cfg, times, sov, all_phones_mx[:, len(p_ids):], refer,
                                prompt_sem, seq, sv_emb)
     else:
         audio_np, steps, cfg_rate = decode_v3family(

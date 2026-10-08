@@ -117,7 +117,7 @@ where the deps it needs are present (install the extra for multi-language).
 
 All entry scripts default to the **CPU** MLX device; Metal requires an
 explicit opt-in (`--gpu` or `GSOVITS_GPU_LOCK_OK=1`) **and** a fresh
-`.tmp/gpu.lock.d/owner` file (<=45 min old; set `GSOVITS_RUN_TAG` to require
+`.tmp/gpu.lock.d/owner` file (<=15 min old; set `GSOVITS_RUN_TAG` to require
 your tag in it). See `gsovits_mlx/gpu_lock.py`. This keeps GPU work serial
 when several agents share the machine.
 

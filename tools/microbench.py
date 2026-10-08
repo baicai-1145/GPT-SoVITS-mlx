@@ -63,8 +63,8 @@ import numpy as np
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-DEFAULT_MODELS_ROOT = "/Volumes/2T/gpt-sovits-models/mlx"
-DEFAULT_REF_AUDIO = "/Volumes/2T/gpt-sovits-models/bench/ref_zh_3.5s.wav"
+DEFAULT_MODELS_ROOT = os.environ.get("GSOVITS_MODELS_ROOT", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models_local"))
+DEFAULT_REF_AUDIO = os.path.join(os.path.dirname(DEFAULT_MODELS_ROOT), "models_local", "ref_zh_3.5s.wav") if os.path.isdir(os.path.join(os.path.dirname(DEFAULT_MODELS_ROOT), "models_local")) else "/Volumes/2T/gpt-sovits-models/bench/ref_zh_3.5s.wav"
 DEFAULT_REF_TEXT = "希望你以后能够做得比我还好哟。"
 DEFAULT_TEXT = "你好，欢迎来到各自的旅程。今天我们聊聊机器学习。"
 MB_DIR = os.path.join(REPO, ".tmp", "mb")
@@ -375,9 +375,10 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
                     "mu_todo_T": int(fea_todo.shape[-1]),
                 }
             del fea_ref, fea_todo, mel2, mel
-            voc = load_vocoder_v4(os.path.join(models_root, "v5_vocoder"))
+            voc_dtype = mx.float16 if os.environ.get("GSOVITS_V5_VOCODER_FP16", "1") != "0" else None
+            voc = load_vocoder_v4(os.path.join(models_root, "v5_vocoder"), dtype=voc_dtype)
             t2 = time.perf_counter()
-            audio = voc(pred)
+            audio = voc.infer(pred)
             mx.eval(audio)
             spans[f"vocoder_{i}"] = round(time.perf_counter() - t2, 3)
             del pred
@@ -396,7 +397,7 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
             del ge, refer_mask
             # mel2: v3 prompt mel is 100-mel 1024/256 @ 24 kHz (e2e_v3 stage 5)
             import soundfile as sf
-            ref24, _sr = sf.read("/Volumes/2T/gpt-sovits-models/bench/ref_zh_3.5s.wav",
+            ref24, _sr = sf.read(DEFAULT_REF_AUDIO,
                                  dtype="float32", always_2d=True)
             ref24 = ref24.mean(axis=1)
             from gsovits_mlx.pipeline import resample_linear

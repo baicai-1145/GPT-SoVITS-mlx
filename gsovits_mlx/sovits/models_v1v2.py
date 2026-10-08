@@ -147,6 +147,22 @@ class Generator(nn.Module):
         x = self.conv_post(x)
         return mx.tanh(x)
 
+    def infer(self, x: mx.array, g: mx.array | None = None) -> mx.array:
+        """Decode in the parameter dtype, optionally compiling immutable weights.
+
+        Reload a model after weight changes; do not mutate after the first trace.
+        Stage trimming uses eager execution so its eval/clear barriers run.
+        """
+        dtype = self.conv_pre.weight.dtype
+        x = x.astype(dtype)
+        g = g.astype(dtype) if g is not None else None
+        if (os.environ.get("GSOVITS_VOCODER_FAST", "1") == "0"
+                or os.environ.get("GSOVITS_HIFIGAN_STAGE_TRIM") == "1"):
+            return self(x, g).astype(mx.float32)
+        if getattr(self, "_inference_fn", None) is None:
+            self._inference_fn = mx.compile(self)
+        return self._inference_fn(x, g).astype(mx.float32)
+
 
 class ResidualCouplingLayer(nn.Module):
     """modules.ResidualCouplingLayer, mean_only=True (all GPT-SoVITS ckpts)."""
@@ -323,16 +339,19 @@ class SynthesizerTrn(nn.Module):
         # fp32-in; fp16 w with fp32 in = 0.999x). Compiled warm is a
         # further ~5% over eager fp16; gates: corr 0.9995+ vs seed-0.
         # default ON (gates: corr 0.99999-1.0 across the cell); opt out with =0
-        if os.environ.get("GSOVITS_HIFIGAN_FAST", "1") != "0":
+        fp16_input = os.environ.get("GSOVITS_HIFIGAN_FAST", "1") != "0"
+        trim = os.environ.get("GSOVITS_HIFIGAN_STAGE_TRIM") == "1"
+        gin = ge
+        if fp16_input:
+            zin = zin.astype(self.dec.conv_pre.weight.dtype)
+            gin = ge.astype(self.dec.conv_pre.weight.dtype) if ge is not None else None
+        # Trimming contains eval/clear barriers and must bypass a cached graph.
+        if fp16_input and not trim:
             if self._dec_fast is None:
                 self._dec_fast = mx.compile(self.dec)
-            zin = zin.astype(self.dec.conv_pre.weight.dtype)
-            gin_fast = ge.astype(self.dec.conv_pre.weight.dtype) if ge is not None else None
-            # cast back: downstream (sf.write, wav gates, e2e consumers) all
-            # expect fp32 audio; ~1 ms at 0.7 M samples
-            o = self._dec_fast(zin, gin_fast).astype(mx.float32)
+            o = self._dec_fast(zin, gin).astype(mx.float32)
         else:
-            o = self.dec(zin, g=ge)
+            o = self.dec(zin, g=gin).astype(mx.float32)
         return o, y_mask
 
     def extract_latent(self, x: mx.array) -> mx.array:

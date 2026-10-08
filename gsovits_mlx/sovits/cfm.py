@@ -60,10 +60,12 @@ class CFM:
         """mu: (B, T, C) condition; prompt: (B, C, T_p) reference mel (normed).
         Returns generated (B, C, T)."""
         B, T = mu.shape[0], mu.shape[1]
-        # Euler STATE stays fp32 (mixed-precision policy: fp16 GEMMs inside the
-        # DiT, fp32 accumulation between steps) — torch reference accumulates
-        # fp32; fp16 state drifts ~6e-3 over 32 steps.
-        dtype = mx.float32
+        # Pure-fp16 semantics (2026-10-08, user decision): the flow STATE
+        # follows the condition dtype (mu), matching the CUDA project's
+        # `state_dtype = mu.dtype` — no fp32 accumulation island between Euler
+        # steps. fp16 state drifts ~6e-3 vs fp32 over 32 steps (same class of
+        # fp16 noise the CUDA project accepts under is_half=True).
+        dtype = mu.dtype
         x = mx.random.normal((B, self.in_channels, T), key=key).astype(dtype) * temperature
         prompt_len = prompt.shape[-1]
         prompt_x = mx.zeros_like(x)
@@ -122,8 +124,9 @@ class CFMV5:
         steps, cfg = validate_v5_sampling(n_timesteps, inference_cfg_rate)
         batch, frames = mu.shape[0], mu.shape[1]
         prompt_len = prompt.shape[-1]
-        # Euler STATE stays fp32 (see CFM.inference note).
-        dtype = mx.float32
+        # Pure-fp16 semantics (see CFM.inference note): state follows mu.dtype,
+        # matching CUDA v5_inference `state_dtype = mu.dtype`.
+        dtype = mu.dtype
         x = mx.random.normal((batch, self.in_channels, frames), key=key).astype(dtype) * V5_TEMPERATURE
         x[:, :, :prompt_len] = 0
         prompt_x = mx.zeros_like(x).astype(dtype)
@@ -139,25 +142,36 @@ class CFMV5:
         # estimator step (loop-invariant inputs captured as closure constants;
         # only x and time flow through the compiled boundary each step).
         import os as _os
+        timetable = None
+        if (cache is not None and _os.environ.get("GSOVITS_DIT_TIME_CACHE", "1") == "1"
+                and hasattr(self.estimator, "prepare_timestep_cache")
+                and not self.estimator.use_step_embedding):
+            stream_dtype = cache["condition"].dtype
+            if _os.environ.get("GSOVITS_DIT_FP16_BLOCKS", "0") == "1":
+                stream_dtype = self.estimator.transformer_blocks[0].attn.to_q_w.dtype
+            timetable = self.estimator.prepare_timestep_cache(steps, batch, dtype, stream_dtype)
         step_fn = None
-        if _os.environ.get("GSOVITS_DIT_STEP_COMPILE", "0") == "1" and cfg <= 1e-5:
-            def _step(xx, tt):
+        if _os.environ.get("GSOVITS_DIT_STEP_COMPILE", "1") == "1" and cfg <= 1e-5:
+            def _step(xx, tt, entry=None):
+                extra = {"timestep_cache": entry} if entry is not None else {}
                 v, _, _ = self.estimator(
                     xx, prompt_x, x_lens, tt, None, condition,
                     drop_audio_cond=False, drop_text=False, static_cache=cache,
-                    infer=True, text_cache=text_cache,
+                    infer=True, text_cache=text_cache, **extra,
                 )
                 return mx.transpose(v, (0, 2, 1))
             step_fn = mx.compile(_step)
         for index in range(steps):
             time = mx.full((batch,), index * step, dtype=dtype)
+            entry = timetable[index] if timetable is not None else None
+            extra = {"timestep_cache": entry} if entry is not None else {}
             if step_fn is not None:
-                velocity = step_fn(x, time)
+                velocity = step_fn(x, time, entry)
             else:
                 velocity, text_embedding, _ = self.estimator(
                     x, prompt_x, x_lens, time, None, condition,
                     drop_audio_cond=False, drop_text=False, static_cache=cache,
-                    infer=True, text_cache=text_cache,
+                    infer=True, text_cache=text_cache, **extra,
                 )
                 if self.use_conditioner_cache and cache is None:
                     text_cache = text_embedding
@@ -166,7 +180,7 @@ class CFMV5:
                 negative, _, _ = self.estimator(
                     x, prompt_x, x_lens, time, None, condition,
                     drop_audio_cond=True, drop_text=False, static_cache=cache,
-                    infer=True, text_cache=text_cache,
+                    infer=True, text_cache=text_cache, **extra,
                 )
                 negative = mx.transpose(negative, (0, 2, 1))
                 velocity = velocity + cfg * (velocity - negative)

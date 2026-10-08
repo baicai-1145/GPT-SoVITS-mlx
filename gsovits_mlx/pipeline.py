@@ -20,6 +20,7 @@ import mlx.nn as nn
 
 from .gpt.t2s import Text2SemanticDecoder
 from .io import eval_tree, load_mlx_safetensors, release
+from .model_cache import resident_model
 from .sovits.models_v1v2 import SynthesizerTrn
 from .sovits.models_v3 import SynthesizerTrnV3
 from .sovits.dit import load_dit_params
@@ -66,6 +67,7 @@ def load_audio_16k(path: str) -> np.ndarray:
 # Model loading
 # ---------------------------------------------------------------------------
 
+@resident_model("sovits")
 def _load_sovits_v1v2(path: str, version: str):
     arrays = load_mlx_safetensors(os.path.join(path, "sovits.safetensors"))
     meta = json.load(open(os.path.join(path, "sovits.json")))
@@ -125,6 +127,7 @@ def _load_sovits_v1v2(path: str, version: str):
     return m, meta
 
 
+@resident_model("gpt")
 def load_gpt(path: str) -> Text2SemanticDecoder:
     arrays = load_mlx_safetensors(os.path.join(path, "gpt.safetensors"))
     meta = json.load(open(os.path.join(path, "gpt.json")))
@@ -132,7 +135,50 @@ def load_gpt(path: str) -> Text2SemanticDecoder:
     gpt.load(dict(arrays))
     eval_tree(gpt)
     release(arrays)
+    _prewarm_ar_batch(gpt)
     return gpt
+
+
+def _prewarm_ar_batch(gpt: Text2SemanticDecoder) -> None:
+    """Shape-prewarm for batched AR (cold-start mitigation).
+
+    MLX compiles Metal kernels per shape-specialization: the first request
+    at a new batch width B pays a full compile wave inside its latency
+    (measured: B=8 first-run 5.74s vs warm 2.26s; warmup at B=2 covers only
+    B=2 shapes). MLX 0.32.2 has no persistent kernel cache, so the only
+    lever is running one tiny dummy decode per planned B at load time.
+    This also sizes the buffer pool and ramps GPU clocks before the first
+    real request. GSOVITS_AR_PREWARM="2,4,8" (comma list, "0" disables;
+    default off to keep CLI one-shot loads fast).
+    """
+    import os
+    import mlx.core as mx
+    spec = os.environ.get("GSOVITS_AR_PREWARM", "")
+    if not spec or spec == "0":
+        return
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            B = int(token)
+        except ValueError:
+            continue
+        if B < 1:
+            continue
+        try:
+            ph = mx.zeros((1, 8), mx.int32)
+            bt = mx.zeros((1, 1024, 8), mx.float32)
+            pr = mx.zeros((1, 4), mx.int32)
+            if B == 1:
+                # serial shapes: trace python paths + trigger the system
+                # MTLCompiler cache for mixed_gemv/SDPA first launches
+                gpt.infer(ph, bt, pr, fast_cache=True)
+            else:
+                gpt.infer_batch([(ph, bt, pr)] * B, uniforms=[[0.5] * 4] * B)
+        except Exception:
+            # prewarm is best-effort: never block model load
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +237,7 @@ def _load_ref_enc(re_, g):
     re_.fc.weight, re_.fc.bias = g("ref_enc.fc"), g("ref_enc.fc.b")
 
 
+@resident_model("sovits")
 def load_sovits_v3(path: str, version: str = "v3"):
     """Converted SynthesizerTrnV3 (v3/v4/v5 family) from sovits.safetensors + sovits.json."""
     arrays = load_mlx_safetensors(os.path.join(path, "sovits.safetensors"))
@@ -231,12 +278,17 @@ def load_sovits_v3(path: str, version: str = "v3"):
     return m, meta
 
 
-def load_vocoder_v4(path: str):
-    """Converted v4/v5 HiFi-GAN Generator (vocoder.safetensors + vocoder.json)."""
+@resident_model("vocoder")
+def load_vocoder_v4(path: str, dtype=None):
+    """Converted v4/v5 Generator; optionally cast parameters at load time."""
     from .sovits.models_v1v2 import Generator
     arrays = load_mlx_safetensors(os.path.join(path, "vocoder.safetensors"))
     h = json.load(open(os.path.join(path, "vocoder.json")))
-    g = arrays.get
+
+    def g(key):
+        value = arrays.get(key)
+        return value.astype(dtype) if dtype is not None and value is not None else value
+
     voc = Generator(h["initial_channel"], h["resblock"], h["resblock_kernel_sizes"],
                     h["resblock_dilation_sizes"], h["upsample_rates"],
                     h["upsample_initial_channel"], h["upsample_kernel_sizes"],
@@ -258,6 +310,7 @@ def load_vocoder_v4(path: str):
     return voc
 
 
+@resident_model("sv")
 def load_sv_encoder(path: str):
     """Converted ERes2NetV2 speaker encoder (sv.safetensors + sv.json)."""
     from .sovits.sv_encoder import AFF, BN2d, BasicAFFBlock, BasicResBlock, Conv2d, ERes2NetV2
@@ -313,6 +366,7 @@ def load_sv_encoder(path: str):
     return m, h
 
 
+@resident_model("vocoder")
 def load_bigvgan(path: str):
     """Converted BigVGAN v2 (bigvgan.safetensors + bigvgan.json)."""
     arrays = load_mlx_safetensors(os.path.join(path, "bigvgan.safetensors"))

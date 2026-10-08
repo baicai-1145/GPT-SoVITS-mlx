@@ -227,3 +227,9 @@ __pycache__/
 
 # pi team state
 .pi/
+
+# local weights mirror (moved off /Volumes/2T for cold-start I/O, 2026-10-08)
+models_local/
+AGENTS.md
+# macOS junk
+.DS_Store

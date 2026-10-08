@@ -51,6 +51,9 @@ from gsovits_mlx.text import vendored_cpufront
 
 punctuation = set(["!", "?", "…", ",", ".", "-"])  # official module constant
 
+# One resident model, independent of text/results; replace on export changes.
+_BERT_RESOURCES: dict[tuple, tuple] = {}
+
 
 class Segment(NamedTuple):
     phones: list            # cleaned_text_to_sequence ids
@@ -130,17 +133,41 @@ class TextFrontend:
             find_tokenizer_json, load_bert_tokenizer)
 
         bert_dir = os.path.join(self.models_root, "bert")
+        cache_key = None
+        if os.environ.get("GSOVITS_FRONTEND_MODEL_CACHE", "1") == "1":
+            paths = [os.path.join(bert_dir, name)
+                     for name in ("bert.safetensors", "config.json", "tokenizer.json")]
+            files = tuple((os.path.realpath(path), s.st_ino, s.st_mtime_ns, s.st_size)
+                          for path in paths for s in (os.stat(path),))
+            cache_key = (files, str(mx.default_device()),
+                         os.environ.get("GSOVITS_FRONTEND_F32", "0") == "1")
+            resident = _BERT_RESOURCES.get(cache_key)
+            if resident is not None:
+                self._bert, self._tok = resident
+                return self._bert
+        else:
+            _BERT_RESOURCES.clear()
         arrays = load_mlx_safetensors(os.path.join(bert_dir, "bert.safetensors"))
-        # fp32 BERT = the stage-1 verified configuration (e2e_v2.py). The
-        # exported bert.safetensors is fp16; the additive attention mask
-        # ((1 - am) * -1e9) overflows fp16 (0 * inf = NaN), so the fp16
-        # weights are upcast here. (Dropping the manual np round-trip is a
-        # P0-B/memory concern, not a semantic one.)
-        arrays = {k: mx.array(np.asarray(v, np.float32))
-                  for k, v in arrays.items() if "position_ids" not in k}
+        # GPU frontend (2026-10-08, user decision): BERT runs in its native
+        # fp16 export on the selected device — matching the CUDA project's
+        # bert_model.half() under is_half=True. The historical fp32 upcast
+        # existed because (1-am)*-1e9 overflows fp16 (0*inf=NaN); the mask is
+        # now clamped to -65504 (fp16 min) inside BertModel, which softmax
+        # treats identically. Set GSOVITS_FRONTEND_F32=1 for the old path.
+        if os.environ.get("GSOVITS_FRONTEND_F32", "0") != "1":
+            arrays = {k: v for k, v in arrays.items() if "position_ids" not in k}
+        else:
+            arrays = {k: mx.array(np.asarray(v, np.float32))
+                      for k, v in arrays.items() if "position_ids" not in k}
         cfg = json.load(open(os.path.join(bert_dir, "config.json")))
         self._bert = BertModel(arrays, cfg)
+        if cache_key is not None:
+            # A changed export also invalidates tokenizer.json's path cache.
+            load_bert_tokenizer.cache_clear()
         self._tok = load_bert_tokenizer(find_tokenizer_json(self.models_root))
+        if cache_key is not None:
+            _BERT_RESOURCES.clear()
+            _BERT_RESOURCES[cache_key] = (self._bert, self._tok)
         return self._bert
 
     def _bert_feature_zh(self, norm_text: str, word2ph: list) -> np.ndarray:
@@ -181,8 +208,14 @@ class TextFrontend:
         return re.sub(pattern, r"\1", text)
 
     def _get_first(self, text: str) -> str:
-        m = re.match(self._first_pattern + "+", text)
-        return m.group() if m else ""
+        """Official TextPreprocessor.get_first: the FIRST CLAUSE (text before
+        the first split char), stripped — NOT leading split chars. The
+        pre_seg_text condition `len(get_first(text)) < 4` then means "the
+        first clause is under 4 chars (add a leading 。/.)"; matching only
+        leading punctuation would make nearly EVERY sentence prepend and
+        diverge from the official phones by one token (found in the
+        multilingual bench parity sweep, 2026-10-07)."""
+        return re.split(self._first_pattern, text)[0].strip()
 
     def merge_short_text_in_array(self, texts: list, threshold: int) -> list:
         if len(texts) < 2:
@@ -444,7 +477,7 @@ def _assert_gpu_allowed(device: str) -> None:
             try:
                 owner = open(os.path.join(lock, "owner")).read().strip()
                 fresh = (time.time()
-                         - os.path.getmtime(os.path.join(lock, "owner"))) < 45 * 60
+                         - os.path.getmtime(os.path.join(lock, "owner"))) < 15 * 60
             except OSError:
                 owner, fresh = "", False
             if owner and fresh:

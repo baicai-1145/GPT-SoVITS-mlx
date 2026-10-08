@@ -20,7 +20,7 @@ tools/export_g2pw_mlx.py; kept fp32 because the argmax decides zh phones
 and fp16 logits can flip near-ties). Lookup order:
     $GSOVITS_G2PW_SAFETENSORS
     <official G2PWModel dir>/g2pw.safetensors
-    <models_root>/g2pw/g2pw.safetensors   (default /Volumes/2T/.../mlx/g2pw)
+    <models_root>/g2pw/g2pw.safetensors   (default <repo>/models_local/g2pw)
 
 Numerical gate: label-exact vs the torch G2PW on the parity corpus (see
 tests/test_g2pw_mlx.py).
@@ -34,11 +34,13 @@ import sys
 
 import numpy as np
 
+from .fused_ln import dense_residual_norm
+
 _NUM_POS = 11
 _NUM_HEADS = 12
 _MODEL = None  # {"arrays": ..., "n_layers": int}, built lazily
 
-DEFAULT_MODELS_ROOT = "/Volumes/2T/gpt-sovits-models/mlx"
+DEFAULT_MODELS_ROOT = os.environ.get("GSOVITS_MODELS_ROOT", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "models_local"))
 
 
 def _abs_model_dir(model_dir: str) -> str:
@@ -76,6 +78,16 @@ def _load_model(model_dir: str) -> dict:
     import mlx.core as mx
 
     arrays = mx.load(_resolve_weights(model_dir))
+    # fp16 G2PW is the DEFAULT (2026-10-08, user decision after parity
+    # evidence: 45/45 multilingual sentences phones-exact vs the fp32 path,
+    # .tmp/multi_fe). Halves weight residency (635->317MB) and Metal traffic.
+    # The argmax near-tie risk is real in principle; set GSOVITS_G2PW_FP16=0
+    # to fall back to the fp32 path if a future corpus flips a polyphone.
+    # (Note: the CUDA project's g2pW.onnx is fp32; this is a deliberate,
+    # verified deviation.)
+    if os.environ.get("GSOVITS_G2PW_FP16", "1") == "1":
+        arrays = {k: (v.astype(mx.float16) if v.dtype == mx.float32 else v)
+                  for k, v in arrays.items()}
     n_layers = 1 + max(int(k.split(".")[3]) for k in arrays
                        if k.startswith("bert.encoder.layer."))
     return {"arrays": arrays, "n_layers": n_layers}
@@ -102,11 +114,11 @@ def nn_gelu(x):
 
 
 def _forward(w: dict, input_ids, token_type_ids, attention_mask,
-             phoneme_mask, char_ids, position_ids):
-    """G2PWModel.forward in MLX. Index arrays int32; masks float32.
+             phoneme_mask, char_ids, position_ids, query_batch_ids=None):
+    """Encode (B,S) contexts and classify their query positions.
 
-    Shapes: input_ids/token_type_ids/attention_mask (B,S); phoneme_mask/
-    char_ids/position_ids (B,N). Returns probs (B,N,L).
+    query_batch_ids maps each query to a shared context, avoiding repeated
+    BERT work for multiple polyphones in the same window.
     """
     import mlx.core as mx
 
@@ -119,7 +131,7 @@ def _forward(w: dict, input_ids, token_type_ids, attention_mask,
         x, arrays["bert.embeddings.LayerNorm.weight"],
         arrays["bert.embeddings.LayerNorm.bias"], 1e-12)
     # additive key mask, official (1 - am) * -10000, broadcast over heads/queries
-    m = (1.0 - attention_mask[:, None, None, :]) * -10000.0
+    m = (1.0 - attention_mask[:, None, None, :]).astype(x.dtype) * mx.array(-10000.0, x.dtype)
     dim = x.shape[-1]
     hd = dim // _NUM_HEADS
     scale = 1.0 / math.sqrt(hd)
@@ -136,22 +148,27 @@ def _forward(w: dict, input_ids, token_type_ids, attention_mask,
         v = v.reshape(B, S, _NUM_HEADS, hd).transpose(0, 2, 1, 3)
         a = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=m)
         a = a.transpose(0, 2, 1, 3).reshape(B, S, dim)
-        a = mx.fast.layer_norm(
-            a @ arrays[p + "attention.output.dense.weight"].T
-            + arrays[p + "attention.output.dense.bias"] + x,
+        a = dense_residual_norm(
+            a @ arrays[p + "attention.output.dense.weight"].T,
+            arrays[p + "attention.output.dense.bias"], x,
             arrays[p + "attention.output.LayerNorm.weight"],
             arrays[p + "attention.output.LayerNorm.bias"], 1e-12)
         h = _gelu(a @ arrays[p + "intermediate.dense.weight"].T
                   + arrays[p + "intermediate.dense.bias"]) if False else _gelu(a @ arrays[p + "intermediate.dense.weight"].T + arrays[p + "intermediate.dense.bias"])
-        x = mx.fast.layer_norm(
-            h @ arrays[p + "output.dense.weight"].T
-            + arrays[p + "output.dense.bias"] + a,
+        x = dense_residual_norm(
+            h @ arrays[p + "output.dense.weight"].T,
+            arrays[p + "output.dense.bias"], a,
             arrays[p + "output.LayerNorm.weight"],
             arrays[p + "output.LayerNorm.bias"], 1e-12)
-    # gather per-query positions: flat[(arange(B)*S + position_ids)]
     flat = x.reshape(B * S, dim)
-    idx = mx.arange(B)[:, None] * S + position_ids
-    hq = flat[idx]  # (B, N, dim)
+    if query_batch_ids is not None:
+        idx = query_batch_ids * S + position_ids
+    elif position_ids.ndim == 1:
+        offsets = mx.arange(B) * S if B != 1 else 0
+        idx = offsets + position_ids
+    else:
+        idx = mx.arange(B)[:, None] * S + position_ids
+    hq = flat[idx]
     pos_logits = hq @ arrays["pos_classifier.weight"].T + arrays["pos_classifier.bias"]
     pos_pred = mx.argmax(pos_logits, axis=-1)  # (B, N)
     # descriptor mask: bias (1,L) + char (B,N,L) + second (B,N,L) -> (B,N,L)
@@ -165,10 +182,10 @@ def _forward(w: dict, input_ids, token_type_ids, attention_mask,
     return exp_logits / mx.sum(exp_logits, axis=-1, keepdims=True)
 
 
-def _predict_numpy(w: dict, model_input: dict):
+def _predict_numpy(w: dict, model_input: dict, query_batch_ids=None):
     import mlx.core as mx
 
-    probs = np.array(_forward(
+    probs = _forward(
         w,
         mx.array(np.asarray(model_input["input_ids"], np.int32)),
         mx.array(np.asarray(model_input["token_type_ids"], np.int32)),
@@ -176,11 +193,14 @@ def _predict_numpy(w: dict, model_input: dict):
         mx.array(np.asarray(model_input["phoneme_masks"], np.float32)),
         mx.array(np.asarray(model_input["char_ids"], np.int32)),
         mx.array(np.asarray(model_input["position_ids"], np.int32)),
-    ))
-    probs = probs.reshape(-1, probs.shape[-1])  # (B=1, N, L) -> (N, L)
-    preds = np.argmax(probs, axis=1).tolist()
-    confidences = [float(probs[i, p]) for i, p in enumerate(preds)]
-    return preds, confidences
+        mx.array(query_batch_ids, mx.int32) if query_batch_ids is not None else None,
+    )
+    probs = probs.reshape(-1, probs.shape[-1])
+    preds = mx.argmax(probs, axis=-1)
+    confidence = mx.take_along_axis(probs, preds[:, None], axis=-1)[:, 0]
+    # One small transfer, rather than every query's full label distribution.
+    result = np.asarray(mx.stack((preds.astype(mx.float32), confidence), axis=-1))
+    return result[:, 0].astype(np.int32).tolist(), result[:, 1].tolist()
 
 
 def register_as_torch_api() -> None:
@@ -207,6 +227,32 @@ def _make_converter_class():
             preds, confidences = _predict_numpy(get_model(self.model_dir),
                                                 model_input)
             return [self.labels[p] for p in preds], confidences
+
+        def _predict_with_sentence_dedup(self, model_input: dict, texts: list):
+            if os.environ.get("GSOVITS_G2PW_BATCHED", "1") == "0":
+                return super()._predict_with_sentence_dedup(model_input, texts)
+            groups = {}
+            for i, text in enumerate(texts):
+                groups.setdefault(text, []).append(i)
+            contexts = list(groups.values())
+            preds, confidences = [""] * len(texts), [0.0] * len(texts)
+            # Vendored base_api._predict_with_sentence_dedup keeps row 0 only
+            # for these encoder inputs; position_ids, char_ids and phoneme_masks
+            # remain per occurrence. batch_ids maps each query to its context.
+            context_fields = ("input_ids", "token_type_ids", "attention_masks")
+            # Bound encoder activation residency for callers passing many sentences.
+            for start in range(0, len(contexts), 8):
+                chunk = contexts[start:start + 8]
+                rows = [indices[0] for indices in chunk]
+                queries = [i for indices in chunk for i in indices]
+                batch_ids = [b for b, indices in enumerate(chunk) for _ in indices]
+                inputs = {name: value[rows if name in context_fields else queries]
+                          for name, value in model_input.items()}
+                p, c = _predict_numpy(get_model(self.model_dir), inputs, batch_ids)
+                for i, label, confidence in zip(queries, p, c):
+                    preds[i] = self.labels[label]
+                    confidences[i] = confidence
+            return preds, confidences
 
     return G2PWTorchConverter
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import time
 
-LOCK_STALE_SEC = 45 * 60
+LOCK_STALE_SEC = 15 * 60
 
 
 def _find_lock() -> tuple[str, str] | None:

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import math
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from .fused_adaln import fused_modulated_norm
 
 
 def sequence_mask_2d(lengths, max_length) -> mx.array:
@@ -36,10 +39,14 @@ class TimestepEmbedding(nn.Module):
         self.time_mlp_2_b = mx.zeros((dim,))
 
     def __call__(self, timestep: mx.array) -> mx.array:
+        # CUDA reference: freqs built fp32 (build-time), timestep follows model
+        # dtype in v5 (`torch.full(..., dtype=state_dtype)`). Keep the fp32
+        # frequency table (identical construction), cast the product to the
+        # weight dtype so downstream GEMMs stay fp16.
         half = self.freq_embed_dim // 2
         emb = math.log(10000) / (half - 1)
         emb = mx.exp(mx.arange(half, dtype=mx.float32) * -emb)
-        emb = timestep[:, None].astype(mx.float32) * emb[None, :] * 1000.0
+        emb = timestep[:, None].astype(self.time_mlp_0_w.dtype) * emb[None, :].astype(self.time_mlp_0_w.dtype) * 1000.0
         emb = mx.concatenate([mx.sin(emb), mx.cos(emb)], axis=-1)
         x = nn.silu(emb @ self.time_mlp_0_w.T + self.time_mlp_0_b)
         return x @ self.time_mlp_2_w.T + self.time_mlp_2_b
@@ -138,10 +145,16 @@ class Attention(nn.Module):
 
     def _qkv_w(self):
         # task-10: fused (3*inner, dim) weight + bias, built once.
+        # task-12: evaluate the packed arrays at build time. The lazy
+        # concatenate made every compiled step re-materialize the W/b packs
+        # (dense probe: 528 W + 528 b copy dispatches per sentence, 1.03 GiB
+        # of W payload). Exact-op packing; eval happens before the compiled
+        # step first sees the arrays.
         w = getattr(self, "_qkv_w_cache", None)
         if w is None:
             w = (mx.concatenate([self.to_q_w, self.to_k_w, self.to_v_w], axis=0),
                  mx.concatenate([self.to_q_b, self.to_k_b, self.to_v_b], axis=0))
+            mx.eval(w)
             self._qkv_w_cache = w
         return w
 
@@ -171,15 +184,12 @@ class Attention(nn.Module):
         q_h = mx.concatenate([apply_rope(q_h[:, :1], rope0), q_h[:, 1:]], axis=1)
         k_h = mx.concatenate([apply_rope(k_h[:, :1], rope0), k_h[:, 1:]], axis=1)
 
-        # SDPA (softmax/exp + value mix) runs fp32 even under fp16 weights:
-        # it is a small share of block time but the dominant precision
-        # amplifier (task-1: kept v5turbo's 32-step v_pos error just over the
-        # 2e-2 gate in pure fp16). No-op when inputs are fp32.
-        sdpa_dt = mx.float32 if q_h.dtype != mx.float32 else q_h.dtype
+        # SDPA in the stream dtype (pure-fp16 semantics, 2026-10-08): matches
+        # the CUDA project's F.scaled_dot_product_attention under is_half=True
+        # (native fp16 attention, no fp32 island). No-op when inputs are fp32.
         out = mx.fast.scaled_dot_product_attention(
-            q_h.astype(sdpa_dt), k_h.astype(sdpa_dt), v.astype(sdpa_dt),
-            scale=1.0 / math.sqrt(self.dim_head),
-            mask=(mask[:, None, None, :].astype(sdpa_dt)
+            q_h, k_h, v, scale=1.0 / math.sqrt(self.dim_head),
+            mask=(mask[:, None, None, :].astype(q_h.dtype)
                   if mask is not None else None)).astype(q_h.dtype)
         out = out.transpose(0, 2, 1, 3).reshape(b, t, self.heads * self.dim_head)
         out = out @ self.to_out_0_w.T + self.to_out_0_b
@@ -220,8 +230,7 @@ class AdaLayerNormZero(nn.Module):
         cd = self._cdtype
         emb = (nn.silu(emb).astype(cd) @ self.linear_w.T + self.linear_b).astype(x.dtype)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [emb[:, i*x.shape[-1]:(i+1)*x.shape[-1]] for i in range(6)]
-        norm = _ln_noaffine(x)
-        x = norm * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        x = _modulated_norm(x, scale_msa, shift_msa)
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
@@ -232,20 +241,35 @@ class AdaLayerNormZero_Final(nn.Module):
         self.linear_b = mx.zeros((dim * 2,))
         self._cdtype = None
 
-    def __call__(self, x: mx.array, emb: mx.array) -> mx.array:
-        # same mixed-precision treatment as AdaLayerNormZero
-        if self._cdtype is None:
-            self._cdtype = self.linear_w.dtype
-        cd = self._cdtype
-        emb = (nn.silu(emb).astype(cd) @ self.linear_w.T + self.linear_b).astype(x.dtype)
+    def __call__(self, x: mx.array, emb: mx.array, precomputed_mods=None) -> mx.array:
+        if precomputed_mods is None:
+            if self._cdtype is None:
+                self._cdtype = self.linear_w.dtype
+            cd = self._cdtype
+            emb = (nn.silu(emb).astype(cd) @ self.linear_w.T + self.linear_b).astype(x.dtype)
+        else:
+            emb = precomputed_mods
         scale, shift = emb[:, : x.shape[-1]], emb[:, x.shape[-1]:]
-        return _ln_noaffine(x) * (1 + scale[:, None]) + shift[:, None]
+        return _modulated_norm(x, scale, shift)
+
+
+def _modulated_norm(x, scale, shift, dtype=None):
+    dtype = x.dtype if dtype is None else dtype
+    if (os.environ.get("GSOVITS_DIT_FUSED_ADALN", "0") == "1"
+            and os.environ.get("GSOVITS_DIT_FAST_LN", "1") != "0"
+            and mx.default_device() == mx.gpu and x.dtype == mx.float32
+            and x.shape[0] == 1 and x.shape[-1] == 1024
+            and scale.dtype == mx.float32 and shift.dtype == mx.float32
+            and dtype in (mx.float16, mx.float32)):
+        return fused_modulated_norm(x, scale, shift, dtype)
+    return (_ln_noaffine(x) * (1 + scale[:, None]) + shift[:, None]).astype(dtype)
 
 
 def _ln_noaffine(x: mx.array) -> mx.array:
-    # fp32-internal: fp16 mean/var over 1024 dims loses too much precision
-    # (task gate: LayerNorm stays fp32 internally; no-op when x is fp32).
-    xf = x.astype(mx.float32)
+    if x.dtype == mx.float32 and os.environ.get("GSOVITS_DIT_FAST_LN", "1") != "0":
+        return mx.fast.layer_norm(x, None, None, 1e-6)
+    # Preserve explicit fp16 reduction/rounding in the fp16 residual path.
+    xf = x.astype(x.dtype)
     mu = mx.mean(xf, axis=-1, keepdims=True)
     var = mx.mean((xf - mu) ** 2, axis=-1, keepdims=True)
     return ((xf - mu) / mx.sqrt(var + 1e-6)).astype(x.dtype)
@@ -278,13 +302,12 @@ class DiTBlock(nn.Module):
             D = x.shape[-1]
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [
                 precomputed_mods[:, i * D:(i + 1) * D] for i in range(6)]
-            norm = _ln_noaffine(x)
-            norm = norm * (1 + scale_msa[:, None]) + shift_msa[:, None]
+            norm = _modulated_norm(x, scale_msa, shift_msa, cd)
         else:
             norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, t)
         attn_output = self.attn(norm.astype(cd), mask, rope)
         x = x + (gate_msa[:, None] * attn_output).astype(x.dtype)
-        norm = _ln_noaffine(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        norm = _modulated_norm(x, scale_mlp, shift_mlp, cd)
         ff_output = self.ff(norm.astype(cd))
         x = x + (gate_mlp[:, None] * ff_output).astype(x.dtype)
         return x
@@ -379,6 +402,31 @@ class DiT(nn.Module):
         self.norm_out = AdaLayerNormZero_Final(dim)
         self.proj_out_w = mx.zeros((mel_dim, dim))
         self.proj_out_b = mx.zeros((mel_dim,))
+        self._timestep_cache = {}
+
+    def prepare_timestep_cache(self, steps: int, batch: int, state_dtype, stream_dtype):
+        """V5 time modulation is independent of the chunk and CFG branch."""
+        if self.use_step_embedding:
+            raise ValueError("Timestep caching requires the V5 no-step-embedding path")
+        key = (steps, batch, state_dtype, stream_dtype)
+        if key not in self._timestep_cache:
+            entries = []
+            t0w = getattr(self.time_embed, "time_mlp_0_w", None) if not callable(self.time_embed) else None
+            td = t0w.dtype if t0w is not None else mx.float32
+            for index in range(steps):
+                time = mx.full((batch,), index * (1.0 / steps), dtype=state_dtype)
+                t = self.time_embed(time.astype(td)).astype(stream_dtype)
+                activation = nn.silu(t)
+                # Retain the per-step, per-layer GEMV shape and rounding order.
+                mods = tuple((activation.astype(b.attn_norm.linear_w.dtype)
+                              @ b.attn_norm.linear_w.T + b.attn_norm.linear_b).astype(stream_dtype)
+                             for b in self.transformer_blocks)
+                final = (activation.astype(self.norm_out.linear_w.dtype)
+                         @ self.norm_out.linear_w.T + self.norm_out.linear_b).astype(stream_dtype)
+                entries.append({"time": t, "blocks": mods, "final": final})
+            mx.eval(entries)
+            self._timestep_cache[key] = entries
+        return self._timestep_cache[key]
 
     def _rope(self, seq_len: int, dtype) -> mx.array:
         # cached per seq_len; RAW angles (T, dim_head/2) — apply_rope derives
@@ -425,7 +473,8 @@ class DiT(nn.Module):
 
     def __call__(self, x0, cond0, x_lens, time, dt_base_bootstrap, text0,
                  use_grad_ckpt=False, drop_audio_cond=False, drop_text=False,
-                 infer=False, text_cache=None, dt_cache=None, static_cache=None):
+                 infer=False, text_cache=None, dt_cache=None, static_cache=None,
+                 timestep_cache=None):
         x = mx.transpose(x0, (0, 2, 1))
         cond = mx.transpose(cond0, (0, 2, 1))
         text = mx.transpose(text0, (0, 2, 1))
@@ -437,13 +486,22 @@ class DiT(nn.Module):
         batch, seq_len = x.shape[0], x.shape[1]
         # torch: t = time_embed(time); dt = d_embed(dt_base) (first call) or dt_cache;
         #        t += dt; returns dt (the d_embed OUTPUT, not time+d) as the cache value.
-        t = self.time_embed(time.astype(mx.float32))
+        # CUDA reference: freqs built fp32 (build-time), timestep follows model
+        # dtype in v5 (`torch.full(..., dtype=state_dtype)`). Keep the fp32
+        # frequency table (identical construction), cast the product to the
+        # first weight's dtype when available (tests monkeypatch time_embed as
+        # a plain function; fall back to fp32 = old behavior there).
+        t0w = getattr(self.time_embed, "time_mlp_0_w", None) if not callable(self.time_embed) else None
+        td = t0w.dtype if t0w is not None else mx.float32
+        t = self.time_embed(time.astype(td)) if timestep_cache is None else timestep_cache["time"]
         dt_out = None
         if self.use_step_embedding:
             if infer and dt_cache is not None:
                 t = t + dt_cache
             else:
-                dt_out = self.d_embed(dt_base_bootstrap.astype(mx.float32))
+                d0w = getattr(self.d_embed, "time_mlp_0_w", None)
+                dtd = d0w.dtype if d0w is not None else mx.float32
+                dt_out = self.d_embed(dt_base_bootstrap.astype(dtd))
                 t = t + dt_out
 
         if static_cache is not None:
@@ -469,6 +527,9 @@ class DiT(nn.Module):
         # fp16 here would promote the whole graph back to fp32 via NumPy
         # promotion rules and forfeit the fp16 GEMM win. No-op when fp32.
         t = t.astype(x.dtype)
+        if timestep_cache is not None:
+            if self.use_step_embedding or timestep_cache["time"].dtype != x.dtype:
+                raise ValueError("Timestep cache does not match the DiT residual stream")
 
         rope = static_cache["rope"] if static_cache is not None else self._rope(seq_len, x.dtype)
 
@@ -484,7 +545,10 @@ class DiT(nn.Module):
         # GSOVITS_DIT_PREFOLD=1 (task-10): all blocks share the same t, so the
         # 22 modulation GEMMs batch into ONE einsum upfront (removes ~66
         # kernel launches/step); blocks consume precomputed 6-way params.
-        if _os.environ.get("GSOVITS_DIT_PREFOLD", "0") == "1":
+        if timestep_cache is not None:
+            for block, mods in zip(self.transformer_blocks, timestep_cache["blocks"]):
+                x = block(x, None, mask, rope, precomputed_mods=mods)
+        elif _os.environ.get("GSOVITS_DIT_PREFOLD", "0") == "1":
             # shapes: W (L, 6D, D); t (B, D) -> mods (B, L, 6D). The stacked
             # weights are constants — build once, reuse every step.
             if self._prefold_w is None:
@@ -505,13 +569,17 @@ class DiT(nn.Module):
         if self.long_skip_connection:
             x = mx.concatenate([x, residual], axis=-1) @ self.long_skip_w.T
 
-        x = self.norm_out(x, t)
+        if timestep_cache is None:
+            x = self.norm_out(x, t)
+        else:
+            x = self.norm_out(x, t, precomputed_mods=timestep_cache["final"])
         out = x @ self.proj_out_w.T + self.proj_out_b
         return (out, text_embed if static_cache is None else None, dt_out) if infer else out
 
 
 def load_dit_params(dit: DiT, arrays: dict, depth: int, text_blocks: int, has_d_embed: bool):
     """Map converted safetensors arrays onto the DiT structures."""
+    dit._timestep_cache.clear()
     ge = arrays.get
     dit.time_embed.time_mlp_0_w = ge("dit.time_embed.0.w")
     dit.time_embed.time_mlp_0_b = ge("dit.time_embed.0.b")
@@ -557,6 +625,9 @@ def load_dit_params(dit: DiT, arrays: dict, depth: int, text_blocks: int, has_d_
         blk.ff.ff_0_0_b = ge(f"dit.blocks.{i}.ff.0.b")
         blk.ff.ff_2_w = ge(f"dit.blocks.{i}.ff.2.w")
         blk.ff.ff_2_b = ge(f"dit.blocks.{i}.ff.2.b")
+        # task-12: stale packs after a weight reload would silently reuse the
+        # old Q/K/V parameters; drop them so the next call rebuilds.
+        blk.attn._qkv_w_cache = None
     if "dit.long_skip" in arrays:
         dit.long_skip_w = ge("dit.long_skip")
     dit.norm_out.linear_w = ge("dit.norm_out.w")
