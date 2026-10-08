@@ -145,9 +145,11 @@ def run_text(args, timing: dict) -> None:
     from gsovits_mlx.text.preproc import TextFrontend, bootstrap
 
     t0 = time.perf_counter()
+    # models_root is absolute (main() normalizes path args) — set bert_path
+    # FIRST so the vendored chinese2 import resolves the g2pw tokenizer even
+    # if a stale/relative bert_path leaked into the environment.
+    os.environ["bert_path"] = os.path.join(args.models_root, "bert")
     bootstrap(args.cpufast_repo, models_root=args.models_root)
-    if not os.environ.get("bert_path"):
-        os.environ["bert_path"] = os.path.join(args.models_root, "bert")
     fe = TextFrontend(models_root=args.models_root, lazy=True,
                       device=os.environ.get("GSOVITS_FRONTEND_DEVICE", "gpu"))
     timing["stage1_model_load"] = time.perf_counter() - t0
@@ -493,6 +495,17 @@ def main() -> None:
     ap.add_argument("--timing-json", default=None,
                     help="write per-stage timing breakdown to this file")
     args = ap.parse_args()
+
+    # bootstrap() chdirs into the CPUFast repo before stage-1 runs, so any
+    # RELATIVE path argument would resolve against the wrong cwd afterwards
+    # (g2pw tokenizer FileNotFoundError, missing wav list, exp dir inside
+    # CPUFast). Normalize every path arg to absolute up front.
+    for p in ("list", "wav_dir", "exp_dir", "models_root"):
+        setattr(args, p, os.path.abspath(os.path.expanduser(getattr(args, p))))
+    if args.cpufast_repo:
+        args.cpufast_repo = os.path.abspath(os.path.expanduser(args.cpufast_repo))
+    if args.timing_json:
+        args.timing_json = os.path.abspath(args.timing_json)
 
     if args.part >= args.parts:
         raise SystemExit(f"--part {args.part} out of range for --parts {args.parts}")
