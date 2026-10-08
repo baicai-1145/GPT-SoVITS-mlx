@@ -1,0 +1,385 @@
+"""s2 (SoVITS) GAN training driver — MLX port of official s2_train.py.
+
+Usage (single process; the official multi-GPU DDP path collapses to
+num_replicas=1 here):
+
+  # one-time checkpoint extraction (base venv, torch):
+  /Users/baicai1145/.venvs/base/bin/python tools/train_s2_extract.py \
+      --version v2 --out .tmp/train_s2
+
+  # training run (repo venv, GPU behind the lock):
+  python tools/train_s2.py --version v2 \
+      --exp-dir <exp_dir from tools/prepare_data.py> \
+      --train-npz .tmp/train_s2/s2G_v2.npz \
+      [--disc-npz .tmp/train_s2/s2D_v2.npz] \
+      --out .tmp/train_s2/run_v2 --steps 200 --batch-size 6
+
+Semantics (official s2_train.py, verified line-by-line):
+  * AdamW G: 4 param groups — base lr 1e-4; text_embedding / encoder_text /
+    mrte each at lr*0.4 (text_low_lr_rate); betas (0.8, 0.99), eps 1e-9,
+    weight_decay 0.01 (torch default).
+  * AdamW D: single group, same hyperparams.
+  * SHARED GradScaler: D step scales+steps on the pre-update scale;
+    scaler.update() runs ONLY after the G step.
+  * ExponentialLR gamma=0.999875 stepped once per epoch.
+  * clip_grad_value_(None): NO-OP on grads (official commons only clamps
+    when clip_value is not None); we compute the grad norm for logging.
+  * freeze_quantizer=True: ssl_proj + quantizer excluded from optimizers
+    (official no_grad+eval); quantizer runs fp32 outside the fp16 graph.
+  * fp16 autocast for the G forward; fp32 losses (mel/kl/fm/gen).
+
+Deviations (documented, unavoidable or measured):
+  * G forward runs TWICE per step (once for the D-step trace with p16
+    constant, once for the G-step grad trace). Torch runs it once and
+    reuses y_hat; MLX graphs require the forward inside each traced loss.
+    Same RNG key per pair -> identical y_hat draws; no semantic change,
+    ~2x forward cost per step (backward passes are single each).
+  * DDP gradient averaging absent (single process).
+  * Bucket sampler randperm: numpy PCG64, not torch Philox (s2_data.py).
+  * v1/v2 have NO pretrained s2D on this machine (checked /Volumes/2T
+    .../pretrained_models and the whole repo tree): D inits fresh for
+    v1/v2; v2Pro/ProPlus load s2Dv2Pro*.pth.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+
+import numpy as np
+
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+from gsovits_mlx.gpu_lock import resolve_device  # noqa: E402
+
+_HPS_V1V2 = dict(
+    spec_channels=1025, inter_channels=192, hidden_channels=192,
+    filter_channels=768, n_heads=2, n_layers=6, kernel_size=3,
+    resblock="1", resblock_kernel_sizes=[3, 7, 11],
+    resblock_dilation_sizes=[[1, 3, 5]] * 3,
+    upsample_rates=[10, 8, 2, 2, 2], upsample_initial_channel=512,
+    upsample_kernel_sizes=[16, 16, 8, 2, 2], gin_channels=512,
+    semantic_frame_rate="25hz", freeze_quantizer=True)
+VERSION_MODEL_HPS = {
+    "v1": dict(_HPS_V1V2),
+    "v2": dict(_HPS_V1V2),
+    "v2Pro": dict(_HPS_V1V2, gin_channels=1024),
+    "v2ProPlus": dict(_HPS_V1V2, gin_channels=1024,
+                      upsample_initial_channel=768,
+                      upsample_kernel_sizes=[20, 16, 8, 2, 2]),
+}
+TRAIN = dict(
+    learning_rate=1e-4, betas=(0.8, 0.99), eps=1e-9, fp16_run=True,
+    lr_decay=0.999875, segment_size=20480, hop_length=640,
+    filter_length=2048, win_length=2048, n_mel_channels=128,
+    mel_fmin=0.0, mel_fmax=None, c_mel=45.0, c_kl=1.0,
+    text_low_lr_rate=0.4, sampling_rate=32000,
+)
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--version", required=True,
+                   choices=["v1", "v2", "v2Pro", "v2ProPlus"])
+    p.add_argument("--exp-dir", required=True,
+                   help="exp_dir from tools/prepare_data.py (2-name2text.txt, "
+                        "4-cnhubert/, 5-wav32k/ [, 7-sv_cn/])")
+    p.add_argument("--train-npz", required=True,
+                   help="s2G training npz from tools/train_s2_extract.py")
+    p.add_argument("--disc-npz", default=None)
+    p.add_argument("--out", required=True)
+    p.add_argument("--steps", type=int, default=200)
+    p.add_argument("--batch-size", type=int, default=6)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--lr", type=float, default=TRAIN["learning_rate"])
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--log-interval", type=int, default=10)
+    p.add_argument("--save-every", type=int, default=200)
+    p.add_argument("--export-inference", action="store_true")
+    p.add_argument("--init-scale", type=float, default=65536.0)
+    p.add_argument("--memory-limit-mb", type=int,
+                   default=int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "3072")))
+    p.add_argument("--cpu", action="store_true",
+                   help="debug-only CPU run (tiny steps; the full model "
+                        "does NOT fit CPU time budgets)")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    device = resolve_device(flag_gpu=not args.cpu, verbose=True)
+    import mlx.core as mx
+    if device == "gpu":
+        try:
+            mx.metal.set_memory_limit(args.memory_limit_mb * 1024 * 1024)
+        except Exception as e:  # noqa: BLE001
+            print(f"[mem] limit not set: {e}", file=sys.stderr)
+
+    from gsovits_mlx.train.s2_data import (
+        BucketSampler, TextAudioSpeakerCollate, TextAudioSpeakerLoader)
+    from gsovits_mlx.train import s2_gan as G
+    from gsovits_mlx.train.s2_discriminator import (
+        MultiPeriodDiscriminator, load_mpd_weights)
+    from gsovits_mlx.train.s2_torchio import load_train_params_npz
+    from gsovits_mlx.train.optim import AdamW
+    from gsovits_mlx.train.mixed_precision import GradScaler
+    from gsovits_mlx.train import ckpt as ckpt_mod
+    from gsovits_mlx.text.mel_frontend import _librosa_mel
+
+    os.makedirs(args.out, exist_ok=True)
+    hps = VERSION_MODEL_HPS[args.version]
+    seg_frames = TRAIN["segment_size"] // TRAIN["hop_length"]  # 32
+    is_pro = args.version in ("v2Pro", "v2ProPlus")
+
+    # ---- data ----
+    dataset = TextAudioSpeakerLoader(
+        args.exp_dir, version=args.version,
+        sampling_rate=TRAIN["sampling_rate"],
+        filter_length=TRAIN["filter_length"],
+        hop_length=TRAIN["hop_length"], win_length=TRAIN["win_length"])
+    print(f"[data] {dataset.stats}")
+    collate = TextAudioSpeakerCollate(version=args.version)
+    sampler = BucketSampler(dataset.lengths, args.batch_size, shuffle=True)
+
+    # ---- models ----
+    net_g = G.SynthesizerTrnTrain(version=args.version, segment_size=seg_frames,
+                                  **hps)
+    params32 = load_train_params_npz(args.train_npz)
+    missing = [n for n in net_g.parameter_names(include_frozen=True)
+               if n not in params32]
+    if missing:
+        raise RuntimeError(f"s2G npz missing {len(missing)} params: {missing[:8]}")
+    net_g.bind(params32)
+
+    periods = [2, 3, 5, 7, 11, 17, 23] if is_pro else [2, 3, 5, 7, 11]
+    net_d = MultiPeriodDiscriminator(periods=periods)
+    d_fresh = True
+    if args.disc_npz and os.path.exists(args.disc_npz):
+        d_src = load_train_params_npz(args.disc_npz)
+        miss, unexp = load_mpd_weights(net_d, d_src)
+        d_fresh = False
+        print(f"[init] D loaded ({len(miss)} missing / {len(unexp)} unexpected)")
+    else:
+        print(f"[init] no pretrained s2D for {args.version}: D init fresh "
+              "(documented; official expects s2D for v1/v2 but it is absent "
+              "on this machine)")
+
+    # ---- optimizers ----
+    all_names = net_g.parameter_names()
+    text_emb = [n for n in all_names if n == "enc_p.text_embedding"]
+    enc_text = [n for n in all_names if n.startswith("enc_p.encoder_text")]
+    mrte = [n for n in all_names if n.startswith("enc_p.mrte")]
+    low = set(text_emb + enc_text + mrte)
+    base = [n for n in all_names if n not in low]
+    assert set(base) | low == set(all_names) and not (set(base) & low)
+
+    def gdict(names):
+        return {n: params32[n] for n in names}
+
+    optim_g = AdamW(
+        [{"params": gdict(base), "lr": args.lr},
+         {"params": gdict(text_emb), "lr": args.lr * TRAIN["text_low_lr_rate"]},
+         {"params": gdict(enc_text), "lr": args.lr * TRAIN["text_low_lr_rate"]},
+         {"params": gdict(mrte), "lr": args.lr * TRAIN["text_low_lr_rate"]}],
+        lr=args.lr, betas=TRAIN["betas"], eps=TRAIN["eps"], weight_decay=0.01)
+    for g_ in optim_g.param_groups:
+        g_["base_lr"] = g_["lr"]
+
+    d32 = net_d.parameters()  # {name: fp32 array}
+    optim_d = AdamW([d32], lr=args.lr, betas=TRAIN["betas"],
+                    eps=TRAIN["eps"], weight_decay=0.01)
+    optim_d.param_groups[0]["base_lr"] = args.lr
+
+    sched_g = G.ExponentialLR(optim_g, gamma=TRAIN["lr_decay"])
+    sched_d = G.ExponentialLR(optim_d, gamma=TRAIN["lr_decay"])
+    scaler = GradScaler(init_scale=args.init_scale)
+
+    mel_basis = mx.array(_librosa_mel(
+        TRAIN["sampling_rate"], TRAIN["filter_length"],
+        TRAIN["n_mel_channels"], TRAIN["mel_fmin"], TRAIN["mel_fmax"]))
+
+    def make_fp16(params_f32: dict) -> dict:
+        out = {}
+        for k, v in params_f32.items():
+            if k.startswith(("sv_emb.", "ge_to512.", "prelu")):
+                out[k] = v  # sv family stays fp32 (v2Pro export policy)
+            else:
+                out[k] = v.astype(mx.float16)
+        return out
+
+    # ---- traced losses --------------------------------------------------------
+    def prep_batch(batch):
+        arrays = [mx.array(b) for b in batch[:8]]
+        sv = mx.array(batch[8]) if is_pro else None
+        return arrays, sv
+
+    def g_forward(p16, arrays, sv, key):
+        (ssl, ssl_lengths, spec, spec_lengths, wav, wav_lengths, text,
+         text_lengths) = arrays
+        net_g.bind(p16)
+        spec16 = spec.astype(mx.float16)
+        y_lengths = spec_lengths  # y frames == spec frames (official)
+        quantized = net_g.quantize_ssl(ssl)  # fp32 frozen block, no p16 deps
+        o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
+            net_g.forward(ssl, spec16, y_lengths, text.astype(mx.int32),
+                          text_lengths, sv_emb=sv, key=key,
+                          quantized_in=quantized)
+        mel = G.spec_to_mel(spec.astype(mx.float32), mel_basis)
+        y_mel = G.slice_segments(mel, ids_slice, seg_frames)
+        y_hat_mel = G.mel_spectrogram_train(
+            o.astype(mx.float32).squeeze(1), mel_basis,
+            TRAIN["filter_length"], TRAIN["hop_length"], TRAIN["win_length"])
+        y = G.slice_segments(wav, ids_slice * TRAIN["hop_length"],
+                             TRAIN["segment_size"])
+        return o, y, y_mel, y_hat_mel, kl_ssl, \
+            (z, z_p, m_p, logs_p, m_q, logs_q), y_mask
+
+    def d_loss_fn(d16, p16, arrays, sv, key):
+        """D loss wrt d16; G forward under captured p16 (constants)."""
+        load_mpd_weights(net_d, d16)
+        o, y, *_ = g_forward(p16, arrays, sv, key)
+        y32 = y.astype(mx.float32)
+        y_hat32 = mx.stop_gradient(o).astype(mx.float32)
+        y_d_hat_r, y_d_hat_g, _, _ = net_d(y32, y_hat32)
+        loss, _, _ = G.discriminator_loss(y_d_hat_r, y_d_hat_g)
+        return loss
+
+    def g_loss_fn(p16, d16, arrays, sv, key):
+        """G loss wrt p16; D under captured d16 (constants)."""
+        o, y, y_mel, y_hat_mel, kl_ssl, ql, y_mask = g_forward(
+            p16, arrays, sv, key)
+        z, z_p, m_p, logs_p, m_q, logs_q = ql
+        loss_mel = mx.mean(mx.abs(y_mel - y_hat_mel)) * TRAIN["c_mel"]
+        loss_kl = G.kl_loss(z_p, logs_q, m_p, logs_p, y_mask) * TRAIN["c_kl"]
+        load_mpd_weights(net_d, d16)
+        y32 = y.astype(mx.float32)
+        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y32, o.astype(mx.float32))
+        loss_fm = G.feature_loss(fmap_r, fmap_g)
+        loss_gen, _ = G.generator_loss(y_d_hat_g)
+        return (loss_gen + loss_fm + loss_mel + kl_ssl * 1.0 + loss_kl,
+                (loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl))
+
+    # ---- loop -----------------------------------------------------------------
+    logf = open(os.path.join(args.out, "loss.jsonl"), "a")
+    step, epoch = 0, 1
+    key = mx.random.key(args.seed)
+    t0 = time.perf_counter()
+    stop = False
+    parts_log = {}
+
+    def grad_norm_sq(gr):
+        return sum(float(mx.sum(g_.astype(mx.float32) ** 2)) for g_ in gr.values())
+
+    while not stop:
+        sampler.set_epoch(epoch)
+        batches = [collate([dataset[i] for i in b]) for b in iter(sampler)]
+        for bi, batch in enumerate(batches):
+            if step >= args.steps:
+                stop = True
+                break
+            key, kd, kg = mx.random.split(key, 3)
+            arrays, sv = prep_batch(batch)
+
+            masters = {}
+            for g_ in optim_g.param_groups:
+                masters.update(g_["params"])
+            p16 = make_fp16(masters)
+            d_masters = dict(optim_d.param_groups[0]["params"])
+            d16 = {k: v.astype(mx.float16) for k, v in d_masters.items()}
+
+            # ---- D step (pre-update scale) ----
+            (loss_d, dgrads) = mx.value_and_grad(d_loss_fn)(d16, p16, arrays, sv, kd)
+            loss_d_scaled = loss_d * scaler.get_scale()
+            dgrads = {k: v * scaler.get_scale() for k, v in dgrads.items()}
+            mx.eval(loss_d, *dgrads.values())
+            optim_d.param_groups[0]["grads"] = {
+                k: v.astype(mx.float32) for k, v in dgrads.items()}
+            scaler.unscale_(optim_d)
+            gn_d = grad_norm_sq(optim_d.param_groups[0]["grads"]) ** 0.5
+            scaler.step(optim_d)
+
+            # ---- G step ----
+            (loss_g, parts), ggrads = mx.value_and_grad(g_loss_fn)(
+                p16, d16, arrays, sv, kg)
+            loss_g_scaled = loss_g * scaler.get_scale()
+            ggrads = {k: v * scaler.get_scale() for k, v in ggrads.items()}
+            mx.eval(loss_g, *ggrads.values())
+            for g_ in optim_g.param_groups:
+                g_["grads"] = {k: ggrads[k].astype(mx.float32)
+                               for k in g_["params"] if k in ggrads}
+            scaler.unscale_(optim_g)
+            gn_g = sum(grad_norm_sq(g_["grads"]) for g_ in optim_g.param_groups) ** 0.5
+            scaler.step(optim_g)
+            scaler.update()
+
+            # ---- logging ----
+            if step % args.log_interval == 0 or step == args.steps - 1:
+                rec = dict(step=step, epoch=epoch, batch=bi,
+                           loss_disc=float(loss_d),
+                           loss_gen=float(parts[0]), loss_fm=float(parts[1]),
+                           loss_mel=float(parts[2]), loss_kl_ssl=float(parts[3]),
+                           loss_kl=float(parts[4]),
+                           grad_norm_d=round(gn_d, 3),
+                           grad_norm_g=round(gn_g, 3),
+                           scale=scaler.get_scale(),
+                           lr=optim_g.param_groups[0]["lr"],
+                           elapsed=round(time.perf_counter() - t0, 1))
+                print(json.dumps(rec))
+                logf.write(json.dumps(rec) + "\n")
+                logf.flush()
+            step += 1
+            if args.save_every and step % args.save_every == 0:
+                _save(ckpt_mod, args, optim_g, optim_d, step, epoch, d_fresh)
+        epoch += 1
+        sched_g.step()
+        sched_d.step()
+        if args.epochs is not None and epoch - 1 >= args.epochs:
+            stop = True
+        if not batches:
+            stop = True
+
+    logf.close()
+    _save(ckpt_mod, args, optim_g, optim_d, step, epoch - 1, d_fresh)
+
+    peak = 0
+    try:
+        if device == "gpu":
+            peak = int(mx.metal.get_peak_memory())
+    except Exception:
+        pass
+    summary = dict(steps=step, epochs=epoch - 1, peak_metal_bytes=peak,
+                   elapsed_s=round(time.perf_counter() - t0, 1),
+                   disc_init="fresh" if d_fresh else "pretrained",
+                   device=device)
+    print("[done]", json.dumps(summary))
+    with open(os.path.join(args.out, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=1)
+
+    if args.export_inference:
+        from tools.train_s2_export import export_inference
+        masters = {}
+        for g_ in optim_g.param_groups:
+            masters.update(g_["params"])
+        out_dir = export_inference(net_g, masters, params32, hps, args.version,
+                                   os.path.join(args.out, "sovits_export"))
+        print(f"[export] {out_dir}")
+    return 0
+
+
+def _save(ckpt_mod, args, optim_g, optim_d, step, epoch, d_fresh):
+    masters = {}
+    for g_ in optim_g.param_groups:
+        masters.update(g_["params"])
+    ckpt_mod.save_resume(
+        os.path.join(args.out, "resume"), masters, [optim_g, optim_d],
+        step=step, epoch=epoch,
+        extra={"version": args.version, "disc_fresh": d_fresh})
+
+
+if __name__ == "__main__":
+    sys.exit(main())
