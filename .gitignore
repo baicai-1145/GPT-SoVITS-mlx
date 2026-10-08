@@ -233,3 +233,6 @@ models_local/
 AGENTS.md
 # macOS junk
 .DS_Store
+
+# local dev docs (not for remote)
+docs/
