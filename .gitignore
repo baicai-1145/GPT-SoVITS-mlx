@@ -229,7 +229,9 @@ __pycache__/
 .pi/
 
 # local weights mirror (moved off /Volumes/2T for cold-start I/O, 2026-10-08)
+# (bare entry: worktrees symlink models_local -> main repo's copy)
 models_local/
+models_local
 AGENTS.md
 # macOS junk
 .DS_Store
