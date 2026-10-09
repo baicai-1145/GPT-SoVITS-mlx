@@ -100,10 +100,14 @@ class AdamW:
             if isinstance(group, dict) and "params" in group:
                 g = dict(self.defaults)
                 g.update(group)
-                g["params"] = dict(group["params"])
+                # BUGFIX (2026-10-09, s1-ar probe): keep the CALLER's dict
+                # object. dict(group["params"]) copies, and apply_group's
+                # params.update() rebinds keys only in the copy → model
+                # params silently never updated (bit-identical losses).
+                g["params"] = group["params"]
             else:
                 g = dict(self.defaults)
-                g["params"] = dict(group)
+                g["params"] = group  # caller's dict, kept by reference
             g.setdefault("grads", {})
             g.setdefault("lr", lr)
             g.setdefault("weight_decay", weight_decay)
@@ -223,10 +227,12 @@ class ScaledAdam:
             if isinstance(group, dict) and "params" in group:
                 g = dict(self.defaults)
                 g.update(group)
-                g["params"] = dict(group["params"])
+                # BUGFIX (2026-10-09, s1-ar probe): keep the CALLER's dict
+                # object — same rationale as AdamW above (silent no-train).
+                g["params"] = group["params"]
             else:
                 g = dict(self.defaults)
-                g["params"] = dict(group)
+                g["params"] = group  # caller's dict, kept by reference
             g.setdefault("grads", {})
             self.param_groups.append(g)
         self._states = [dict() for _ in self.param_groups]
