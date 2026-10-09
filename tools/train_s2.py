@@ -108,6 +108,13 @@ def parse_args(argv=None):
     p.add_argument("--save-every", type=int, default=200)
     p.add_argument("--export-inference", action="store_true")
     p.add_argument("--init-scale", type=float, default=65536.0)
+    p.add_argument("--precision", choices=("fp16", "fp32"), default="fp16",
+                   help="fp16: autocast+GradScaler (official fp16_run=True "
+                        "semantics); fp32: no autocast/scaler — official "
+                        "s2 config default (fp16_run=false). fp16 proven "
+                        "unstable here: KL exp(-2*logs_p) overflows fp16 "
+                        "range and the scaler collapses (scale 1e-56 in "
+                        "the v2 smoke); use fp32.")
     p.add_argument("--memory-limit-mb", type=int,
                    default=int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "8192")),
                    help="Metal wired limit; 8GB default for training (lead "
@@ -223,7 +230,9 @@ def main(argv=None) -> int:
     def make_fp16(params_f32: dict) -> dict:
         out = {}
         for k, v in params_f32.items():
-            if k.startswith(("sv_emb.", "ge_to512.", "prelu")):
+            if args.precision == "fp32":
+                out[k] = v
+            elif k.startswith(("sv_emb.", "ge_to512.", "prelu")):
                 out[k] = v  # sv family stays fp32 (v2Pro export policy)
             else:
                 out[k] = v.astype(mx.float16)
@@ -240,7 +249,7 @@ def main(argv=None) -> int:
         (ssl, ssl_lengths, spec, spec_lengths, wav, wav_lengths, text,
          text_lengths) = arrays
         net_g.bind(p16)
-        spec16 = spec.astype(mx.float16)
+        spec16 = spec if args.precision == "fp32" else spec.astype(mx.float16)
         y_lengths = spec_lengths  # y frames == spec frames (official)
         # frozen fp32 quantizer block (outside the fp16 graph); commit value
         # feeds loss_gen_all (official kl_ssl*1) and is logged per step
@@ -322,28 +331,36 @@ def main(argv=None) -> int:
 
             # ---- D step (pre-update scale) ----
             (loss_d, dgrads) = mx.value_and_grad(d_loss_fn)(d16, p16, arrays, sv, kd)
-            loss_d_scaled = loss_d * scaler.get_scale()
-            dgrads = {k: v * scaler.get_scale() for k, v in dgrads.items()}
+            if args.precision == "fp16":
+                dgrads = {k: v * scaler.get_scale() for k, v in dgrads.items()}
             mx.eval(loss_d, *dgrads.values())
             optim_d.param_groups[0]["grads"] = {
                 k: v.astype(mx.float32) for k, v in dgrads.items()}
-            scaler.unscale_(optim_d)
+            if args.precision == "fp16":
+                scaler.unscale_(optim_d)
             gn_d = grad_norm_sq(optim_d.param_groups[0]["grads"]) ** 0.5
-            scaler.step(optim_d)
+            if args.precision == "fp16":
+                scaler.step(optim_d)
+            else:
+                optim_d.step()
 
             # ---- G step ----
             (loss_g, parts), ggrads = mx.value_and_grad(g_loss_fn)(
                 p16, d16, arrays, sv, kg)
-            loss_g_scaled = loss_g * scaler.get_scale()
-            ggrads = {k: v * scaler.get_scale() for k, v in ggrads.items()}
+            if args.precision == "fp16":
+                ggrads = {k: v * scaler.get_scale() for k, v in ggrads.items()}
             mx.eval(loss_g, *ggrads.values())
             for g_ in optim_g.param_groups:
                 g_["grads"] = {k: ggrads[k].astype(mx.float32)
                                for k in g_["params"] if k in ggrads}
-            scaler.unscale_(optim_g)
+            if args.precision == "fp16":
+                scaler.unscale_(optim_g)
             gn_g = sum(grad_norm_sq(g_["grads"]) for g_ in optim_g.param_groups) ** 0.5
-            scaler.step(optim_g)
-            scaler.update()
+            if args.precision == "fp16":
+                scaler.step(optim_g)
+                scaler.update()
+            else:
+                optim_g.step()
 
             # ---- logging ----
             if step % args.log_interval == 0 or step == args.steps - 1:
@@ -352,9 +369,9 @@ def main(argv=None) -> int:
                            loss_gen=float(parts[0]), loss_fm=float(parts[1]),
                            loss_mel=float(parts[2]), loss_kl_ssl=float(parts[3]),
                            loss_kl=float(parts[4]),
-                           grad_norm_d=round(gn_d, 3),
-                           grad_norm_g=round(gn_g, 3),
-                           scale=scaler.get_scale(),
+                           grad_norm_d=round(gn_d, 3) if gn_d == gn_d else None,
+                           grad_norm_g=round(gn_g, 3) if gn_g == gn_g else None,
+                           scale=scaler.get_scale() if args.precision == "fp16" else 1.0,
                            lr=optim_g.param_groups[0]["lr"],
                            elapsed=round(time.perf_counter() - t0, 1))
                 print(json.dumps(rec))
@@ -362,12 +379,14 @@ def main(argv=None) -> int:
                 logf.flush()
                 if first_rec is None:
                     first_rec = rec
-            step += 1
-            if step == 1 and first_rec is not None:
-                assert (rec["loss_disc"] != first_rec["loss_disc"]
-                        or rec["loss_mel"] != first_rec["loss_mel"]), \
+            if step == 1:
+                # silent no-train regression net: compare the JUST-FINISHED
+                # step-1 losses against the logged step-0 record
+                assert (float(loss_d) != first_rec["loss_disc"]
+                        or float(parts[2]) != first_rec["loss_mel"]), \
                     "silent no-train: step-1 losses identical to step-0 " \
                     "(optimizer update path dead?)"
+            step += 1
             if args.save_every and step % args.save_every == 0:
                 _save(ckpt_mod, args, optim_g, optim_d, step, epoch, d_fresh)
         epoch += 1

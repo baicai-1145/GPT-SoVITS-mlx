@@ -77,7 +77,7 @@ def export_inference(net_g, masters: dict, params32: dict, hps: dict,
     # enc_p
     a["enc_p.ssl_proj.weight"] = np32(p["enc_p.ssl_proj.weight"])
     a["enc_p.ssl_proj.bias"] = np32(p["enc_p.ssl_proj.bias"])
-    a["enc_p.text_embedding"] = np32(p["enc_p.text_embedding"])
+    a["enc_p.text_embedding"] = np32(p["enc_p.text_embedding.weight"])
     a["enc_p.proj.weight"] = np32(p["enc_p.proj.weight"])
     a["enc_p.proj.bias"] = np32(p["enc_p.proj.bias"])
     for src_pre, dst_pre, n in (
