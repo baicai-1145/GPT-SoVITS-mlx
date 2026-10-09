@@ -104,13 +104,20 @@ def main(argv=None) -> None:
         global _REFRESH_LOCK
         _REFRESH_LOCK = refresh_lock
     device = resolve_device(args.gpu, verbose=True)
+    if device == "gpu":
+        import mlx.core as mx
+        try:
+            mx.metal.set_memory_limit(8 * 1024 * 1024 * 1024)
+        except Exception:
+            pass
+        print("[metal] memory limit set to 8GB", flush=True)
 
     import numpy as np
     import mlx.core as mx
     from mlx.utils import tree_map, tree_flatten
     from gsovits_mlx.pipeline import load_sovits_v3
     from gsovits_mlx.train.lora import inject_lora
-    from gsovits_mlx.train.s2_cfm import S2V3TrainModel
+    from gsovits_mlx.train.s2_cfm import S2V3TrainModel, upcast_training_model
     from gsovits_mlx.train.s2_v3_data import (TextAudioSpeakerLoaderV3V4,
                                               bucket_batches, collate_for)
     from gsovits_mlx.train.optim import AdamW
