@@ -75,6 +75,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-batch-mel", type=int, default=None,
                    help="skip batches whose collated mel width exceeds this"
                         " (smoke memory aid; frames)")
+    p.add_argument("--dit-fp32", action="store_true",
+                   help="force fp32 DiT forward (debug only; banned at "
+                        "max length on this machine — OOM'd twice)")
     p.add_argument("--dump-batches", default=None,
                    help="dump collated batches as npz into this dir and exit"
                         " (for the torch CPU reference driver)")
@@ -147,9 +150,8 @@ def main(argv=None) -> None:
     # -- model ------------------------------------------------------------------
     sovits_dir = os.path.join(args.models_root, args.sovits_dir or args.version)
     model, meta = load_sovits_v3(sovits_dir, args.version)
-    # training runs on an fp32 tree INCLUDING the plain-object attrs the
-    # parameters() walk misses (quantizer embed, DiT) — see helper docstring
-    upcast_training_model(model)
+    # fp32 trunk/LoRA masters + fp16 DiT (official autocast fp16_run=true)
+    upcast_training_model(model, dit_fp16=not args.dit_fp32)
 
     adapters = None if args.no_lora else \
         inject_lora(model.cfm.estimator, rank=args.lora_rank, seed=args.seed)

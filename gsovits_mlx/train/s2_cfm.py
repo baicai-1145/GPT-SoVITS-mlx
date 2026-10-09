@@ -82,19 +82,22 @@ LORA_FULL_TRAIN_PARAM_PREFIXES = ("ref_enc.", "bridge_0.", "wns1.",
 # DiT training forward with LoRA deltas on q/k/v/out projections
 # ---------------------------------------------------------------------------
 
-def upcast_training_model(model: SynthesizerTrnV3) -> None:
-    """Cast ALL weights to fp32 for training — including the ones
-    nn.Module.parameters() does NOT reach (plain-object attributes):
+def upcast_training_model(model: SynthesizerTrnV3,
+                          dit_fp16: bool = True) -> None:
+    """Prepare training weight layout (official autocast semantics).
 
-    * ``model.quantizer.embed`` — plain array on a plain object; leaving it
-      fp16 makes the L2-distance GEMM run at fp16 precision (~0.5 absolute
-      error on ~545-magnitude distances) and flips ~50% of the code picks
-      vs the official fp32 quantizer (measured on batch_002).
-    * ``model.cfm.estimator`` (the DiT) — plain-object holder; fp16 weights
-      gave up to ~12% CFM-loss drift vs the torch fp32 reference.
-
-    Everything inside model.parameters() (enc_p/ref_enc/ssl_proj/bridge/
-    wns1/linear_mel) is upcast through model.update.
+    * trunk (enc_p/ref_enc/ssl_proj/bridge/wns1/linear_mel via
+      model.parameters()) and the plain-object attrs the walk MISSES —
+      ``quantizer.embed`` (fp16 L2-distance GEMM flips ~50% code picks
+      vs fp32 torch; measured on batch_002) and the DiT tree — are
+      upcast to fp32 MASTERS.
+    * with ``dit_fp16=True`` (default; official s2 trains under
+      ``autocast(fp16_run=True)``): the DiT weights are cast BACK to fp16
+      — fp16 forward is the official memory/precision regime, and the
+      frozen base needs no master. LoRA A/B stay fp32 (masters; official
+      peft keeps fp32 params under autocast) and are cast at use time in
+      dit_lora_forward (fp16 B@A + fp16 add matches autocast: the fp32
+      master only matters for the OPTIMIZER update).
     """
     from mlx.utils import tree_map
     model.update(tree_map(lambda v: v.astype(mx.float32) if hasattr(v, "dtype")
@@ -106,6 +109,12 @@ def upcast_training_model(model: SynthesizerTrnV3) -> None:
         blk.attn._qkv_w_cache = None
         blk.attn._cdtype = None
     model.quantizer.embed = model.quantizer.embed.astype(mx.float32)
+    if dit_fp16:
+        est.update(tree_map(lambda v: v.astype(mx.float16) if hasattr(v, "dtype")
+                            else v, est.parameters()))
+        for blk in est.transformer_blocks:
+            blk.attn._qkv_w_cache = None
+            blk.attn._cdtype = None
 
 
 def dit_lora_forward(dit, adapters: dict[str, LoRALinear], xt, prompt, x_lens,
@@ -137,9 +146,12 @@ def dit_lora_forward(dit, adapters: dict[str, LoRALinear], xt, prompt, x_lens,
                 continue
             base_w = getattr(attn, attr)
             saved[(bi, attr)] = base_w
-            # W + B@A (scaling = alpha/r = 1.0); dtype follows the base
-            # weight (fp32 in training)
-            setattr(attn, attr, base_w + (a.lora_B @ a.lora_A).astype(base_w.dtype))
+            # W + B@A (scaling = alpha/r = 1.0), computed in the BASE WEIGHT
+            # dtype: fp16 under official autocast semantics (fp32 LoRA
+            # masters cast at use — the master only matters for the update)
+            delta = (a.lora_B.astype(base_w.dtype)
+                     @ a.lora_A.astype(base_w.dtype))
+            setattr(attn, attr, base_w + delta)
             touched = True
         if touched:
             attn._qkv_w_cache = None
@@ -372,16 +384,13 @@ class S2V3TrainModel:
         see CFMTrainingLoss(det=...)."""
         model = self.model
 
-        # FROZEN TRUNK UNDER stop_gradient: ssl_proj/quantizer/enc_p/
-        # ref_enc/bridge are frozen in LoRA fine-tuning (official
-        # set_no_grad); keeping their graphs alive only wastes memory (the
-        # low-swap jetsam kill at 2026-10-09 18:39 was exactly this). When
-        # LoRA adapters are attached, everything below DiT is a constant.
-        # (Non-LoRA full fine-tune keeps bridge/wns1 trainable — there the
-        # graph must flow, so only apply the cut in the LoRA path.)
-        if self.lora_adapters:
-            spec = mx.stop_gradient(spec)
-            ssl = mx.stop_gradient(ssl)
+        # FROZEN-TRUNK CUT (memory): official set_no_grad freezes ONLY
+        # ssl_proj/quantizer/enc_p in the LoRA trainer; ref_enc (ge),
+        # bridge and wns1 REMAIN TRAINABLE. So the cut severs exactly the
+        # frozen segment: inputs to ssl_proj/enc_p and their output x.
+        # ge/bridge/wns1 keep full graphs (their params receive grads).
+        ssl = mx.stop_gradient(ssl)
+        text = mx.stop_gradient(text)
 
         y_mask = (mx.arange(spec.shape[2])[None, :]
                   < mx.asarray(spec_lengths)[:, None]).astype(spec.dtype)
@@ -397,15 +406,11 @@ class S2V3TrainModel:
             quantized, mx.asarray(spec_lengths), text,
             mx.asarray(text_lengths), ge)
 
+        x = mx.stop_gradient(x)  # enc_p output: frozen segment boundary
         fea = nn.leaky_relu(model.bridge_0(x), 0.01)
         sc = 1.875 if self.version == "v3" else 2.0
         fea = _nearest_interp(fea, int(fea.shape[-1] * sc), scale_factor=sc)
         fea, _ = model.wns1(fea, mx.asarray(mel_lengths), ge)
-        if self.lora_adapters:
-            # DiT (LoRA targets) is the only grad consumer; fea is a constant
-            # conditioning input — cut the graph AFTER wns1 as well.
-            fea = mx.stop_gradient(fea)
-            ge = mx.stop_gradient(ge)
 
         B = ssl.shape[0]
         if det is not None:
