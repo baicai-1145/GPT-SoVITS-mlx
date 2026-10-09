@@ -455,42 +455,37 @@ def bootstrap(cpufast_repo: str | None = None,
 
 def _assert_gpu_allowed(device: str) -> None:
     """GPU-lock discipline (lead mandate, task-2): selecting the Metal device
-    requires holding .tmp/gpu.lock.d (owner file naming this agent/task).
-    The lock dir lives at the MAIN checkout's .tmp (repo-root sibling)."""
+    requires holding the CANONICAL main-repo .tmp/gpu.lock.d (owner file
+    naming this agent/task).
+
+    2026-10-09 postmortem: accepting the first lock found while walking up
+    from here let worktree-local locks authorize GPU use, breaking mutual
+    exclusion (3 concurrent trainers -> machine OOM -> watchdog reboot).
+    Delegating to gsovits_mlx.gpu_lock, whose resolution is cwd-independent
+    (anchored at the package location, topmost .git-bearing ancestor = main
+    repo root) — the bootstrap chdir into CPUFast no longer matters.
+    """
     if device != "gpu":
         return
-    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    # The worktree lives INSIDE the main checkout's tree
-    # (<main>/.pi/herdr-team/<agent>/worktrees/<name>), so walking up the
-    # ancestors covers both the main checkout's .tmp/gpu.lock.d and any
-    # worktree-local one.
-    seen = []
-    d = here
-    while True:
-        lock = os.path.join(d, ".tmp", "gpu.lock.d")
-        if os.path.isdir(lock):
-            # Machine law: the lock is ANONYMOUS discipline -- any fresh,
-            # non-empty owner counts. Do NOT name-match specific agents and
-            # do NOT delegate to gpu_lock.lock_status() here: that walks up
-            # from CWD, which by front-end time is the CPUFast repo
-            # (bootstrap chdir) and never finds this lock.
-            try:
-                owner = open(os.path.join(lock, "owner")).read().strip()
-                fresh = (time.time()
-                         - os.path.getmtime(os.path.join(lock, "owner"))) < 15 * 60
-            except OSError:
-                owner, fresh = "", False
-            if owner and fresh:
-                return
-            raise RuntimeError(
-                f"GPU device requested but gpu.lock is stale/empty "
-                f"(owner={owner!r}, fresh={fresh}); refresh the owner file "
-                "or claim the lock")
-        seen.append(d)
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
+    from gsovits_mlx.gpu_lock import _find_lock, LOCK_STALE_SEC
+
+    found = _find_lock()
+    if found is None:
+        raise RuntimeError(
+            "GPU device requested but no canonical gpu.lock.d found at the "
+            "main-repo .tmp; claim the lock (gpu_lock.acquire_lock) before "
+            "Metal runs")
+    owner, lock = found
+    # Machine law: the lock is ANONYMOUS discipline -- any fresh, non-empty
+    # owner counts. Do NOT name-match specific agents.
+    try:
+        fresh = (time.time()
+                 - os.path.getmtime(os.path.join(lock, "owner"))) < LOCK_STALE_SEC
+    except OSError:
+        fresh = False
+    if owner and fresh:
+        return
     raise RuntimeError(
-        "GPU device requested but no .tmp/gpu.lock.d found (searched: "
-        + ", ".join(seen) + "); claim the lock before Metal runs")
+        f"GPU device requested but gpu.lock is stale/empty "
+        f"(owner={owner!r}, fresh={fresh}); refresh the owner file "
+        "or claim the lock")
