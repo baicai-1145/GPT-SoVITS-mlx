@@ -24,6 +24,7 @@ only the networks.
 from __future__ import annotations
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from ..utils.layers import get_padding
 
@@ -57,7 +58,7 @@ class WeightNormConv1d:
     def weight(self) -> mx.array:
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2), keepdims=True))
-        w = self.weight_g[:, None, None] * v32 / norm
+        w = self.weight_g.reshape(-1)[:, None, None].astype(mx.float32) * v32 / norm
         return w
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -84,9 +85,11 @@ class WeightNormConv2d:
 
     @property
     def weight(self) -> mx.array:
+        """Effective weight in TORCH layout (out, in, kh, kw)."""
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2, 3), keepdims=True))
-        return self.weight_g[:, None, None, None] * v32 / norm
+        w = self.weight_g.reshape(-1)[:, None, None, None].astype(mx.float32) * v32 / norm
+        return w
 
     def __call__(self, x: mx.array) -> mx.array:
         # x: (B, C, H, W) -> (B, H, W, C) channels-last for mx.conv2d
@@ -94,7 +97,8 @@ class WeightNormConv2d:
         if any(self.padding):
             x = mx.pad(x, [(0, 0), (self.padding[0], self.padding[0]),
                            (self.padding[1], self.padding[1]), (0, 0)])
-        w = self.weight.astype(x.dtype)
+        # torch weight (out, in, kh, kw) -> MLX conv2d (out, kh, kw, in)
+        w = mx.transpose(self.weight.astype(x.dtype), (0, 2, 3, 1))
         out = mx.conv2d(x, w, stride=self.stride, padding=(0, 0))
         out = mx.transpose(out, (0, 3, 1, 2))
         return out + self.bias[None, :, None, None]
@@ -120,7 +124,7 @@ class DiscriminatorS:
         fmap = []
         for l in self.convs:
             x = l(x)
-            x = mx.leaky_relu(x, LRELU_SLOPE)
+            x = nn.leaky_relu(x, LRELU_SLOPE)
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
@@ -155,7 +159,7 @@ class DiscriminatorP:
         x = mx.reshape(x, (b, c, t // self.period, self.period))
         for l in self.convs:
             x = l(x)
-            x = mx.leaky_relu(x, LRELU_SLOPE)
+            x = nn.leaky_relu(x, LRELU_SLOPE)
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
@@ -217,9 +221,9 @@ class MultiPeriodDiscriminator:
 
 
 def load_mpd_weights(mpd: MultiPeriodDiscriminator, arrays: dict) -> list:
-    """Load official s2D checkpoint arrays (torch layout) into mpd.
+    """Load s2D npz arrays (ALREADY MLX layouts from train_s2_extract.py:
+    3-D weight_v/weight transposed at extract time) into mpd.
 
-    torch Conv1d weight (out,in,k) -> MLX (out,k,in); Conv2d unchanged layout.
     Returns the official-style missing/unexpected key report.
     """
     src = dict(arrays)
@@ -227,12 +231,7 @@ def load_mpd_weights(mpd: MultiPeriodDiscriminator, arrays: dict) -> list:
     loaded = []
     for name in expected:
         if name in src:
-            a = src.pop(name)
-            if a.ndim == 3 and ".convs." in name:  # Conv1d weight_g/v
-                a = mx.transpose(a, (0, 2, 1))
-            target = mpd.parameters()
-            # assign into the right module attribute
-            _assign(mpd, name, a)
+            _assign(mpd, name, src.pop(name))
             loaded.append(name)
     missing = sorted(expected - set(loaded))
     unexpected = sorted(src.keys())
@@ -240,11 +239,10 @@ def load_mpd_weights(mpd: MultiPeriodDiscriminator, arrays: dict) -> list:
 
 
 def _assign(mpd: MultiPeriodDiscriminator, name: str, a: mx.array) -> None:
-    parts = name.split(".")
-    i, sub, j = int(parts[1]), parts[2], int(parts[4]) if parts[3] == "convs" else None
-    d = mpd.discriminators[i]
-    if parts[3] == "convs":
-        conv = d.convs[j]
+    parts = name.split(".")  # discriminators.<i>.convs.<j>.<field> | ...conv_post.<field>
+    d = mpd.discriminators[int(parts[1])]
+    if parts[2] == "convs":
+        conv = d.convs[int(parts[3])]
     else:
         conv = d.conv_post
     field = parts[-1]

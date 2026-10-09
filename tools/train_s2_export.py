@@ -27,21 +27,35 @@ import numpy as np
 
 
 def _fuse(g: mx.array, v: mx.array) -> mx.array:
-    v32 = v.astype(mx.float32)
-    norm = mx.sqrt(mx.sum(v32 * v32, axis=tuple(range(1, v32.ndim)), keepdims=True))
-    return (g.reshape(-1)[: , None, None][:, : v32.ndim - 1 or 1].reshape(
-        [v32.shape[0]] + [1] * (v32.ndim - 1)) * v32 / norm)
+    """Legacy alias kept for compatibility."""
+    return fuse_wn(g, v)
 
 
 def fuse_wn(g: mx.array, v: mx.array) -> mx.array:
-    """torch weight_norm fuse: w[out] = g[out] * v[out] / ||v[out]||."""
+    """torch weight_norm fuse (dim=0, per OUT-channel): w[o] = g[o]*v[o]/||v[o]||.
+
+    Use for Conv1d-style weights stored MLX (out,k,in) — the norm runs over
+    the trailing axes (k,in) per out-channel."""
     v32 = v.astype(mx.float32)
-    norm = mx.sqrt(mx.sum(v32.reshape(v32.shape[0], -1) ** 2, axis=1,
+    norm = mx.sqrt(mx.sum(mx32_sq(v32).reshape(v32.shape[0], -1), axis=1,
                           keepdims=True))
-    return (g.reshape(-1)[:, None, None][:, :1, :1].reshape(
-        [v32.shape[0]] + [1] * (v32.ndim - 1)) if v32.ndim == 3 else
-        g.reshape(-1)[:, None][:, :1] if v32.ndim == 2 else g.reshape(-1)) \
-        * v32 / norm.reshape([v32.shape[0]] + [1] * (v32.ndim - 1))
+    g1 = g.reshape(-1)[:, None]
+    return (g1 * v32.reshape(v32.shape[0], -1) / norm).reshape(v32.shape)
+
+
+def fuse_wn_t(g: mx.array, v: mx.array) -> mx.array:
+    """ConvTranspose1d weight_norm fuse (per IN-channel).
+
+    torch weight (in,out,k) with weight_g (in,1,1): norm over (out,k) per
+    in-channel. In MLX layout v is (out,k,in), so the norm runs over the
+    LEADING axes (0,1) and g broadcasts on the last axis."""
+    v32 = v.astype(mx.float32)
+    norm = mx.sqrt(mx.sum(v32 * v32, axis=(0, 1), keepdims=True))
+    return v32 / norm * g.reshape(-1)[None, None, :]
+
+
+def mx32_sq(x):
+    return x * x
 
 
 def export_inference(net_g, masters: dict, params32: dict, hps: dict,
@@ -134,8 +148,10 @@ def export_inference(net_g, masters: dict, params32: dict, hps: dict,
     a["dec.conv_pre.weight"] = np32(p["dec.conv_pre.weight"])
     a["dec.conv_pre.bias"] = np32(p["dec.conv_pre.bias"])
     for i in range(len(net_g.dec.ups)):
-        # fused weight is (out,k,in) — same as convert's to_mlx_conv1d_t
-        a[f"dec.ups.{i}.weight"] = fused_np(f"dec.ups.{i}")
+        # ConvTranspose1d: per-IN-channel norm (torch (in,out,k), dim=0 g);
+        # fused result is (out,k,in) — same as convert's to_mlx_conv1d_t
+        a[f"dec.ups.{i}.weight"] = np32(fuse_wn_t(p[f"dec.ups.{i}.weight_g"],
+                                                  p[f"dec.ups.{i}.weight_v"]))
         a[f"dec.ups.{i}.bias"] = np32(p[f"dec.ups.{i}.bias"])
     for i in range(len(net_g.dec.resblocks)):
         for cn in ("convs1", "convs2"):
@@ -155,10 +171,9 @@ def export_inference(net_g, masters: dict, params32: dict, hps: dict,
         for w in ("pre", "post"):
             a[f"flow.{fi}.{w}.weight"] = np32(p[f"{src}.{w}.weight"])
             a[f"flow.{fi}.{w}.bias"] = np32(p[f"{src}.{w}.bias"])
-        # cond: training v is MLX (out,k,in) with k=1; loader wants
-        # cond_layer.weight as (out,1,in)?? pipeline: enc.cond_layer.weight =
-        # g("flow.{fi}.enc.cond") and convert transposed (0,2,1) from torch
-        # (out,in,1) -> (out,1,in). Our fused MLX (out,1,in) IS the target.
+        # cond: training v is MLX (out,1,in); convert transposes the torch
+        # fused (out,in,1) by (0,2,1) -> (out,1,in) — identical to our fused
+        # layout, so no transpose here.
         a[f"flow.{fi}.enc.cond"] = fused_np(f"{src}.enc.cond_layer")
         a[f"flow.{fi}.enc.cond.b"] = np32(p[f"{src}.enc.cond_layer.bias"])
         n_wn = len(wn_flows[fi].enc.in_layers)
@@ -166,10 +181,10 @@ def export_inference(net_g, masters: dict, params32: dict, hps: dict,
             for layer, dst_l in (("in_layers", "in"), ("res_skip_layers", "skip")):
                 fused = fuse_wn(p[f"{src}.enc.{layer}.{wi}.weight_g"],
                                 p[f"{src}.enc.{layer}.{wi}.weight_v"])
-                # training MLX (out,k,in) -> loader wants torch (out,in,k):
-                # convert transposed torch fused by (0,2,1). Undo it.
-                a[f"flow.{fi}.enc.{dst_l}.{wi}"] = np32(
-                    mx.transpose(fused, (0, 2, 1)))
+                # training layout is ALREADY MLX (out,k,in) — the loader
+                # feeds it straight into Conv1d.weight (convert transposed
+                # the torch fused (out,in,k) by (0,2,1) to reach this layout)
+                a[f"flow.{fi}.enc.{dst_l}.{wi}"] = np32(fused)
                 a[f"flow.{fi}.enc.{dst_l}.{wi}.b"] = np32(
                     p[f"{src}.enc.{layer}.{wi}.bias"])
 

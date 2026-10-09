@@ -84,10 +84,22 @@ def extract(path: str, out_npz: str) -> dict:
     arrays = {}
     for k, v in sd.items():
         a = v.float().numpy()
-        if a.ndim == 3 and ".weight" in k and "weight_g" not in k \
-                and "weight_v" not in k and "text_embedding" not in k:
-            # Conv1d / ConvTranspose1d weight -> (out, k, in)
-            a = to_mlx_conv1d(a)
+        # any 3-D conv-ish tensor (plain .weight or weight_v) -> MLX layout;
+        # weight_g is (out,1,1) which transposes to itself.
+        if a.ndim == 3 and k.endswith("weight_v"):
+            # torch ConvTranspose1d weight_v is (in,out,k) -> MLX (out,k,in);
+            # Conv1d weight_v (out,in,k) -> (out,k,in) — same transpose (1,2,0)
+            # only for transpose-conv. Distinguish: dec.ups.* are transpose.
+            if k.startswith("dec.ups."):
+                a = np.ascontiguousarray(a.transpose(1, 2, 0))
+            else:
+                a = to_mlx_conv1d(a)
+        elif a.ndim == 3 and k.endswith(".weight") and "text_embedding" not in k:
+            base = k[:-len(".weight")]
+            if base.startswith("dec.ups."):
+                a = np.ascontiguousarray(a.transpose(1, 2, 0))
+            else:
+                a = to_mlx_conv1d(a)
         arrays[k] = a.astype(np.float32)
     os.makedirs(os.path.dirname(out_npz) or ".", exist_ok=True)
     np.savez(out_npz, **arrays)

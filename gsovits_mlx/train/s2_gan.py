@@ -8,11 +8,10 @@ Training-step semantics replicated from s2_train.py (read line-by-line):
 
   1. fp16 autocast forward of net_g (full SynthesizerTrn.forward including
      the autocast-disabled fp32 ssl_proj+quantizer block; with
-     freeze_quantizer=True those params get NO updates — official no_grad +
-     eval — and commit_loss is 0-weighted into the G loss; we still add
-     kl_ssl*1 which is identically zero for a frozen quantizer... NOTE: the
-     official forward returns the quantizer commit loss; with freeze=True
-     the block is inside no_grad so its loss has no graph and equals 0).
+     freeze_quantizer=True the forward eval()s ssl_proj+quantizer every
+     step, so the VQ self.training branches (commit loss, EMA update) never
+     run: kl_ssl is EXACTLY 0.0, and loss_gen_all's `+ kl_ssl * 1` term is
+     replicated verbatim as a logged 0.0)
   2. mel = spec_to_mel(spec); y_mel = slice_segments(mel, ids_slice, 32);
      y_hat_mel = mel_spectrogram(y_hat) — a FRESH stft on the generated
      20480-sample slice (magnitude -> mel fb -> ln clamp 1e-5).
@@ -469,10 +468,10 @@ class SynthesizerTrnTrain:
         """Returns (y_hat, kl_ssl, ids_slice, y_mask, (z,z_p,m_p,logs_p,m_q,logs_q),
         stats_ssl).
 
-        quantized_in: optional PRECOMPUTED quantized ssl (B, 768, T') fp32 —
-        lets the caller run the frozen fp32 quantizer block once outside the
-        fp16 forward (an implementation detail; numerically identical since
-        the block is frozen/no-grad in the official code too).
+        kl_ssl is the RVQ commit loss VALUE (official: mse(quantized, x)
+        computed even with freeze_quantizer=True — net_g is in train mode, so
+        the VQ layer's self.training branch runs inside the no_grad block;
+        it contributes no gradients but enters loss_gen_all with weight 1).
         """
         y_mask = sequence_mask(y_lengths, y.shape[2]).astype(y.dtype)
         if self.version == "v1":
@@ -487,21 +486,20 @@ class SynthesizerTrnTrain:
             ge512 = mx.transpose(
                 mx.transpose(ge, (0, 2, 1)) @ self.ge_to512_weight.T.astype(ge.dtype)
                 + self.ge_to512_bias.astype(ge.dtype), (0, 2, 1))
-        # frozen fp32 quantizer block (autocast disabled in official)
+        # frozen fp32 quantizer block (autocast disabled in official).
+        # freeze_quantizer=True (official default): forward calls
+        # quantizer.eval() each step -> VQ self.training branches (commit,
+        # EMA) never run -> kl_ssl is EXACTLY 0.0 (official tensor([0.]));
+        # loss_gen_all still adds kl_ssl * 1 verbatim.
         if quantized_in is None:
-            ssl32 = ssl.astype(mx.float32)
-            proj = self.ssl_proj(ssl32)
-            xt = mx.transpose(proj, (0, 2, 1))
-            embed = self.quantizer_embed.astype(mx.float32)
-            d = (mx.sum(xt * xt, axis=-1, keepdims=True)
-                 + mx.sum(embed * embed, axis=-1)[None, None, :]
-                 - 2.0 * xt @ mx.transpose(embed))
-            codes = mx.argmin(d, axis=-1)
-            quantized = mx.transpose(embed[codes], (0, 2, 1))
-            quantized = mx.stop_gradient(quantized)
+            quantized, kl_ssl = self._quantize_ssl(
+                ssl, with_commit=not self.freeze_quantizer)
+            if kl_ssl is None:
+                kl_ssl = mx.zeros((), mx.float32)
+        elif isinstance(quantized_in, tuple):
+            quantized, kl_ssl = quantized_in
         else:
-            quantized = quantized_in
-        kl_ssl = mx.zeros((), mx.float32)  # frozen quantizer -> no commit loss
+            quantized, kl_ssl = quantized_in, mx.zeros((), mx.float32)
         if self.semantic_frame_rate == "25hz":
             quantized = _nearest_interp(quantized, quantized.shape[-1] * 2)
 
@@ -516,8 +514,17 @@ class SynthesizerTrnTrain:
         return (o, kl_ssl, ids_slice, y_mask2,
                 (z, z_p, m_p, logs_p, m_q, logs_q), quantized)
 
-    # -- quantizer precompute (outside the fp16 graph) ------------------------
-    def quantize_ssl(self, ssl: mx.array) -> mx.array:
+    # -- quantizer block (frozen fp32; official autocast-disabled) ------------
+    def _quantize_ssl(self, ssl: mx.array, with_commit: bool = False):
+        """ssl_proj + RVQ layer-0 nearest-code assignment.
+
+        Returns (quantized (B,768,T'), commit_or_None). commit =
+        mse(quantized, proj(ssl)); only computed when with_commit — the
+        official only produces it when the quantizer stays in TRAIN mode
+        (freeze_quantizer=False), since SynthesizerTrn.forward eval()s the
+        quantizer each step when frozen, disabling the self.training
+        commit/EMA branches (kl_ssl is then exactly 0.0).
+        """
         ssl32 = ssl.astype(mx.float32)
         proj = self.ssl_proj(ssl32)
         xt = mx.transpose(proj, (0, 2, 1))
@@ -526,7 +533,18 @@ class SynthesizerTrnTrain:
              + mx.sum(embed * embed, axis=-1)[None, None, :]
              - 2.0 * xt @ mx.transpose(embed))
         codes = mx.argmin(d, axis=-1)
-        return mx.stop_gradient(mx.transpose(embed[codes], (0, 2, 1)))
+        q = mx.transpose(embed[codes], (0, 2, 1))
+        commit = mx.mean((q - proj) ** 2) if with_commit else None
+        return mx.stop_gradient(q), commit
+
+    def quantize_ssl(self, ssl: mx.array) -> tuple:
+        """Returns (quantized, kl_ssl) — pass as forward(quantized_in=).
+
+        kl_ssl follows official freeze_quantizer semantics: exactly 0.0
+        when frozen (quantizer.eval() each forward), mse commit otherwise.
+        """
+        q, commit = self._quantize_ssl(ssl, with_commit=not self.freeze_quantizer)
+        return q, commit if commit is not None else mx.zeros((), mx.float32)
 
     # -- parameter names -------------------------------------------------------
     def parameter_names(self, include_frozen: bool = False) -> list[str]:
@@ -540,7 +558,7 @@ class SynthesizerTrnTrain:
         names = []
         ep = "enc_p."
         names += [f"{ep}ssl_proj.weight", f"{ep}ssl_proj.bias"]
-        names += [f"{ep}text_embedding"]
+        names += [f"{ep}text_embedding.weight"]
         names += [f"{ep}proj.weight", f"{ep}proj.bias"]
         for pre, n in ((f"{ep}encoder_ssl", len(self.enc_p.encoder_ssl.attn_layers)),
                        (f"{ep}encoder_text", len(self.enc_p.encoder_text.attn_layers)),
@@ -593,7 +611,7 @@ class SynthesizerTrnTrain:
     # names grouped for the official low-lr param groups
     def text_low_lr_names(self) -> list[str]:
         out = []
-        out += ["enc_p.text_embedding"]
+        out += ["enc_p.text_embedding.weight"]
         out += _encoder_param_names("enc_p.encoder_text",
                                     len(self.enc_p.encoder_text.attn_layers))
         out += _mrte_param_names("enc_p.mrte")

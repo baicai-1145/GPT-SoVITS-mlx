@@ -103,7 +103,9 @@ def parse_args(argv=None):
     p.add_argument("--export-inference", action="store_true")
     p.add_argument("--init-scale", type=float, default=65536.0)
     p.add_argument("--memory-limit-mb", type=int,
-                   default=int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "3072")))
+                   default=int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "8192")),
+                   help="Metal wired limit; 8GB default for training (lead "
+                        "advisory after a 13GB runaway kill; env override)")
     p.add_argument("--cpu", action="store_true",
                    help="debug-only CPU run (tiny steps; the full model "
                         "does NOT fit CPU time budgets)")
@@ -116,6 +118,8 @@ def main(argv=None) -> int:
     import mlx.core as mx
     if device == "gpu":
         try:
+            mx.set_memory_limit(args.memory_limit_mb * 1024 * 1024)
+        except AttributeError:
             mx.metal.set_memory_limit(args.memory_limit_mb * 1024 * 1024)
         except Exception as e:  # noqa: BLE001
             print(f"[mem] limit not set: {e}", file=sys.stderr)
@@ -171,7 +175,7 @@ def main(argv=None) -> int:
 
     # ---- optimizers ----
     all_names = net_g.parameter_names()
-    text_emb = [n for n in all_names if n == "enc_p.text_embedding"]
+    text_emb = [n for n in all_names if n == "enc_p.text_embedding.weight"]
     enc_text = [n for n in all_names if n.startswith("enc_p.encoder_text")]
     mrte = [n for n in all_names if n.startswith("enc_p.mrte")]
     low = set(text_emb + enc_text + mrte)
@@ -203,6 +207,12 @@ def main(argv=None) -> int:
         TRAIN["sampling_rate"], TRAIN["filter_length"],
         TRAIN["n_mel_channels"], TRAIN["mel_fmin"], TRAIN["mel_fmax"]))
 
+    # frozen fp32 block (official autocast-disabled): ssl_proj + quantizer
+    # stay fp32 and are never optimized; carried inside p16 so bind() sees
+    # them and the quantizer math matches official exactly.
+    frozen32 = {n: params32[n] for n in net_g.parameter_names(include_frozen=True)
+                if n not in set(all_names)}
+
     def make_fp16(params_f32: dict) -> dict:
         out = {}
         for k, v in params_f32.items():
@@ -210,6 +220,7 @@ def main(argv=None) -> int:
                 out[k] = v  # sv family stays fp32 (v2Pro export policy)
             else:
                 out[k] = v.astype(mx.float16)
+        out.update(frozen32)  # fp32 constants (ssl_proj/quantizer)
         return out
 
     # ---- traced losses --------------------------------------------------------
@@ -224,11 +235,13 @@ def main(argv=None) -> int:
         net_g.bind(p16)
         spec16 = spec.astype(mx.float16)
         y_lengths = spec_lengths  # y frames == spec frames (official)
-        quantized = net_g.quantize_ssl(ssl)  # fp32 frozen block, no p16 deps
+        # frozen fp32 quantizer block (outside the fp16 graph); commit value
+        # feeds loss_gen_all (official kl_ssl*1) and is logged per step
+        quant, commit = net_g.quantize_ssl(ssl)
         o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
             net_g.forward(ssl, spec16, y_lengths, text.astype(mx.int32),
                           text_lengths, sv_emb=sv, key=key,
-                          quantized_in=quantized)
+                          quantized_in=(quant, commit))
         mel = G.spec_to_mel(spec.astype(mx.float32), mel_basis)
         y_mel = G.slice_segments(mel, ids_slice, seg_frames)
         y_hat_mel = G.mel_spectrogram_train(
@@ -236,7 +249,7 @@ def main(argv=None) -> int:
             TRAIN["filter_length"], TRAIN["hop_length"], TRAIN["win_length"])
         y = G.slice_segments(wav, ids_slice * TRAIN["hop_length"],
                              TRAIN["segment_size"])
-        return o, y, y_mel, y_hat_mel, kl_ssl, \
+        return o, y, y_mel, y_hat_mel, kl_ssl, commit, \
             (z, z_p, m_p, logs_p, m_q, logs_q), y_mask
 
     def d_loss_fn(d16, p16, arrays, sv, key):
@@ -251,7 +264,7 @@ def main(argv=None) -> int:
 
     def g_loss_fn(p16, d16, arrays, sv, key):
         """G loss wrt p16; D under captured d16 (constants)."""
-        o, y, y_mel, y_hat_mel, kl_ssl, ql, y_mask = g_forward(
+        o, y, y_mel, y_hat_mel, kl_ssl, commit, ql, y_mask = g_forward(
             p16, arrays, sv, key)
         z, z_p, m_p, logs_p, m_q, logs_q = ql
         loss_mel = mx.mean(mx.abs(y_mel - y_hat_mel)) * TRAIN["c_mel"]
@@ -261,6 +274,7 @@ def main(argv=None) -> int:
         y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y32, o.astype(mx.float32))
         loss_fm = G.feature_loss(fmap_r, fmap_g)
         loss_gen, _ = G.generator_loss(y_d_hat_g)
+        # official: loss_gen + loss_fm + loss_mel + kl_ssl * 1 + loss_kl
         return (loss_gen + loss_fm + loss_mel + kl_ssl * 1.0 + loss_kl,
                 (loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl))
 
@@ -270,7 +284,7 @@ def main(argv=None) -> int:
     key = mx.random.key(args.seed)
     t0 = time.perf_counter()
     stop = False
-    parts_log = {}
+    first_rec = None
 
     def grad_norm_sq(gr):
         return sum(float(mx.sum(g_.astype(mx.float32) ** 2)) for g_ in gr.values())
@@ -332,7 +346,14 @@ def main(argv=None) -> int:
                 print(json.dumps(rec))
                 logf.write(json.dumps(rec) + "\n")
                 logf.flush()
+                if first_rec is None:
+                    first_rec = rec
             step += 1
+            if step == 1 and first_rec is not None:
+                assert (rec["loss_disc"] != first_rec["loss_disc"]
+                        or rec["loss_mel"] != first_rec["loss_mel"]), \
+                    "silent no-train: step-1 losses identical to step-0 " \
+                    "(optimizer update path dead?)"
             if args.save_every and step % args.save_every == 0:
                 _save(ckpt_mod, args, optim_g, optim_d, step, epoch, d_fresh)
         epoch += 1

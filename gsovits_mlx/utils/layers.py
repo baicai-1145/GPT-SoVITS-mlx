@@ -153,7 +153,7 @@ class Conv1d(nn.Module):
             return self.weight.astype(dtype)
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2), keepdims=True))
-        w = self.weight_g[:, None, None].astype(mx.float32) * v32 / norm
+        w = self.weight_g.reshape(-1)[:, None, None].astype(mx.float32) * v32 / norm
         return w.astype(dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -187,20 +187,24 @@ class ConvTranspose1d(nn.Module):
         self.padding = padding
 
     def effective_weight(self, dtype):
-        """(out, k, in) MLX-layout effective weight."""
+        """(out, k, in) MLX-layout effective weight (torch weight_norm dim=0).
+
+        torch ConvTranspose1d weight is (in, out, k) with weight_g (in,1,1):
+        the norm is over (out,k) PER IN-CHANNEL. In MLX layout (out,k,in)
+        that means normalize over axes (0,1) and broadcast g on the last.
+        """
         if self.weight_v is None:
             return self.weight.astype(dtype)
         v32 = self.weight_v.astype(mx.float32)
-        norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2), keepdims=True))
-        w = self.weight_g[:, None, None].astype(mx.float32) * v32 / norm
+        norm = mx.sqrt(mx.sum(v32 * v32, axis=(0, 1), keepdims=True))
+        w = v32 / norm * self.weight_g.reshape(1, 1, -1).astype(mx.float32)
         return w.astype(dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
-        w = self.effective_weight(dtype)        # (out, k, in)
-        w_t = mx.transpose(w, (2, 0, 1))       # -> (in, k, out) kernel layout
+        w = self.effective_weight(dtype)  # (out, k, in) == mx kernel layout
         x = mx.transpose(x, (0, 2, 1))
-        out = mx.conv_transpose1d(x, w_t, stride=self.stride, padding=self.padding)
+        out = mx.conv_transpose1d(x, w, stride=self.stride, padding=self.padding)
         out = mx.transpose(out, (0, 2, 1))
         if self.bias is not None:
             out = out + self.bias[None, :, None].astype(out.dtype)
