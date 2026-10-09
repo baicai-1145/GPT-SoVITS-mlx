@@ -24,22 +24,90 @@ import time
 LOCK_STALE_SEC = 15 * 60
 
 
-def _find_lock() -> tuple[str, str] | None:
-    """Return (owner_text, lock_dir) for the first gpu.lock.d found walking
-    up from CWD (covers the main checkout and any worktrees inside it)."""
-    d = os.getcwd()
+def _repo_root() -> str:
+    """Main-repo root for THIS checkout, even inside a git worktree.
+
+    All agents (including teammates in .pi/herdr-team/*/worktrees/*, which
+    physically live INSIDE the main checkout's tree) must serialize on ONE
+    lock: the main checkout's .tmp/gpu.lock.d. A worktree-local lock is
+    invisible to processes launched from the main repo and has caused a
+    3-way concurrent-GPU OOM + watchdog reboot (2026-10-09) — never create
+    or honor one.
+
+    Resolution: walk up from this file's location (source of truth, cwd
+    independent) to the outermost directory containing a .git marker. For
+    the main checkout that is the repo root; for a worktree copy of this
+    package it is the worktree root, whose PARENT CHAIN still leads to the
+    main root — so we keep walking to the topmost .git-bearing ancestor,
+    which for in-tree worktrees is the MAIN repo root.
+    """
+    best = os.path.dirname(os.path.abspath(__file__))
+    d = best
     while True:
-        lock = os.path.join(d, ".tmp", "gpu.lock.d")
-        if os.path.isdir(lock):
-            try:
-                owner = open(os.path.join(lock, "owner")).read().strip()
-            except OSError:
-                owner = ""
-            return owner, lock
         parent = os.path.dirname(d)
+        if os.path.exists(os.path.join(parent, ".git")):
+            best = parent  # remember topmost .git-bearing ancestor
         if parent == d:
-            return None
+            return best
         d = parent
+
+
+def lock_dir() -> str:
+    """Canonical lock dir: <main-repo-root>/.tmp/gpu.lock.d (single lock)."""
+    return os.path.join(_repo_root(), ".tmp", "gpu.lock.d")
+
+
+def _find_lock() -> tuple[str, str] | None:
+    """Return (owner_text, lock_dir) for the CANONICAL main-repo lock.
+
+    Historical note: this used to walk up from CWD and accept the first
+    gpu.lock.d found, which let worktree-local locks authorize GPU use —
+    mutual exclusion broke (concurrent trainers, machine OOM/watchdog
+    reboot). Now only the single main-repo lock counts; CWD is irrelevant.
+    """
+    lock = lock_dir()
+    if not os.path.isdir(lock):
+        return None
+    try:
+        owner = open(os.path.join(lock, "owner")).read().strip()
+    except OSError:
+        owner = ""
+    return owner, lock
+
+
+def acquire_lock(owner_text: str) -> str:
+    """Create the canonical main-repo lock; SystemExit if already held.
+
+    Every GPU run MUST acquire via this helper (atomic mkdir; owner file
+    names tool+task+agent+timestamp). Raises SystemExit with the current
+    owner if the lock exists — never work around it by making a local lock.
+    """
+    lock = lock_dir()
+    try:
+        os.makedirs(lock, exist_ok=False)
+    except FileExistsError:
+        try:
+            cur = open(os.path.join(lock, "owner")).read().strip()
+        except OSError:
+            cur = "<unreadable>"
+        raise SystemExit(
+            f"[gpu.lock] held by {cur!r}; ONE GPU process at a time "
+            "(AGENTS.md). Wait, or take over only if stale (>15 min, "
+            "then rm -rf the dir and re-acquire).")
+    with open(os.path.join(lock, "owner"), "w") as f:
+        f.write(f"{owner_text} {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    return lock
+
+
+def refresh_lock() -> None:
+    """Touch the owner file (long tasks: refresh at least every 15 min)."""
+    os.utime(os.path.join(lock_dir(), "owner"))
+
+
+def release_lock() -> None:
+    """Remove the lock (no-op when absent). Only the owner releases."""
+    import shutil
+    shutil.rmtree(lock_dir(), ignore_errors=True)
 
 
 def lock_status() -> tuple[bool, str]:
