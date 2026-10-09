@@ -261,6 +261,7 @@ def main(argv=None) -> None:
     # -- loop ------------------------------------------------------------------------
     t0 = time.time()
     step = start_step
+    n_bad = 0
     max_steps = args.steps if args.steps > 0 else None
     stop = False
     for epoch in range(args.epochs):
@@ -273,12 +274,26 @@ def main(argv=None) -> None:
                 continue
             if use_ckpt:
                 loss_f, info, grads = tm.train_loss_and_grads(masters, batch)
+                import math as _math
+                if not _math.isfinite(loss_f) or any(
+                        _math.isnan(float(mx.abs(g).max())) for g in grads.values()):
+                    n_bad += 1
+                    print(f"[warn] step {step+1}: non-finite loss/grads — "
+                          f"skipping batch (mel_lengths={batch.mel_lengths}, "
+                          f"melT={batch.mel.shape[-1]})", flush=True)
+                    if n_bad > 10:
+                        raise SystemExit("too many non-finite batches")
+                    continue
                 opt.set_grads(0, grads)
                 opt.step()
                 sync_adapters()
                 loss = loss_f
                 trainer.step += 1
                 trainer._log(loss)
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
                 from gsovits_mlx.train.loop import FootprintSampler
                 _fp = FootprintSampler.read_phys_footprint(os.getpid())
                 if _fp > 8 * 1024 * 1024 * 1024:
