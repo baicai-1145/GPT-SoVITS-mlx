@@ -55,6 +55,8 @@ from __future__ import annotations
 import math
 import random
 
+import numpy as np
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -147,11 +149,9 @@ def dit_lora_forward(dit, adapters: dict[str, LoRALinear], xt, prompt, x_lens,
             base_w = getattr(attn, attr)
             saved[(bi, attr)] = base_w
             # W + B@A (scaling = alpha/r = 1.0), computed in the BASE WEIGHT
-            # dtype: fp16 under official autocast semantics (fp32 LoRA
-            # masters cast at use — the master only matters for the update)
-            delta = (a.lora_B.astype(base_w.dtype)
-                     @ a.lora_A.astype(base_w.dtype))
-            setattr(attn, attr, base_w + delta)
+            # dtype (fp32 here — see ckpt variant below for why fp16 is
+            # unusable for the BACKWARD: grads overflow past block ~8)
+            setattr(attn, attr, base_w + (a.lora_B @ a.lora_A).astype(base_w.dtype))
             touched = True
         if touched:
             attn._qkv_w_cache = None
@@ -164,6 +164,81 @@ def dit_lora_forward(dit, adapters: dict[str, LoRALinear], xt, prompt, x_lens,
         if any_touched:
             for block in dit.transformer_blocks:
                 block.attn._qkv_w_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Two-pass checkpointed LoRA DiT forward+backward (s1 train_loss_and_grads
+# pattern). WHY: the fused-graph LoRA forward above holds ALL 22 blocks'
+# activation graphs (jetsam'd the machine at T=952), and the fp16 alternative
+# NaNs in BACKWARD (grad magnitudes grow block-on-block and overflow fp16
+# past block ~8; forward stays finite — see .tmp probes 2026-10-09). The
+# two-pass form keeps ONLY the block inputs (B×T×1024 fp32) and recomputes
+# one block at a time during backward — one block's graph alive at any
+# moment. fp32 weights everywhere: no overflow, and fwd/bwd numerics equal
+# the parity-verified fp32 path (grad check vs the fused path is the test).
+# ---------------------------------------------------------------------------
+
+def dit_ckpt_heads(dit, xt, prompt, x_lens, t, d, mu):
+    """Eager head: everything before block 0 and after the last block.
+
+    Returns (h0, tail_fn) where tail_fn(h) finishes the estimator. Both
+    parts are eval'd/severed from the frozen-trunk graph; LoRA deltas are
+    NOT applied here (blocks own them in the ckpt path).
+    """
+    x = mx.transpose(xt, (0, 2, 1))
+    cond = mx.transpose(prompt, (0, 2, 1))
+    text = mx.transpose(mu, (0, 2, 1))
+    seq_len = x.shape[1]
+    mask = (mx.arange(seq_len)[None, :]
+            < mx.asarray(x_lens)[:, None].astype(mx.float32))
+    mask = mask.astype(mx.bool_)
+    text_embed = dit.text_embed(text.astype(mx.float32), seq_len)
+    h = dit.input_embed(x, cond, text_embed)
+    rope = dit._rope(seq_len, mx.float32)
+    t0w = getattr(dit.time_embed, "time_mlp_0_w", None)
+    td = t0w.dtype if t0w is not None else mx.float32
+    emb = dit.time_embed(t.astype(td))
+    if getattr(dit, "use_step_embedding", False):
+        d0w = getattr(dit.d_embed, "time_mlp_0_w", None)
+        dtd = d0w.dtype if d0w is not None else mx.float32
+        emb = emb + dit.d_embed(d.astype(dtd))
+    mx.eval(h, rope, emb)
+
+    def tail(h_last):
+        y = h_last
+        if dit.long_skip_w is not None:
+            # NOTE: long_skip needs the PRE-block residual; h0 is that only
+            # when no blocks ran. For v3 (long_skip absent) this is exact.
+            if getattr(dit, "_ckpt_h0", None) is not None:
+                y = mx.concatenate([y, dit._ckpt_h0], axis=-1) @ dit.long_skip_w.T
+        y = dit.norm_out(y, emb)
+        return y @ dit.proj_out_w.T + dit.proj_out_b
+
+    return h, mask, rope, emb, tail
+
+
+def dit_ckpt_block_fwd(dit, adapters, i, h, mask, rope, emb):
+    """Block i forward with LoRA delta materialized (differentiable)."""
+    block = dit.transformer_blocks[i]
+    attn = block.attn
+    saved = {}
+    for suffix, attr in (("to_q", "to_q_w"), ("to_k", "to_k_w"),
+                         ("to_v", "to_v_w"), ("to_out.0", "to_out_0_w")):
+        a = adapters.get(f"dit.blocks.{i}.attn.{suffix}")
+        if a is None:
+            continue
+        base_w = getattr(attn, attr)
+        saved[attr] = base_w
+        setattr(attn, attr, base_w + (a.lora_B @ a.lora_A).astype(base_w.dtype))
+    if saved:
+        attn._qkv_w_cache = None
+    try:
+        return block(h, emb, mask, rope)
+    finally:
+        for attr, w in saved.items():
+            setattr(attn, attr, w)
+        if saved:
+            attn._qkv_w_cache = None
 
 
 def dit_sequence_mask(x_lens, max_length: int) -> mx.array:
@@ -373,6 +448,302 @@ class S2V3TrainModel:
                                     x_lens, t, d, mu)
         return self.model.cfm.estimator(
             xt, prompt, x_lens, t, d, mu, use_grad_ckpt=False)
+
+    # -- two-pass checkpointed training (memory-safe DiT backward) -------------
+    def _prep_ckpt(self, ssl, spec, mel, ssl_lengths, spec_lengths, text,
+                   text_lengths, mel_lengths, det):
+        """Shared trunk prep for the checkpointed path: returns everything
+        the CFM loss needs plus the (eval'd, severed) DiT head state."""
+        model = self.model
+        ssl = mx.stop_gradient(ssl)
+        text = mx.stop_gradient(text)
+
+        y_mask = (mx.arange(spec.shape[2])[None, :]
+                  < mx.asarray(spec_lengths)[:, None]).astype(spec.dtype)
+        y_mask = y_mask[:, None, :]
+        # ge side is TRAINABLE — run under the value_and_grad of the outer
+        # trunk loss (kept small: ref_enc output is (B, 512)).
+        ge = model.ref_enc(spec[:, :704] * y_mask, y_mask)
+
+        sslp = model.ssl_proj(ssl)
+        codes = model.quantizer.encode(sslp)
+        quantized = model.quantizer.decode(codes)
+        quantized = _nearest_interp(quantized, quantized.shape[-1] * 2)
+        x, m_p, logs_p, y_mask2 = model.enc_p(
+            quantized, mx.asarray(spec_lengths), text,
+            mx.asarray(text_lengths), ge)
+        x = mx.stop_gradient(x)
+        fea = nn.leaky_relu(model.bridge_0(x), 0.01)
+        sc = 1.875 if self.version == "v3" else 2.0
+        fea = _nearest_interp(fea, int(fea.shape[-1] * sc), scale_factor=sc)
+        fea, _ = model.wns1(fea, mx.asarray(mel_lengths), ge)
+        return ge, fea
+
+    def train_loss_and_grads(self, masters: dict, batch: dict,
+                             det: dict | None = None) \
+            -> tuple[float, dict, dict]:
+        """Checkpointed forward+backward (s1 pattern; see dit_ckpt_* docs).
+
+        Pass 1 (eager): trunk to fea (severed after enc_p); DiT head
+        (input_embed/rope/emb) eval'd; blocks run one at a time keeping
+        ONLY h_i inputs; small tail (norm_out/proj_out) + CFM loss build
+        the only live graphs besides the current block.
+        Pass 2 (backward): grad of (tail+CFM-loss) wrt h_L; then per block
+        i=L-1..0 grad of (block(h_i) * g_{i+1}).sum() wrt (h_i, lora A/B);
+        then grad of the ge-side trunk loss (ref_enc/bridge/wns1) through
+        the small fea-graph.
+        Returns (loss_f, info, grads {name: fp32}).
+        """
+        import random as _random
+        model = self.model
+        est = model.cfm.estimator
+        adapters = self.adapter_by_name if self.use_lora else {}
+
+        b_np = {k: np.asarray(v) for k, v in batch.items()}
+        B = b_np["ssl"].shape[0]
+        mel_lengths = mx.array(b_np["mel_lengths"].astype(np.float32))
+        spec_lengths = mx.array(b_np["spec_lengths"])
+
+        # -- pass 1a: trunk (ge side differentiable, frozen side severed) ---
+        def trunk_loss(p):
+            self.apply_params({k: v for k, v in p.items()
+                               if not k.startswith("dit.")})
+            ge, fea = self._prep_ckpt(
+                mx.array(b_np["ssl"]), mx.array(b_np["spec"]),
+                mx.array(b_np["mel"]), mx.array(b_np["ssl_lengths"]),
+                spec_lengths, mx.array(b_np["text"].astype(np.int32)),
+                mx.array(b_np["text_lengths"]), mel_lengths, None)
+            return ge, fea
+
+        # frozen side runs once (no grads needed): ge/fea values
+        self.apply_params({k: v for k, v in masters.items()
+                           if not k.startswith("dit.")})
+        ge, fea = self._prep_ckpt(
+            mx.array(b_np["ssl"]), mx.array(b_np["spec"]),
+            mx.array(b_np["mel"]), mx.array(b_np["ssl_lengths"]),
+            spec_lengths, mx.array(b_np["text"].astype(np.int32)),
+            mx.array(b_np["text_lengths"]), mel_lengths, None)
+
+        # -- CFM state (same draw logic as CFMTrainingLoss) ------------------
+        ml_np = b_np["mel_lengths"]
+        if det is not None:
+            t = det["t"].astype(mx.float32)
+            x0_full = det["x0"].astype(mx.float32)
+            gate = det["gate"]
+            pl = [int(p) for p in det["prompt_lens"]]
+        else:
+            key = mx.random.key(random.getrandbits(63))
+            key, sub = mx.random.split(key)
+            t = mx.random.uniform(0.0, 1.0, (B,), key=key).astype(mx.float32)
+            x0_full = mx.random.normal((B, 100, b_np["mel"].shape[2]), key=sub)
+            gate = self.rng.random()
+            pr = mx.random.uniform(0.0, 1.0, (B,), key=sub)
+            pr_np = np.asarray(pr)
+            pl = []
+            for i in range(B):
+                pl.append(int(np.floor(pr_np[i] * (ml_np[i] * 2.0 / 3.0))))
+
+        minn = min(b_np["mel"].shape[2], fea.shape[-1])
+        mel = mx.array(b_np["mel"])[:, :, :minn]
+        fea = fea[:, :, :minn]
+        x0 = x0_full[:, :, :minn]
+        vt = mel - x0
+        xt = x0 + t[:, None, None] * vt
+        dt = mx.zeros((B,), dtype=mx.float32)
+        prompt = mx.zeros_like(mel)
+        for i in range(B):
+            if pl[i] > 0:
+                prompt[i, :, :pl[i]] = mel[i, :, :pl[i]]
+                xt[i, :, :pl[i]] = 0.0
+        x_lens = mel_lengths
+
+        info = {"two_step": False}
+        if gate < 0.3:
+            info["two_step"] = True
+            base = mx.array([self.rng.randint(2, 7) for _ in range(B)],
+                            dtype=mx.float32)
+            d = 1.0 / mx.power(2.0, base)
+            d_input = mx.where(d < 1e-2, mx.zeros_like(d), d)
+            v1 = mx.stop_gradient(mx.transpose(
+                self._estimator(xt, prompt, x_lens, t, d_input, fea), (0, 2, 1)))
+            mx.eval(v1)
+            x_mid = xt + d[:, None, None] * v1
+            v2 = mx.stop_gradient(mx.transpose(
+                self._estimator(x_mid, prompt, x_lens, t + d, d_input, fea),
+                (0, 2, 1)))
+            mx.eval(v2)
+            vt = mx.stop_gradient((v1 + v2) / 2)
+            mx.eval(vt)
+            dt = 2 * d
+
+        # -- pass 1b: DiT head + eager block walk ----------------------------
+        xt_t = mx.stop_gradient(xt)
+        prompt_t = mx.stop_gradient(prompt)
+        h0, mask, rope, emb, tail = dit_ckpt_heads(
+            est, xt_t, prompt_t, x_lens, t, dt, fea)
+        est._ckpt_h0 = h0  # long_skip residual (v3: unused)
+        hs = [h0]
+        h = h0
+        for i in range(len(est.transformer_blocks)):
+            h = dit_ckpt_block_fwd(est, adapters, i, h, mask, rope, emb)
+            mx.eval(h)
+            hs.append(h)
+
+        # -- tail + CFM loss (live graph; small) -----------------------------
+        def tail_loss(h_last):
+            y = est.norm_out(h_last, emb)
+            out = y @ est.proj_out_w.T + est.proj_out_b
+            vt_pred = mx.transpose(out, (0, 2, 1))
+            total = mx.zeros((), dtype=mx.float32)
+            for i in range(B):
+                lo, hi = pl[i], int(ml_np[i])
+                if hi <= lo:
+                    continue
+                pred = vt_pred[i, :, lo:hi].astype(mx.float32)
+                tgt = vt[i, :, lo:hi].astype(mx.float32)
+                total = total + mx.sum((pred - tgt) ** 2) / pred.size
+            return total / B
+
+        loss, g_h = mx.value_and_grad(tail_loss)(hs[-1])
+        mx.eval(loss, g_h)
+        loss_f = float(loss)
+
+        grads = {}
+
+        # -- pass 2: blocks, one at a time ------------------------------------
+        g = g_h
+        for i in range(len(est.transformer_blocks) - 1, -1, -1):
+            block = est.transformer_blocks[i]
+            lora_params = []
+            names = []
+            for suffix in ("to_q", "to_k", "to_v", "to_out.0"):
+                nm = f"dit.blocks.{i}.attn.{suffix}"
+                if nm in adapters:
+                    lora_params.extend([masters[f"{nm}.lora_A"],
+                                        masters[f"{nm}.lora_B"]])
+                    names.extend([f"{nm}.lora_A", f"{nm}.lora_B"])
+
+            def red(hh, *lp, _i=i, _np=lora_params, _names=names):
+                # recompute block i with CURRENT lora params
+                a_map = {}
+                for j, nm in enumerate(_names):
+                    suffix = nm.rsplit(".", 2)[-2] if nm.endswith("B") \
+                        else nm.rsplit(".", 2)[-2]
+                    base = nm.rsplit(".", 1)[0]
+                    a_map.setdefault(base, {})["A" if nm.endswith("A") else "B"] = lp[j]
+                block = est.transformer_blocks[_i]
+                attn = block.attn
+                saved = {}
+                for suffix, attr in (("to_q", "to_q_w"), ("to_k", "to_k_w"),
+                                     ("to_v", "to_v_w"),
+                                     ("to_out.0", "to_out_0_w")):
+                    nm2 = f"dit.blocks.{_i}.attn.{suffix}"
+                    if nm2 not in a_map:
+                        continue
+                    base_w = getattr(attn, attr)
+                    saved[attr] = base_w
+                    A = a_map[nm2]["A"]
+                    Bm = a_map[nm2]["B"]
+                    setattr(attn, attr,
+                            base_w + (Bm @ A).astype(base_w.dtype))
+                if saved:
+                    attn._qkv_w_cache = None
+                try:
+                    out = block(hh, emb, mask, rope)
+                    return (out.astype(mx.float32) * g.astype(mx.float32)).sum()
+                finally:
+                    for attr, w in saved.items():
+                        setattr(attn, attr, w)
+                    if saved:
+                        attn._qkv_w_cache = None
+
+            if lora_params:
+                res = mx.grad(red, argnums=tuple(range(len(lora_params) + 1)))(
+                    hs[i], *lora_params)
+                g = res[0]
+                for j, nm in enumerate(names):
+                    grads[nm] = res[j + 1].astype(mx.float32)
+                mx.eval(g, *(grads[nm] for nm in names))
+            else:
+                # no adapters on this block (shouldn't happen for v3)
+                def red0(hh, _i=i):
+                    out = est.transformer_blocks[_i](hh, emb, mask, rope)
+                    return (out.astype(mx.float32) * g.astype(mx.float32)).sum()
+                g = mx.grad(red0)(hs[i])
+                mx.eval(g)
+
+        # -- ge-side trunk grads (small graph) --------------------------------
+        def full_trunk_loss(p):
+            self.apply_params(p)
+            ge2, fea2 = self._prep_ckpt(
+                mx.array(b_np["ssl"]), mx.array(b_np["spec"]),
+                mx.array(b_np["mel"]), mx.array(b_np["ssl_lengths"]),
+                spec_lengths, mx.array(b_np["text"].astype(np.int32)),
+                mx.array(b_np["text_lengths"]), mel_lengths, None)
+            # reduce like the DiT consumption: fea enters the (severed) head;
+            # its gradient is g_fea — but head is severed, so chain manually:
+            # dL/dfea = dL/d(mu) of the tail... not available. Use the
+            # straight trick: fea only enters via the head; grad wrt fea is
+            # obtained from the head-loss recomputation below.
+            return ge2, fea2
+
+        # gradient of tail wrt fea (mu input) — recompute tail with fea live:
+        # the head path input_embed consumes fea; recompute h-side grad:
+        # (kept simple: re-run input_embed+tail as a function of fea)
+        def head_fea_loss(fea_p):
+            x = mx.stop_gradient(xt_t).transpose(0, 2, 1)
+            cond = mx.stop_gradient(prompt_t).transpose(0, 2, 1)
+            seq_len = x.shape[1]
+            text_embed = est.text_embed(mx.stop_gradient(
+                fea_p).transpose(0, 2, 1).astype(mx.float32), seq_len)
+            hh = est.input_embed(x, cond, text_embed)
+            for i in range(len(est.transformer_blocks)):
+                hh = dit_ckpt_block_fwd(est, adapters, i, hh, mask, rope, emb)
+            y = est.norm_out(hh, emb)
+            out = y @ est.proj_out_w.T + est.proj_out_b
+            vt_pred = mx.transpose(out, (0, 2, 1))
+            total = mx.zeros((), dtype=mx.float32)
+            for i in range(B):
+                lo, hi = pl[i], int(ml_np[i])
+                if hi <= lo:
+                    continue
+                pred = vt_pred[i, :, lo:hi].astype(mx.float32)
+                tgt = vt[i, :, lo:hi].astype(mx.float32)
+                total = total + mx.sum((pred - tgt) ** 2) / pred.size
+            return total / B
+
+        # NOTE: full head recompute for fea-grad would hold ALL block graphs
+        # again. Instead chain block-wise (backward direction reuse of hs):
+        # grad wrt h0 already computed (g after block 0 = grad wrt h0);
+        # head-side: dL/dh0 -> input_embed -> dL/d(text_embed + cond).
+        def head0_loss(fea_p):
+            x = mx.stop_gradient(xt_t).transpose(0, 2, 1)
+            cond = mx.stop_gradient(prompt_t).transpose(0, 2, 1)
+            seq_len = x.shape[1]
+            text_embed = est.text_embed(fea_p.transpose(0, 2, 1)
+                                        .astype(mx.float32), seq_len)
+            hh = est.input_embed(x, cond, text_embed)
+            return (hh.astype(mx.float32) * g.astype(mx.float32)).sum()
+
+        # g is grad wrt h0 at this point (after the block-0 iteration)
+        g_fea_raw = mx.grad(head0_loss)(mx.stop_gradient(fea))
+        # trunk: fea/grad path through bridge/wns1/ref_enc
+        def trunk_fea_loss(p):
+            self.apply_params(p)
+            ge2, fea2 = self._prep_ckpt(
+                mx.array(b_np["ssl"]), mx.array(b_np["spec"]),
+                mx.array(b_np["mel"]), mx.array(b_np["ssl_lengths"]),
+                spec_lengths, mx.array(b_np["text"].astype(np.int32)),
+                mx.array(b_np["text_lengths"]), mel_lengths, None)
+            return (fea2.astype(mx.float32)
+                    * g_fea_raw.astype(mx.float32)).sum()
+
+        trunk_keys = [k for k in masters if not k.startswith("dit.")]
+        tg = mx.grad(trunk_fea_loss)({k: masters[k] for k in trunk_keys})
+        for k in trunk_keys:
+            grads[k] = tg[k].astype(mx.float32)
+        mx.eval(*(grads[k] for k in trunk_keys))
+        return loss_f, info, grads
 
     def forward(self, ssl, spec, mel, ssl_lengths, spec_lengths, text,
                 text_lengths, mel_lengths, key: mx.array | None = None,
