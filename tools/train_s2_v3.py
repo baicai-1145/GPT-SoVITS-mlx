@@ -156,7 +156,11 @@ def main(argv=None) -> None:
     sovits_dir = os.path.join(args.models_root, args.sovits_dir or args.version)
     model, meta = load_sovits_v3(sovits_dir, args.version)
     # fp32 trunk/LoRA masters + fp16 DiT (official autocast fp16_run=true)
-    upcast_training_model(model, dit_fp16=not args.dit_fp32)
+    # ckpt mode NEEDS fp32 DiT weights (fp16 backward overflows — measured);
+    # fp16 is only valid for the fused-forward path which is banned at max
+    # length anyway. Keep --dit-fp32 as an explicit override for fused mode.
+    upcast_training_model(model, dit_fp16=(not args.dit_ckpt
+                                            and not args.dit_fp32))
 
     adapters = None if args.no_lora else \
         inject_lora(model.cfm.estimator, rank=args.lora_rank, seed=args.seed)
