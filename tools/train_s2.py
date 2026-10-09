@@ -125,10 +125,42 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+_lock_held = False
+
+
 def main(argv=None) -> int:
+    global _lock_held
     args = parse_args(argv)
-    device = resolve_device(flag_gpu=not args.cpu, verbose=True)
+    # GPU LAW (task-6): canonical main-repo lock + ps guard, mirroring
+    # tools/train_s2_v3.py — acquire BEFORE resolve_device (the resolver
+    # grants gpu only when a fresh lock exists). One GPU process machine-wide.
+    if not args.cpu:
+        import subprocess as _sp
+        procs = _sp.run(["ps", "ax", "-o", "command"], capture_output=True,
+                        text=True).stdout.splitlines()
+        gpu_procs = [ln.strip() for ln in procs
+                     if ("train" in ln or "smoke" in ln or "prepare" in ln
+                         or "tools/e2e" in ln)
+                     and "python" in ln and "train_s2.py" not in ln
+                     and "grep" not in ln]
+        if gpu_procs:
+            raise SystemExit("[gpu.lock] other GPU python processes running:\n  "
+                             + "\n  ".join(gpu_procs[:5]))
+        from gsovits_mlx.gpu_lock import acquire_lock
+        acquire_lock(f"tools/train_s2.py s2-GAN {args.version} task-6 "
+                     f"exp={args.exp_dir}")
+        _lock_held = True
     import mlx.core as mx
+    device = resolve_device(flag_gpu=not args.cpu, verbose=True)
+    try:
+        return _run(args, device, mx)
+    finally:
+        if _lock_held:
+            from gsovits_mlx.gpu_lock import release_lock
+            release_lock()
+
+
+def _run(args, device, mx):
     if device == "gpu":
         try:
             mx.set_memory_limit(args.memory_limit_mb * 1024 * 1024)
@@ -387,6 +419,19 @@ def main(argv=None) -> int:
                     "silent no-train: step-1 losses identical to step-0 " \
                     "(optimizer update path dead?)"
             step += 1
+            if step % 40 == 0 and _lock_held:
+                from gsovits_mlx.gpu_lock import refresh_lock
+                refresh_lock()
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
+            from gsovits_mlx.train.loop import FootprintSampler
+            _fp = FootprintSampler.read_phys_footprint(os.getpid())
+            if _fp > 8 * 1024 * 1024 * 1024:
+                raise SystemExit(
+                    f"[abort] step {step} footprint {_fp/1e9:.2f} GB > 8GB "
+                    "gate — aborting before machine risk")
             if args.save_every and step % args.save_every == 0:
                 _save(ckpt_mod, args, optim_g, optim_d, step, epoch, d_fresh)
         epoch += 1
