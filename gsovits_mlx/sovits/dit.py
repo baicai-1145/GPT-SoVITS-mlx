@@ -187,9 +187,14 @@ class Attention(nn.Module):
         # SDPA in the stream dtype (pure-fp16 semantics, 2026-10-08): matches
         # the CUDA project's F.scaled_dot_product_attention under is_half=True
         # (native fp16 attention, no fp32 island). No-op when inputs are fp32.
+        # MASK SEMANTICS: mx.fast's mask is ADDITIVE for float inputs but a
+        # keep-mask for BOOL. The 0/1 float mask passed here before 2026-10-09
+        # added +1 to unmasked scores (softmax-invariant when all-ones — why
+        # inference parity never caught it) and leaked padding keys for
+        # padded batches (training; ~4% velocity error on short samples).
         out = mx.fast.scaled_dot_product_attention(
             q_h, k_h, v, scale=1.0 / math.sqrt(self.dim_head),
-            mask=(mask[:, None, None, :].astype(q_h.dtype)
+            mask=(mask[:, None, None, :].astype(mx.bool_)
                   if mask is not None else None)).astype(q_h.dtype)
         out = out.transpose(0, 2, 1, 3).reshape(b, t, self.heads * self.dim_head)
         out = out @ self.to_out_0_w.T + self.to_out_0_b

@@ -89,7 +89,12 @@ def optimizer_state_bytes(optim) -> int:
 
 
 class FootprintSampler(threading.Thread):
-    """Sample own-pid /usr/bin/footprint every interval; track peak."""
+    """Sample own-pid /usr/bin/footprint every interval; track peak.
+
+    NOTE: the stop event is ``_stop_evt`` (NOT ``_stop``) — a ``_stop``
+    instance attr would shadow threading.Thread's private ``_stop()``
+    method and crash join() with "'Event' object is not callable".
+    """
 
     def __init__(self, interval: float = 0.3, pid: int | None = None):
         super().__init__(daemon=True)
@@ -97,7 +102,7 @@ class FootprintSampler(threading.Thread):
         self.pid = pid or os.getpid()
         self.peak = 0
         self.samples: list[int] = []
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()
 
     @staticmethod
     def read_phys_footprint(pid: int) -> int:
@@ -127,16 +132,16 @@ class FootprintSampler(threading.Thread):
         return int(m.group(1))
 
     def run(self):
-        while not self._stop.is_set():
+        while not self._stop_evt.is_set():
             fp = self.read_phys_footprint(self.pid)
             if fp:
                 self.samples.append(fp)
                 if fp > self.peak:
                     self.peak = fp
-            self._stop.wait(self.interval)
+            self._stop_evt.wait(self.interval)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_evt.set()
         self.join(timeout=5)
 
 
@@ -263,7 +268,10 @@ class Trainer:
             if self.scaler is not None:
                 loss = self.scaler.scale(loss)
             grads = backward_fn(flat16, loss)
-            mx.eval(loss)
+            # Eager-eval grads + loss: unevaluated lazy grad graphs retain
+            # forward activation buffers (~1GB/step measured, machine OOM'd
+            # twice on 2026-10-09 — s1-ar probe finding).
+            mx.eval(loss, *grads.values())
             floss = float(loss)
             if self.scaler is not None:
                 floss /= self.scaler.get_scale()
