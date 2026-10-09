@@ -80,12 +80,14 @@ def mel_spectrogram_train(y: mx.array, mel_basis: mx.array, n_fft: int,
 
     Official mel_spectrogram_torch: reflect pad (n_fft-hop)/2 both sides,
     hann window, sqrt(|stft|^2 + 1e-8), mel fb matmul, ln clamp 1e-5.
-    Implemented via the shared numpy stft front-end (parity-tested vs
-    torch) in fp32.
+    DIFFERENTIABLE pure-mx path (gsovits_mlx.train.s2_mel): the shared
+    numpy stft front-end severs the autodiff graph (numpy boundary) and
+    silently zeroes the mel-loss gradient — caught by the 20-step torch
+    reference (loss_mel diverged 22->82 while torch stayed ~20).
     """
-    from ..text.mel_frontend import stft_magnitude
-    spec = stft_magnitude(y.astype(mx.float32), n_fft, hop_size, win_size)
-    return spec_to_mel(spec, mel_basis)
+    from .s2_mel import mel_spec_mx
+    return mel_spec_mx(y.astype(mx.float32), mel_basis, n_fft, hop_size,
+                       win_size)
 
 
 def slice_segments(x: mx.array, ids_str, segment_size: int) -> mx.array:

@@ -97,6 +97,12 @@ def parse_args(argv=None):
     p.add_argument("--batch-size", type=int, default=6)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--lr", type=float, default=TRAIN["learning_rate"])
+    p.add_argument("--lr-scale", type=float, default=1.0,
+                   help="extra multiplier on --lr (e.g. batch_size/official "
+                        "32 for smoke stability; default 1.0 = official)")
+    p.add_argument("--warmup-steps", type=int, default=0,
+                   help="linear lr warmup steps (official has none; smoke "
+                        "uses a few to avoid a first-batch D spike)")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--save-every", type=int, default=200)
@@ -185,19 +191,20 @@ def main(argv=None) -> int:
     def gdict(names):
         return {n: params32[n] for n in names}
 
+    lr_eff = args.lr * args.lr_scale
     optim_g = AdamW(
-        [{"params": gdict(base), "lr": args.lr},
-         {"params": gdict(text_emb), "lr": args.lr * TRAIN["text_low_lr_rate"]},
-         {"params": gdict(enc_text), "lr": args.lr * TRAIN["text_low_lr_rate"]},
-         {"params": gdict(mrte), "lr": args.lr * TRAIN["text_low_lr_rate"]}],
-        lr=args.lr, betas=TRAIN["betas"], eps=TRAIN["eps"], weight_decay=0.01)
+        [{"params": gdict(base), "lr": lr_eff},
+         {"params": gdict(text_emb), "lr": lr_eff * TRAIN["text_low_lr_rate"]},
+         {"params": gdict(enc_text), "lr": lr_eff * TRAIN["text_low_lr_rate"]},
+         {"params": gdict(mrte), "lr": lr_eff * TRAIN["text_low_lr_rate"]}],
+        lr=lr_eff, betas=TRAIN["betas"], eps=TRAIN["eps"], weight_decay=0.01)
     for g_ in optim_g.param_groups:
         g_["base_lr"] = g_["lr"]
 
     d32 = net_d.parameters()  # {name: fp32 array}
-    optim_d = AdamW([d32], lr=args.lr, betas=TRAIN["betas"],
+    optim_d = AdamW([d32], lr=lr_eff, betas=TRAIN["betas"],
                     eps=TRAIN["eps"], weight_decay=0.01)
-    optim_d.param_groups[0]["base_lr"] = args.lr
+    optim_d.param_groups[0]["base_lr"] = lr_eff
 
     sched_g = G.ExponentialLR(optim_g, gamma=TRAIN["lr_decay"])
     sched_d = G.ExponentialLR(optim_d, gamma=TRAIN["lr_decay"])
@@ -305,6 +312,13 @@ def main(argv=None) -> int:
             p16 = make_fp16(masters)
             d_masters = dict(optim_d.param_groups[0]["params"])
             d16 = {k: v.astype(mx.float16) for k, v in d_masters.items()}
+
+            # ---- lr warmup (smoke aid; official has none) ----
+            if args.warmup_steps > 0:
+                w = min(1.0, (step + 1) / args.warmup_steps)
+                for g_ in optim_g.param_groups:
+                    g_["lr"] = g_["base_lr"] * w
+                optim_d.param_groups[0]["lr"] = optim_d.param_groups[0]["base_lr"] * w
 
             # ---- D step (pre-update scale) ----
             (loss_d, dgrads) = mx.value_and_grad(d_loss_fn)(d16, p16, arrays, sv, kd)
