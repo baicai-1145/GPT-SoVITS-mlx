@@ -205,6 +205,10 @@ def main(argv=None) -> int:
     max_sec = config["data"]["max_sec"]
 
     out_dir = args.out_dir or os.path.join(args.exp_dir, "s1_train_out")
+    # ABSOLUTE from launch cwd: the frontend bootstrap chdirs into the
+    # CPUFast repo, which would silently relocate every relative artifact
+    # (found live: export landed in CPUFast/.tmp/... 2026-10-09).
+    out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     loss_log_path = os.path.join(out_dir, "loss.jsonl")
 
