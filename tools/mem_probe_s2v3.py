@@ -40,9 +40,10 @@ def main():
     p.add_argument("--exp-dir", required=True)
     p.add_argument("--models-root", default=os.path.join(_REPO, "models_local"))
     p.add_argument("--steps", type=int, default=3)
-    p.add_argument("--mode", default="fp32", choices=["fp32", "fp16"],
-                   help="DiT forward precision (fp16 = official autocast "
-                        "fp16_run semantics)")
+    p.add_argument("--mode", default="ckpt", choices=["ckpt", "fp16"],
+                   help="ckpt = fp32 weights + two-pass checkpointed DiT "
+                        "backward (default, memory-safe); fp16 = fused fp16 "
+                        "(BANNED: backward overflows fp16 past block ~8)")
     args = p.parse_args()
 
     from gsovits_mlx.gpu_lock import acquire_lock, resolve_device, release_lock
@@ -97,7 +98,7 @@ def main():
             "/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-mlx/models_local",
             args.version)
     model, meta = load_sovits_v3(sovits_dir, args.version)
-    upcast_training_model(model, dit_fp16=(args.mode == "fp16"))
+    upcast_training_model(model, dit_fp16=(args.mode == "fp16"))  # ckpt -> fp32
 
     adapters = inject_lora(model.cfm.estimator, rank=32, seed=1234)
     tm = S2V3TrainModel(model, args.version, lora_adapters=adapters,
@@ -129,16 +130,19 @@ def main():
         _, g = vg(masters)
         return g
 
-    trainer = Trainer(None, [opt], scaler=scaler, log_interval=1)
     pid = os.getpid()
     peaks = []
     for i in range(args.steps):
         t0 = time.time()
-        loss = trainer.train_step(batch, forward_fn, backward_fn)
-        # adapter arrays live on LoRALinear objects; re-sync masters
+        loss_f, info, grads = tm.train_loss_and_grads(masters, batch)
+        # manual AdamW step on the grads (probe only; the CLI trainer keeps
+        # the Trainer class for the fused mode)
+        opt.set_grads(0, grads)
+        opt.step()
         for a in adapters:
             a.lora_A = masters[f"{a.name}.lora_A"]
             a.lora_B = masters[f"{a.name}.lora_B"]
+        loss = loss_f
         fp = footprint_mb(pid)
         peaks.append(fp)
         try:

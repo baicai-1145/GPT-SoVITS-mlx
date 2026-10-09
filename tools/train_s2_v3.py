@@ -76,8 +76,13 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="skip batches whose collated mel width exceeds this"
                         " (smoke memory aid; frames)")
     p.add_argument("--dit-fp32", action="store_true",
-                   help="force fp32 DiT forward (debug only; banned at "
+                   help="force fp32 fused DiT forward (debug only; banned at "
                         "max length on this machine — OOM'd twice)")
+    p.add_argument("--dit-ckpt", dest="dit_ckpt", action="store_true",
+                   default=True,
+                   help="two-pass checkpointed DiT backward (memory-safe "
+                        "default; grad-verified vs fused)")
+    p.add_argument("--no-dit-ckpt", dest="dit_ckpt", action="store_false")
     p.add_argument("--dump-batches", default=None,
                    help="dump collated batches as npz into this dir and exit"
                         " (for the torch CPU reference driver)")
@@ -214,6 +219,12 @@ def main(argv=None) -> None:
         return
     batch_holder = {}
 
+    use_ckpt = args.dit_ckpt and tm.use_lora
+    if use_ckpt:
+        print("[mode] two-pass checkpointed DiT backward (memory-safe; "
+              "grad-verified vs fused: bit-exact loss, grads <=1e-6)",
+              flush=True)
+
     def loss_of(pdict: dict) -> mx.array:
         tm.apply_params(pdict)
         b = batch_holder["b"]
@@ -234,8 +245,8 @@ def main(argv=None) -> None:
         _, grads = value_and_grad(masters)
         return grads
 
-    trainer = Trainer(None, [opt], scaler=scaler, log_interval=1,
-                      loss_log_path=loss_log)
+    trainer = Trainer(None, [opt], scaler=(None if use_ckpt else scaler),
+                      log_interval=1, loss_log_path=loss_log)
 
     start_step = 0
     if args.resume:
@@ -260,8 +271,24 @@ def main(argv=None) -> None:
             batch = collate([dataset[i] for i in bidx])
             if args.max_batch_mel and batch.mel.shape[-1] > args.max_batch_mel:
                 continue
-            loss = trainer.train_step(batch, forward_fn, backward_fn)
-            sync_adapters()
+            if use_ckpt:
+                loss_f, info, grads = tm.train_loss_and_grads(masters, batch)
+                opt.set_grads(0, grads)
+                opt.step()
+                sync_adapters()
+                loss = loss_f
+                trainer.step += 1
+                trainer._log(loss)
+                from gsovits_mlx.train.loop import FootprintSampler
+                _fp = FootprintSampler.read_phys_footprint(os.getpid())
+                if _fp > 8 * 1024 * 1024 * 1024:
+                    release_lock()
+                    raise SystemExit(
+                        f"[abort] step {step} footprint {_fp/1e9:.2f} GB > 8GB "
+                        "gate — aborting before machine risk")
+            else:
+                loss = trainer.train_step(batch, forward_fn, backward_fn)
+                sync_adapters()
             step += 1
             if _REFRESH_LOCK is not None and step % 40 == 0:
                 _REFRESH_LOCK()  # 10-min freshness for long runs

@@ -499,7 +499,9 @@ class S2V3TrainModel:
         est = model.cfm.estimator
         adapters = self.adapter_by_name if self.use_lora else {}
 
-        b_np = {k: np.asarray(v) for k, v in batch.items()}
+        b_np = {k: np.asarray(getattr(batch, k)) for k in (
+            "ssl", "spec", "mel", "ssl_lengths", "spec_lengths",
+            "text", "text_lengths", "mel_lengths")}
         B = b_np["ssl"].shape[0]
         mel_lengths = mx.array(b_np["mel_lengths"].astype(np.float32))
         spec_lengths = mx.array(b_np["spec_lengths"])
