@@ -92,9 +92,22 @@ def parse_args(argv=None):
                    help="Explicit CPUFast repo for the vendored text front-end.")
     p.add_argument("--keep-gpu-lock", action="store_true",
                    help="Do not release the GPU lock on exit (debug).")
+    p.add_argument("--grad-ckpt", action="store_true",
+                   help="Per-block gradient checkpointing (mx.custom_function; "
+                        "forward retains block inputs only, backward "
+                        "recomputes). Peak-memory lever for long buckets.")
     p.add_argument("--cpu", action="store_true",
                    help="Run on CPU (unit-test path only; GPU required for real "
                         "training per AGENTS.md).")
+    p.add_argument("--metal-limit-mb", type=int,
+                   default=int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "8192")),
+                   help="mx.metal.set_memory_limit guard, applied BEFORE the "
+                        "model/data is built: Metal allocations fail loudly "
+                        "in-process instead of OOM-killing the machine.")
+    p.add_argument("--max-src-bucket", type=float, default=None,
+                   help="SMOKE-ONLY: skip batches whose padded src exceeds this "
+                        "(official filters allow up to max_sec). Deviation to "
+                        "exclude extreme length buckets; documented.")
     return p.parse_args(argv)
 
 
@@ -154,7 +167,7 @@ def seed_everything(seed: int):
     import mlx.core as mx
     random.seed(seed)
     np.random.seed(seed)
-    mx.random.seed(mx.random.key(seed))
+    mx.random.seed(seed)
 
 
 def build_loss_fn(model, precision: str):
@@ -202,6 +215,13 @@ def main(argv=None) -> int:
     if not args.cpu:
         acquire_train_lock(args.version, args.exp_dir)
         lock_held = True
+        # OOM law: cap Metal BEFORE building anything so allocations fail
+        # loudly in-process instead of rebooting the machine.
+        try:
+            mx.metal.set_memory_limit(args.metal_limit_mb * 1024 * 1024)
+            print(f"[mem] metal limit set to {args.metal_limit_mb} MB", flush=True)
+        except Exception as e:  # noqa: BLE001 - older mlx lacks the API
+            print(f"[mem] metal memory limit not set: {e}", flush=True)
 
     exit_code = 0
     try:
@@ -239,7 +259,8 @@ def _run(args, config, cleaner_version, init_dir, out_dir, loss_log_path, mx):
     weights = dict(load_mlx_safetensors(
         os.path.join(init_dir, "gpt.safetensors")))
     weights = {k: v.astype(mx.float32) for k, v in weights.items()}
-    model = S1TrainModel(config).load(weights)
+    model = S1TrainModel(config,
+                         use_checkpoint=bool(args.grad_ckpt)).load(weights)
     params = weights
 
     # --- optimizer (official configure_optimizers defaults) ---
@@ -259,6 +280,20 @@ def _run(args, config, cleaner_version, init_dir, out_dir, loss_log_path, mx):
         return model.forward(p, batch)[0]
 
     vg = mx.value_and_grad(loss_only)
+    use_ckpt = getattr(model, "use_gradient_checkpoint", False)
+
+    from gsovits_mlx.train.loop import FootprintSampler
+    fp_sampler = FootprintSampler(interval=0.3)
+    fp_sampler.start()
+
+    def mem_row():
+        try:
+            active = int(mx.metal.get_active_memory())
+            cache = int(mx.metal.get_cache_memory())
+        except Exception:
+            active = cache = -1
+        return {"mx_active": active, "mx_cache": cache,
+                "peak_footprint": fp_sampler.peak}
 
     # --- official loop: backward every batch, step at batch_idx%4==0 (>0) ---
     optim_steps = 0
@@ -266,26 +301,44 @@ def _run(args, config, cleaner_version, init_dir, out_dir, loss_log_path, mx):
     t0 = time.perf_counter()
     last_lock_refresh = t0
     log_rows = []
+    skipped_long = 0
     stop = False
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         batches = sampler.batch_indices()
         grads_acc: dict | None = None
         for batch_idx, indices in enumerate(batches):
-            examples = [dataset[i] for i in indices]
-            batch = dataset.collate(examples)
-            loss, grads = vg(params, batch)
-            mx.eval(loss)
-            loss_f = float(loss)
-            # official accumulation: grads sum (no averaging; sum loss)
+            batch = dataset.collate([dataset[i] for i in indices])
+            if (args.max_src_bucket is not None and
+                    (batch["phoneme_ids"].shape[1]
+                     + batch["semantic_ids"].shape[1]) > args.max_src_bucket):
+                skipped_long += 1
+                continue
+            if use_ckpt:
+                loss_f, _acc, grads = model.train_loss_and_grads(params, batch)
+                grads = {k: g.astype(mx.float32) for k, g in grads.items()}
+            else:
+                loss, grads = vg(params, batch)
+                # Eager-eval loss AND grads: an unevaluated grad is a lazy graph
+                # node retaining the full forward activations of this micro-batch;
+                # accumulating 4 such windows retained ~1GB/step (probe evidence:
+                # phys_footprint +1.07GB/step with Metal capped). Evaluating each
+                # grad + the accumulated sum severs those references.
+                grads = {k: g.astype(mx.float32) for k, g in grads.items()}
             if grads_acc is None:
-                grads_acc = {k: g.astype(mx.float32) for k, g in grads.items()}
+                grads_acc = grads
             else:
                 for k in grads_acc:
-                    grads_acc[k] = grads_acc[k] + grads[k].astype(mx.float32)
+                    grads_acc[k] = grads_acc[k] + grads[k]
+            if use_ckpt:
+                mx.eval(*grads_acc.values())
+            else:
+                mx.eval(loss, *grads_acc.values())
+                loss_f = float(loss)
+            # official accumulation: grads sum (no averaging; sum loss)
             batch_counter += 1
             row = {"batch": batch_counter, "epoch": epoch,
-                   "batch_idx": batch_idx, "loss": loss_f}
+                   "batch_idx": batch_idx, "loss": loss_f, **mem_row()}
             log_rows.append(row)
             if batch_counter % 10 == 1 or batch_counter == 1:
                 el = time.perf_counter() - t0
@@ -294,6 +347,10 @@ def _run(args, config, cleaner_version, init_dir, out_dir, loss_log_path, mx):
             # torch manual_backward + step gate: batch_idx>0 and %4==0
             if batch_idx > 0 and batch_idx % args.grad_accum == 0:
                 optim.apply_group(0, grads_acc)
+                # NOTE: no assign-back needed — since main 1c58f1d the
+                # optimizers keep the caller's params dict by reference and
+                # apply_group mutates it in place (a per-step dict() copy
+                # here would reintroduce one-step-stale forwards).
                 grads_acc = None
                 scheduler.step()
                 optim_steps += 1
@@ -322,6 +379,8 @@ def _run(args, config, cleaner_version, init_dir, out_dir, loss_log_path, mx):
     # final export
     export_dir = os.path.join(out_dir, "export")
     ckpt_mod.save_s1_inference(export_dir, model, config, 0)
+    fp_sampler.stop()
+    mem = mem_row()
     with open(loss_log_path, "w") as f:
         for row in log_rows:
             f.write(json.dumps(row) + "\n")
@@ -336,6 +395,8 @@ def _run(args, config, cleaner_version, init_dir, out_dir, loss_log_path, mx):
         "loss_mean_last20": float(np.mean(losses[-20:])) if losses else None,
         "wall_s": time.perf_counter() - t0,
         "export_dir": export_dir,
+        "skipped_long_batches": skipped_long,
+        "peak_mem": mem,
     }
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
