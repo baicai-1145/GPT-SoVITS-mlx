@@ -29,12 +29,19 @@ import argparse
 import json
 import os
 import random
+import sys
 import time
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
 
 DEFAULT_MODELS_ROOT = os.environ.get(
     "GSOVITS_MODELS_ROOT",
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                  "models_local"))
+
+_REFRESH_LOCK = None  # set when --gpu: long-run freshness keeper
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -68,6 +75,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-batch-mel", type=int, default=None,
                    help="skip batches whose collated mel width exceeds this"
                         " (smoke memory aid; frames)")
+    p.add_argument("--dump-batches", default=None,
+                   help="dump collated batches as npz into this dir and exit"
+                        " (for the torch CPU reference driver)")
     p.add_argument("--gpu", action="store_true")
     return p
 
@@ -75,8 +85,25 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv=None) -> None:
     args = build_argparser().parse_args(argv)
 
-    from gsovits_mlx.gpu_lock import resolve_device
-    resolve_device(args.gpu, verbose=True)
+    from gsovits_mlx.gpu_lock import resolve_device, acquire_lock, \
+        refresh_lock, release_lock
+    if args.gpu:
+        # NEW LOCK LAW (f9185a6): canonical main-repo lock only; refuse to
+        # run alongside any other GPU python process.
+        import subprocess as _sp
+        procs = _sp.run(["ps", "ax", "-o", "command"], capture_output=True,
+                        text=True).stdout.splitlines()
+        gpu_procs = [ln.strip() for ln in procs
+                     if ("train" in ln or "smoke" in ln or "prepare" in ln)
+                     and "python" in ln and "train_s2_v3" not in ln
+                     and "grep" not in ln]
+        if gpu_procs:
+            raise SystemExit("[gpu.lock] other GPU python processes running:\n  "
+                             + "\n  ".join(gpu_procs[:5]))
+        acquire_lock("train_s2_v3 task-5 s2-cfm")
+        global _REFRESH_LOCK
+        _REFRESH_LOCK = refresh_lock
+    device = resolve_device(args.gpu, verbose=True)
 
     import numpy as np
     import mlx.core as mx
@@ -95,12 +122,27 @@ def main(argv=None) -> None:
     np.random.seed(args.seed)
     rng = random.Random(args.seed + 1)   # CFM python rng (2-step branch)
 
+    # -- data -----------------------------------------------------------------------
+    # The vendored official text package needs the CPUFast repo as cwd for
+    # its relative scratch paths (g2pw/japanese); bootstrap chdirs there.
+    # Dataset construction happens here (frontend use only); the worktree
+    # cwd is restored right after (AGENTS.md bootstrap-chdir rule: long-lived
+    # services must not keep the CPUFast cwd or gpu.lock root resolution
+    # breaks).
+    from gsovits_mlx.text.preproc import bootstrap
+    bootstrap(os.environ.get("GSOVITS_CPUFAST",
+                             "/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-CPUFast"),
+              models_root=args.models_root)
+    dataset = TextAudioSpeakerLoaderV3V4(args.exp_dir, args.version)
+    collate = collate_for(args.version)
+    os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
     # -- model ------------------------------------------------------------------
     sovits_dir = os.path.join(args.models_root, args.sovits_dir or args.version)
     model, meta = load_sovits_v3(sovits_dir, args.version)
-    # training runs on an fp32 tree (the Trainer casts fp16 per forward)
-    model.update(tree_map(lambda v: v.astype(mx.float32)
-                          if hasattr(v, "dtype") else v, model.parameters()))
+    # training runs on an fp32 tree INCLUDING the plain-object attrs the
+    # parameters() walk misses (quantizer embed, DiT) — see helper docstring
+    upcast_training_model(model)
 
     adapters = None if args.no_lora else \
         inject_lora(model.cfm.estimator, rank=args.lora_rank, seed=args.seed)
@@ -138,10 +180,29 @@ def main(argv=None) -> None:
         return
 
     # -- data -----------------------------------------------------------------------
-    dataset = TextAudioSpeakerLoaderV3V4(args.exp_dir, args.version)
-    collate = collate_for(args.version)
-
-    # -- loss/grad plumbing ------------------------------------------------------------
+    # loaded ABOVE (before the model) because the frontend bootstrap chdirs
+    # into the CPUFast checkout; the loop below only reads dataset[i].
+    if args.dump_batches:
+        import numpy as _np
+        os.makedirs(args.dump_batches, exist_ok=True)
+        n = 0
+        for bidx in bucket_batches(dataset.lengths, args.batch_size,
+                                   seed=args.seed):
+            batch = collate([dataset[i] for i in bidx])
+            if args.max_batch_mel and batch.mel.shape[-1] > args.max_batch_mel:
+                continue
+            _np.savez(os.path.join(args.dump_batches, f"batch_{n:03d}.npz"),
+                      ssl=batch.ssl, spec=batch.spec, mel=batch.mel,
+                      ssl_lengths=batch.ssl_lengths,
+                      spec_lengths=batch.spec_lengths,
+                      text=batch.text.astype(np.int64),
+                      text_lengths=batch.text_lengths,
+                      mel_lengths=batch.mel_lengths)
+            n += 1
+            if n >= max(args.steps, 20):
+                break
+        print(f"dumped {n} batches -> {args.dump_batches}")
+        return
     batch_holder = {}
 
     def loss_of(pdict: dict) -> mx.array:
@@ -193,6 +254,8 @@ def main(argv=None) -> None:
             loss = trainer.train_step(batch, forward_fn, backward_fn)
             sync_adapters()
             step += 1
+            if _REFRESH_LOCK is not None and step % 40 == 0:
+                _REFRESH_LOCK()  # 10-min freshness for long runs
             if step % 10 == 0:
                 el = time.time() - t0
                 print(f"step {step} loss {loss:.4f} "
@@ -218,6 +281,8 @@ def main(argv=None) -> None:
     print(json.dumps(mem, indent=1))
     print(f"done: {trainer.step} steps in {time.time()-t0:.1f}s -> {args.out}",
           flush=True)
+    if _REFRESH_LOCK is not None:
+        release_lock()
 
 
 def export_merged(args, tm, meta, out_dir: str | None = None) -> str:

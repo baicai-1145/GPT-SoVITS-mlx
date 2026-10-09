@@ -45,6 +45,8 @@ import numpy as np
 
 from ..text.mel_frontend import mel_spectrogram, spectrogram
 
+import mlx.core as mx
+
 # librosa mel (slaney) norm + (x - spec_min) / (spec_max - spec_min) * 2 - 1
 SPEC_MIN, SPEC_MAX = -12.0, 2.0
 
@@ -63,9 +65,16 @@ def ffmpeg_load_audio(path: str, sr: int) -> np.ndarray:
 
 
 def _cleaned_text_to_sequence():
-    """Import the vendored official cleaned_text_to_sequence lazily."""
+    """Import the vendored official cleaned_text_to_sequence lazily.
+
+    The official data_utils reads the GLOBAL module-level ``version``
+    (os.environ["version"]); the vendored text package exposes the same
+    symbol, so set the env before calling for exact official semantics.
+    """
     from ..text import vendored_cpufront as vcf
-    return vcf.cleaned_text_to_sequence()
+    vcf.load_cpufront()
+    import text as _official_text
+    return _official_text.cleaned_text_to_sequence
 
 
 @dataclass
@@ -139,10 +148,11 @@ class TextAudioSpeakerLoaderV3V4:
         new_items = []
         lengths = []
         skipped_phone = skipped_dur = 0
+        cleaner_version = "v1" if version == "v1" else "v2"
         for audiopath in audiopaths_sid_text:
             try:
                 phoneme = self.phoneme_data[audiopath][0].split(" ")
-                phoneme_ids = c2s(phoneme, version)
+                phoneme_ids = c2s(phoneme, cleaner_version)
             except Exception:
                 skipped_phone += 1
                 continue
@@ -179,13 +189,14 @@ class TextAudioSpeakerLoaderV3V4:
 
     def get_audio(self, filename: str):
         audio32 = ffmpeg_load_audio(filename, 32000)
-        spec = spectrogram(audio32[None], 2048, 640, 2048, center=False)[0]
+        spec = spectrogram(mx.array(audio32[None]), 2048, 640, 2048,
+                           center=False)[0]
         if self.version == "v3":
             audio_mel = ffmpeg_load_audio(filename, 24000)
         else:
             audio_mel = audio32
         mel = mel_spectrogram(
-            audio_mel[None], self.filter_length_mel, self.n_mel_channels,
+            mx.array(audio_mel[None]), self.filter_length_mel, self.n_mel_channels,
             self.sampling_rate_mel, self.hop_length_mel, self.win_length_mel,
             fmin=self.mel_fmin, fmax=self.mel_fmax, center=False)[0]
         mel = norm_spec(mel)

@@ -82,83 +82,76 @@ LORA_FULL_TRAIN_PARAM_PREFIXES = ("ref_enc.", "bridge_0.", "wns1.",
 # DiT training forward with LoRA deltas on q/k/v/out projections
 # ---------------------------------------------------------------------------
 
+def upcast_training_model(model: SynthesizerTrnV3) -> None:
+    """Cast ALL weights to fp32 for training — including the ones
+    nn.Module.parameters() does NOT reach (plain-object attributes):
+
+    * ``model.quantizer.embed`` — plain array on a plain object; leaving it
+      fp16 makes the L2-distance GEMM run at fp16 precision (~0.5 absolute
+      error on ~545-magnitude distances) and flips ~50% of the code picks
+      vs the official fp32 quantizer (measured on batch_002).
+    * ``model.cfm.estimator`` (the DiT) — plain-object holder; fp16 weights
+      gave up to ~12% CFM-loss drift vs the torch fp32 reference.
+
+    Everything inside model.parameters() (enc_p/ref_enc/ssl_proj/bridge/
+    wns1/linear_mel) is upcast through model.update.
+    """
+    from mlx.utils import tree_map
+    model.update(tree_map(lambda v: v.astype(mx.float32) if hasattr(v, "dtype")
+                          else v, model.parameters()))
+    est = model.cfm.estimator
+    est.update(tree_map(lambda v: v.astype(mx.float32) if hasattr(v, "dtype")
+                        else v, est.parameters()))
+    for blk in est.transformer_blocks:
+        blk.attn._qkv_w_cache = None
+        blk.attn._cdtype = None
+    model.quantizer.embed = model.quantizer.embed.astype(mx.float32)
+
+
 def dit_lora_forward(dit, adapters: dict[str, LoRALinear], xt, prompt, x_lens,
                      t, d, mu) -> mx.array:
     """Training-layout DiT forward (f5_tts dit.py non-infer path) with LoRA.
 
-    adapters: {"<block>.attn.<suffix>": LoRALinear}; missing keys = no
-    adapter on that projection. Math per projection:
-      y = x @ W.T + b + (x @ A.T) @ B.T   (scaling = alpha/r = 1.0)
-    Everything else mirrors dit.DiT.__call__(infer=False, use_grad_ckpt=False)
-    exactly (same ops, same order, same dtypes).
+    LoRA is applied by MATERIALIZING ``W + B @ A`` into the attention module
+    weights for the duration of the call and then running the VERIFIED
+    inference forward ``DiT.__call__(..., use_grad_ckpt=False)`` — the base
+    weights are frozen in LoRA mode, so the fused weight is an exact,
+    differentiable-through expression: mx.grad flows to A/B through the
+    matmul while every other op follows the parity-verified DiT code path
+    (task-1..12 lineage). This avoids reimplementing the attention block
+    (an earlier hand-rolled port drifted ~10% vs torch on some batches).
+
+    adapters: {"dit.blocks.<i>.attn.<suffix>": LoRALinear} keyed by prefix
+    (S2V3TrainModel sets ``attn._lora_prefix``); scaling = alpha/r = 1.0.
+    Fused QKV packs are invalidated around the swap (task-12 discipline).
     """
-    x = mx.transpose(xt, (0, 2, 1))       # (B, T, C_mel)
-    cond = mx.transpose(prompt, (0, 2, 1))
-    text = mx.transpose(mu, (0, 2, 1))
-    seq_len = x.shape[1]
-    mask = dit_sequence_mask(x_lens, seq_len).astype(x.dtype)
-
-    # t = time_embed(time); dt = d_embed(dt_base); t += dt  (v3/v4 only:
-    # use_step_embedding; v5 DiT has no d_embed)
-    t0w = dit.time_embed.time_mlp_0_w
-    td = t0w.dtype
-    t_emb = dit.time_embed(t.astype(td))
-    if dit.use_step_embedding:
-        d0w = dit.d_embed.time_mlp_0_w
-        t_emb = t_emb + dit.d_embed(d.astype(d0w.dtype))
-
-    text_embed = dit.text_embed(text, seq_len, drop_text=False)
-    x = dit.input_embed(x, cond, text_embed, drop_audio_cond=False)
-    t_emb = t_emb.astype(x.dtype)
-
-    rope = dit._rope(seq_len, x.dtype)
-
-    from ..sovits import dit as dit_mod
-
-    for block in dit.transformer_blocks:
-        norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(x, t_emb)
+    saved = {}  # {(block_idx, attr): base_weight}
+    any_touched = False
+    for bi, block in enumerate(dit.transformer_blocks):
         attn = block.attn
-        # -- attention with LoRA (same math as dit.Attention.__call__) --
-        b, tlen, _ = norm.shape
-        a_q = adapters.get(f"{bi}.to_q") if False else adapters.get(
-            _attn_adapter_name(dit, block, attn, "to_q"))
-        a_k = adapters.get(_attn_adapter_name(dit, block, attn, "to_k"))
-        a_v = adapters.get(_attn_adapter_name(dit, block, attn, "to_v"))
-        a_o = adapters.get(_attn_adapter_name(dit, block, attn, "to_out.0"))
-        qw, qb = attn._qkv_w()
-        qkv = norm @ qw.T + qb
-        inner = qw.shape[0] // 3
-        if a_q is not None or a_k is not None or a_v is not None:
-            parts = []
-            for a in (a_q, a_k, a_v):
-                if a is None:
-                    parts.append(mx.zeros((b, tlen, inner), dtype=qkv.dtype))
-                else:
-                    parts.append((norm @ a.lora_A.T) @ a.lora_B.T)
-            qkv = qkv + mx.concatenate(parts, axis=-1)
-        q, k, v = mx.split(qkv, 3, axis=-1)
-        q_h = q.reshape(b, tlen, attn.heads, attn.dim_head).transpose(0, 2, 1, 3)
-        k_h = k.reshape(b, tlen, attn.heads, attn.dim_head).transpose(0, 2, 1, 3)
-        v_h = v.reshape(b, tlen, attn.heads, attn.dim_head).transpose(0, 2, 1, 3)
-        q_h = mx.concatenate([dit_mod.apply_rope(q_h[:, :1], rope), q_h[:, 1:]], axis=1)
-        k_h = mx.concatenate([dit_mod.apply_rope(k_h[:, :1], rope), k_h[:, 1:]], axis=1)
-        out = mx.fast.scaled_dot_product_attention(
-            q_h, k_h, v_h, scale=1.0 / math.sqrt(attn.dim_head),
-            mask=mask[:, None, None, :].astype(q_h.dtype)).astype(q_h.dtype)
-        out = out.transpose(0, 2, 1, 3).reshape(b, tlen, attn.heads * attn.dim_head)
-        attn_input = out  # to_out input
-        out = attn_input @ attn.to_out_0_w.T + attn.to_out_0_b
-        if a_o is not None:
-            out = out + (attn_input @ a_o.lora_A.T) @ a_o.lora_B.T
-        out = out * mask[:, :, None]
-        x = x + gate_msa[:, None] * out
-
-        norm = dit_mod._modulated_norm(x, scale_mlp, shift_mlp)
-        ff_out = block.ff(norm)
-        x = x + gate_mlp[:, None] * ff_out
-
-    x = dit.norm_out(x, t_emb)
-    return x @ dit.proj_out_w.T + dit.proj_out_b
+        touched = False
+        for suffix, attr in (("to_q", "to_q_w"), ("to_k", "to_k_w"),
+                             ("to_v", "to_v_w"), ("to_out.0", "to_out_0_w")):
+            a = adapters.get(f"dit.blocks.{bi}.attn.{suffix}")
+            if a is None:
+                continue
+            base_w = getattr(attn, attr)
+            saved[(bi, attr)] = base_w
+            # W + B@A (scaling = alpha/r = 1.0); dtype follows the base
+            # weight (fp32 in training)
+            setattr(attn, attr, base_w + (a.lora_B @ a.lora_A).astype(base_w.dtype))
+            touched = True
+        if touched:
+            attn._qkv_w_cache = None
+            any_touched = True
+    try:
+        return dit(xt, prompt, x_lens, t, d, mu, use_grad_ckpt=False)
+    finally:
+        for (bi, attr), w in saved.items():
+            setattr(dit.transformer_blocks[bi].attn, attr, w)
+        if any_touched:
+            for block in dit.transformer_blocks:
+                block.attn._qkv_w_cache = None
 
 
 def dit_sequence_mask(x_lens, max_length: int) -> mx.array:
@@ -183,38 +176,54 @@ def _attn_adapter_name(dit, block, attn, suffix: str) -> str:
 # ---------------------------------------------------------------------------
 
 class CFMTrainingLoss:
-    """CFM.forward port. x1/mu: (B, C, T); returns fp32 scalar loss."""
+    """CFM.forward port. x1/mu: (B, C, T); returns fp32 scalar loss.
+
+    ``det`` mode (deterministic reference): consumes (t, x0, prompt_lens,
+    two_step gate/base) arrays baked into the batch npz instead of drawing —
+    used by the torch-CPU parity comparison so both sides share randomness.
+    """
 
     def __init__(self, estimator, rng: random.Random | None = None):
         self.estimator = estimator  # callable(xt, prompt, x_lens, t, d, mu)
         self.rng = rng or random
 
     def __call__(self, x1: mx.array, x_lens, prompt_lens, mu: mx.array,
-                 key: mx.array | None = None) -> tuple[mx.array, dict]:
+                 key: mx.array | None = None,
+                 det: dict | None = None) -> tuple[mx.array, dict]:
         b = x1.shape[0]
         dtype = x1.dtype
-        if key is None:
-            key = mx.random.key(random.getrandbits(63))
-        key, sub = mx.random.split(key)
-        t = mx.random.uniform(0.0, 1.0, (b,), key=key).astype(dtype)
-        x0 = mx.random.normal(x1.shape, key=sub).astype(dtype)
+        if det is not None:
+            t = det["t"].astype(dtype)
+            x0 = det["x0"].astype(dtype)[:, :, : x1.shape[-1]]
+            pl = [int(p) for p in det["prompt_lens"]]
+            gate = det["gate"]
+        else:
+            if key is None:
+                key = mx.random.key(random.getrandbits(63))
+            key, sub = mx.random.split(key)
+            t = mx.random.uniform(0.0, 1.0, (b,), key=key).astype(dtype)
+            x0 = mx.random.normal(x1.shape, key=sub).astype(dtype)
+            pl = [int(p) for p in prompt_lens]
+            gate = self.rng.random()
         vt = x1 - x0
         xt = x0 + t[:, None, None] * vt
         dt = mx.zeros((b,), dtype=dtype)
         prompt = mx.zeros_like(x1)
 
-        pl = [int(p) for p in prompt_lens]
         for i in range(b):
             if pl[i] > 0:
                 prompt[i, :, : pl[i]] = x1[i, :, : pl[i]]
                 xt[i, :, : pl[i]] = 0.0
 
         info = {"two_step": False}
-        if self.rng.random() < 0.3:
+        if gate < 0.3:
             info["two_step"] = True
-            # official torch.randint(2, 8, (b,)) — high EXCLUSIVE -> [2, 8)
-            base = mx.array([self.rng.randint(2, 7) for _ in range(b)],
-                            dtype=dtype)
+            if det is not None and "base" in det:
+                base = det["base"].astype(dtype)
+            else:
+                # official torch.randint(2, 8, (b,)) — high EXCLUSIVE
+                base = mx.array([self.rng.randint(2, 7) for _ in range(b)],
+                                dtype=dtype)
             d = 1.0 / mx.power(2.0, base)
             d_input = mx.where(d < 1e-2, mx.zeros_like(d), d)
             # detached estimator calls (torch .detach()): stop_gradient
@@ -353,9 +362,13 @@ class S2V3TrainModel:
             xt, prompt, x_lens, t, d, mu, use_grad_ckpt=False)
 
     def forward(self, ssl, spec, mel, ssl_lengths, spec_lengths, text,
-                text_lengths, mel_lengths, key: mx.array | None = None):
+                text_lengths, mel_lengths, key: mx.array | None = None,
+                det: dict | None = None):
         """All inputs mx arrays. spec: (B, 1025, T) linear spectrogram.
-        Returns (loss fp32 scalar, info dict)."""
+        Returns (loss fp32 scalar, info dict).
+
+        det: deterministic-reference state (t/x0/prompt_lens/gate/base) —
+        see CFMTrainingLoss(det=...)."""
         model = self.model
 
         y_mask = (mx.arange(spec.shape[2])[None, :]
@@ -378,17 +391,20 @@ class S2V3TrainModel:
         fea, _ = model.wns1(fea, mx.asarray(mel_lengths), ge)
 
         B = ssl.shape[0]
-        prompt_len_max = mel_lengths * (2.0 / 3.0)
-        if key is None:
-            key = mx.random.key(random.getrandbits(63))
-        key, sub = mx.random.split(key)
-        prompt_len = mx.floor(mx.random.uniform(0.0, 1.0, (B,), key=sub)
-                              * prompt_len_max).astype(mx.int32)
+        if det is not None:
+            prompt_len = det["prompt_lens"]
+        else:
+            prompt_len_max = mel_lengths * (2.0 / 3.0)
+            if key is None:
+                key = mx.random.key(random.getrandbits(63))
+            key, sub = mx.random.split(key)
+            prompt_len = mx.floor(mx.random.uniform(0.0, 1.0, (B,), key=sub)
+                                  * prompt_len_max).astype(mx.int32)
 
         minn = min(mel.shape[-1], fea.shape[-1])
         mel = mel[:, :, :minn]
         fea = fea[:, :, :minn]
 
         cfm = CFMTrainingLoss(self._estimator, rng=self.rng)
-        loss, info = cfm(mel, mel_lengths, prompt_len, fea, key=key)
+        loss, info = cfm(mel, mel_lengths, prompt_len, fea, key=key, det=det)
         return loss, info
