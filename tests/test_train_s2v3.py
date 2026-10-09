@@ -237,7 +237,18 @@ def _torch_nearest(x: np.ndarray, scale: float) -> np.ndarray:
     return F.interpolate(t, scale_factor=scale, mode="nearest").numpy()
 
 
+def _torch_available() -> bool:
+    try:
+        import torch  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def test_nearest_interp_x1875_matches_torch():
+    """Heavy: needs base-venv torch for the reference (F.interpolate)."""
+    if not _torch_available():
+        pytest.skip("torch not installed (run under base venv)")
     x = np.random.rand(2, 8, 37).astype(np.float32)
     ours = np.array(_nearest_interp(mx.array(x), int(37 * 1.875),
                                     scale_factor=1.875))
@@ -246,6 +257,9 @@ def test_nearest_interp_x1875_matches_torch():
 
 
 def test_nearest_interp_x2_matches_torch():
+    """Heavy: needs base-venv torch for the reference (F.interpolate)."""
+    if not _torch_available():
+        pytest.skip("torch not installed (run under base venv)")
     x = np.random.rand(2, 8, 37).astype(np.float32)
     ours = np.array(_nearest_interp(mx.array(x), 37 * 2, scale_factor=2.0))
     ref = _torch_nearest(x, 2.0)
