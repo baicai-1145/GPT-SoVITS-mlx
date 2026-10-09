@@ -63,6 +63,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=3,
                    help="official default minmem//8 (24GB->3)")
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--warmup-steps", type=int, default=50,
+                   help="linear lr warmup (official warmup_epochs analog; "
+                        "lr=0 at step 0 -> args.lr at warmup end)")
     p.add_argument("--lora-rank", type=int, default=32)
     p.add_argument("--no-lora", action="store_true",
                    help="train the DiT base weights too (experiment)")
@@ -276,6 +279,11 @@ def main(argv=None) -> None:
             batch = collate([dataset[i] for i in bidx])
             if args.max_batch_mel and batch.mel.shape[-1] > args.max_batch_mel:
                 continue
+            if use_ckpt and args.warmup_steps > 0 and step < args.warmup_steps:
+                opt.param_groups[0]["lr"] = (
+                    args.lr * (step + 1) / args.warmup_steps)
+            elif use_ckpt:
+                opt.param_groups[0]["lr"] = args.lr
             if use_ckpt:
                 loss_f, info, grads = tm.train_loss_and_grads(masters, batch)
                 import math as _math
