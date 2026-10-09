@@ -23,7 +23,8 @@ mx = pytest.importorskip("mlx.core")
 
 from gsovits_mlx.train.s1_data import (Text2SemanticDataset,  # noqa: E402
                                        BucketBatchSampler, collate, pad_y_eos)
-from gsovits_mlx.train.s1_model_train import (S1TrainModel,  # noqa: E402
+from gsovits_mlx.train.s1_model_train import (NEG_INF,  # noqa: E402
+                                              S1TrainModel,
                                               build_train_attn_mask,
                                               pad_y_eos_np,
                                               make_pad_mask_left_np,
@@ -288,12 +289,17 @@ class TestPadYEos:
         xy_attn = np.concatenate([x_attn, y_attn], axis=0)
         # torch broadcasting: (B,1,1,src) padding OR (src,src) causal -> full 2D
         ref = xy_attn[None, :, :] | xy_padding[:, None, :]
-        ref = np.where(ref, -np.inf, 0.0).astype(np.float32)[:, None, :, :]
+        ref = np.where(ref, NEG_INF, 0.0).astype(np.float32)[:, None, :, :]
         got = build_train_attn_mask(x_lens, y_lens, X, Y, H)
         assert got.shape == (B, 1, X + Y, X + Y)
         np.testing.assert_array_equal(got, ref)
         # semantics: no all-masked rows (NaN safety)
         assert (got > -1e8).any(axis=-1).all()
+        # fp16 cast safety: masked floor must stay finite (no NaN) in fp16
+        # (-inf overflows to NaN; found via probe nan losses 2026-10-09)
+        import mlx.core as _mx
+        m16 = _mx.array(got).astype(_mx.float16)
+        assert _mx.all(_mx.isfinite(m16)).item()
 
 
 # ---------------------------------------------------------------------------

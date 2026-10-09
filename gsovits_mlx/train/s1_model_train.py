@@ -57,7 +57,12 @@ import numpy as np
 __all__ = ["S1TrainModel", "make_pad_mask_left_np", "make_pad_mask_np",
            "build_train_attn_mask", "top3_accuracy", "pad_y_eos_np"]
 
-NEG_INF = -1e9
+NEG_INF = -1e4
+# NOTE: NOT -np.inf — the mask is cast to fp16 for the forward (official
+# autocast materializes it in x.dtype) and -inf overflows fp16 to NaN,
+# silently poisoning every masked SDPA position (found via probe nan
+# losses, 2026-10-09). -1e4 is the standard fp16-safe additive floor:
+# exp(-1e4 * 1/sqrt(64)) == 0 in fp16 softmax.
 
 
 def make_pad_mask_np(lengths, max_len: int = 0) -> np.ndarray:
@@ -114,7 +119,7 @@ def build_train_attn_mask(x_lens, y_lens, X: int, Y: int,
 
     mask = causal[None, :, :] | xy_pad[:, None, :]  # (B, src, src)
     out = np.zeros(mask.shape, dtype=np.float32)
-    out[mask] = -np.inf
+    out[mask] = NEG_INF
     return out[:, None, :, :]  # (B, 1, src, src)
 
 
@@ -235,7 +240,7 @@ class S1TrainModel:
                                          x_len, targets_np)
             return l
 
-        hv = mx.value_and_grad(head_loss)(
+        hv = mx.value_and_grad(head_loss, argnums=(0, 1))(
             h, p16["ar_predict_layer.weight"])
         g_loss, (g_h, g_w) = hv[0], hv[1]
         mx.eval(g_loss, g_h, g_w)
