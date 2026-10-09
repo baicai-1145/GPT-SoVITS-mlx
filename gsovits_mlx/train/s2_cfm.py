@@ -287,6 +287,7 @@ class S2V3TrainModel:
         self.version = version
         self.adapters = list(lora_adapters or [])
         self.use_lora = bool(self.adapters)
+        self.lora_adapters = self.adapters  # alias used by forward's cut
         self.adapter_by_name = {a.name: a for a in self.adapters}
         self.rng = rng or random
         # annotate attention modules with their LoRA prefix so
@@ -371,6 +372,17 @@ class S2V3TrainModel:
         see CFMTrainingLoss(det=...)."""
         model = self.model
 
+        # FROZEN TRUNK UNDER stop_gradient: ssl_proj/quantizer/enc_p/
+        # ref_enc/bridge are frozen in LoRA fine-tuning (official
+        # set_no_grad); keeping their graphs alive only wastes memory (the
+        # low-swap jetsam kill at 2026-10-09 18:39 was exactly this). When
+        # LoRA adapters are attached, everything below DiT is a constant.
+        # (Non-LoRA full fine-tune keeps bridge/wns1 trainable — there the
+        # graph must flow, so only apply the cut in the LoRA path.)
+        if self.lora_adapters:
+            spec = mx.stop_gradient(spec)
+            ssl = mx.stop_gradient(ssl)
+
         y_mask = (mx.arange(spec.shape[2])[None, :]
                   < mx.asarray(spec_lengths)[:, None]).astype(spec.dtype)
         y_mask = y_mask[:, None, :]  # (B, 1, T)
@@ -389,6 +401,11 @@ class S2V3TrainModel:
         sc = 1.875 if self.version == "v3" else 2.0
         fea = _nearest_interp(fea, int(fea.shape[-1] * sc), scale_factor=sc)
         fea, _ = model.wns1(fea, mx.asarray(mel_lengths), ge)
+        if self.lora_adapters:
+            # DiT (LoRA targets) is the only grad consumer; fea is a constant
+            # conditioning input — cut the graph AFTER wns1 as well.
+            fea = mx.stop_gradient(fea)
+            ge = mx.stop_gradient(ge)
 
         B = ssl.shape[0]
         if det is not None:
