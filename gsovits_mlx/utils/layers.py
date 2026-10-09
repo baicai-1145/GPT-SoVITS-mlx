@@ -127,6 +127,11 @@ class Conv1d(nn.Module):
     """Conv1d, torch weight layout (out, in, k), applied to (B, C, T).
 
     MLX conv is channels-last, so we transpose input/output (zero-copy views in MLX).
+
+    Live weight norm (training only): if ``weight_v`` is set (and ``weight_g``),
+    the effective weight is computed per call as g*v/||v||_per-out-channel —
+    torch.nn.utils.weight_norm semantics. The inference path never sets these
+    attributes and is unchanged.
     """
 
     def __init__(self, in_ch: int, out_ch: int, k: int, stride: int = 1, padding: int = 0,
@@ -136,40 +141,73 @@ class Conv1d(nn.Module):
         limit = 1.0 / math.sqrt(in_ch * k / groups)
         self.weight = mx.random.uniform(-limit, limit, (out_ch, k, in_ch // groups))
         self.bias = mx.zeros((out_ch,)) if bias else None
+        self.weight_g = None
+        self.weight_v = None
         self.stride = stride
         self.padding = padding
         self.dilation = dilation
         self.groups = groups
 
+    def effective_weight(self, dtype):
+        if self.weight_v is None:
+            return self.weight.astype(dtype)
+        v32 = self.weight_v.astype(mx.float32)
+        norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2), keepdims=True))
+        w = self.weight_g.reshape(-1)[:, None, None].astype(mx.float32) * v32 / norm
+        return w.astype(dtype)
+
     def __call__(self, x: mx.array) -> mx.array:
         x = mx.transpose(x, (0, 2, 1))  # B C T -> B T C
         if self.padding:
             x = mx.pad(x, [(0, 0), (self.padding, self.padding), (0, 0)])
-        out = mx.conv1d(x, self.weight, stride=self.stride, padding=0,
+        out = mx.conv1d(x, self.effective_weight(x.dtype), stride=self.stride, padding=0,
                         dilation=self.dilation, groups=self.groups)
         out = mx.transpose(out, (0, 2, 1))
         if self.bias is not None:
-            out = out + self.bias[None, :, None]
+            out = out + self.bias[None, :, None].astype(out.dtype)
         return out
 
 
 class ConvTranspose1d(nn.Module):
-    """ConvTranspose1d, torch weight layout (in, out, k), applied to (B, C, T)."""
+    """ConvTranspose1d, torch weight layout (in, out, k), applied to (B, C, T).
+
+    Live weight norm supported like Conv1d (training path only): stored
+    weight_v is MLX-layout (out, k, in) after extraction; the call
+    transposes to the kernel layout (in, k, out) for mx.conv_transpose1d.
+    """
 
     def __init__(self, in_ch: int, out_ch: int, k: int, stride: int = 1, padding: int = 0, bias: bool = True):
         super().__init__()
         limit = 1.0 / math.sqrt(in_ch * k)
         self.weight = mx.random.uniform(-limit, limit, (out_ch, k, in_ch))
         self.bias = mx.zeros((out_ch,)) if bias else None
+        self.weight_g = None
+        self.weight_v = None
         self.stride = stride
         self.padding = padding
 
+    def effective_weight(self, dtype):
+        """(out, k, in) MLX-layout effective weight (torch weight_norm dim=0).
+
+        torch ConvTranspose1d weight is (in, out, k) with weight_g (in,1,1):
+        the norm is over (out,k) PER IN-CHANNEL. In MLX layout (out,k,in)
+        that means normalize over axes (0,1) and broadcast g on the last.
+        """
+        if self.weight_v is None:
+            return self.weight.astype(dtype)
+        v32 = self.weight_v.astype(mx.float32)
+        norm = mx.sqrt(mx.sum(v32 * v32, axis=(0, 1), keepdims=True))
+        w = v32 / norm * self.weight_g.reshape(1, 1, -1).astype(mx.float32)
+        return w.astype(dtype)
+
     def __call__(self, x: mx.array) -> mx.array:
+        dtype = x.dtype
+        w = self.effective_weight(dtype)  # (out, k, in) == mx kernel layout
         x = mx.transpose(x, (0, 2, 1))
-        out = mx.conv_transpose1d(x, self.weight, stride=self.stride, padding=self.padding)
+        out = mx.conv_transpose1d(x, w, stride=self.stride, padding=self.padding)
         out = mx.transpose(out, (0, 2, 1))
         if self.bias is not None:
-            out = out + self.bias[None, :, None]
+            out = out + self.bias[None, :, None].astype(out.dtype)
         return out
 
 
