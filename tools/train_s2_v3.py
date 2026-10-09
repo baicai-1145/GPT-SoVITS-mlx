@@ -285,6 +285,15 @@ def main(argv=None) -> None:
                     print(f"[warn] step {step+1}: non-finite loss/grads — "
                           f"skipping batch (mel_lengths={batch.mel_lengths}, "
                           f"melT={batch.mel.shape[-1]})", flush=True)
+                    if os.environ.get("GSOVITS_DUMP_NAN"):
+                        np.savez(os.path.join(
+                            os.environ["GSOVITS_DUMP_NAN"],
+                            f"nanbatch_step{step+1}.npz"),
+                            ssl=batch.ssl, spec=batch.spec, mel=batch.mel,
+                            ssl_lengths=batch.ssl_lengths,
+                            spec_lengths=batch.spec_lengths, text=batch.text,
+                            text_lengths=batch.text_lengths,
+                            mel_lengths=batch.mel_lengths)
                     if n_bad > 10:
                         raise SystemExit("too many non-finite batches")
                     continue
