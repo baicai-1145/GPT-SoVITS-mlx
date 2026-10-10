@@ -85,7 +85,8 @@ LORA_FULL_TRAIN_PARAM_PREFIXES = ("ref_enc.", "bridge_0.", "wns1.",
 # ---------------------------------------------------------------------------
 
 def upcast_training_model(model: SynthesizerTrnV3,
-                          dit_fp16: bool = True) -> None:
+                          dit_fp16: bool = True,
+                          dit_dtype: mx.Dtype | None = None) -> None:
     """Prepare training weight layout (official autocast semantics).
 
     * trunk (enc_p/ref_enc/ssl_proj/bridge/wns1/linear_mel via
@@ -100,7 +101,14 @@ def upcast_training_model(model: SynthesizerTrnV3,
       peft keeps fp32 params under autocast) and are cast at use time in
       dit_lora_forward (fp16 B@A + fp16 add matches autocast: the fp32
       master only matters for the OPTIMIZER update).
+    * ``dit_dtype`` (e.g. mx.bfloat16) overrides the DiT cast entirely —
+      bf16 keeps fp32's exponent range so the BACKWARD cannot overflow
+      (fp16 backward overflows past block ~8; measured, banned). The
+      LoRA delta add stays in the DiT weight dtype; LoRA masters remain
+      fp32 for the optimizer.
     """
+    if dit_dtype is not None:
+        dit_fp16 = False
     from mlx.utils import tree_map
     model.update(tree_map(lambda v: v.astype(mx.float32) if hasattr(v, "dtype")
                           else v, model.parameters()))
@@ -114,9 +122,12 @@ def upcast_training_model(model: SynthesizerTrnV3,
     if dit_fp16:
         est.update(tree_map(lambda v: v.astype(mx.float16) if hasattr(v, "dtype")
                             else v, est.parameters()))
-        for blk in est.transformer_blocks:
-            blk.attn._qkv_w_cache = None
-            blk.attn._cdtype = None
+    elif dit_dtype is not None:
+        est.update(tree_map(lambda v: v.astype(dit_dtype) if hasattr(v, "dtype")
+                            else v, est.parameters()))
+    for blk in est.transformer_blocks:
+        blk.attn._qkv_w_cache = None
+        blk.attn._cdtype = None
 
 
 def dit_lora_forward(dit, adapters: dict[str, LoRALinear], xt, prompt, x_lens,

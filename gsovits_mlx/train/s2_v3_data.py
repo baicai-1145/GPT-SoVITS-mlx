@@ -24,6 +24,22 @@ Official semantics ported:
 * CollateV4: max_ssl_len = 2*((max//2)+1); max_spec_len = 2*((max//2)+1);
   mel row width max_spec_len*2.
 
+CFM-trainer additions (memory optimization, OFF by default):
+
+* ``quantize_pad_multiple``: pad widths rounded up to a multiple of 64
+  frames (opt-in; ``--pad-multiple 64`` in tools/train_s2_v3.py). Extra pad
+  columns are zeros beyond every length, so all masked loss slices
+  (x_lens/mel_lengths bounded) and the y_mask/x_mask-aware trunk are
+  unchanged; quantizing the collated widths recycles a small set of Metal
+  buffer sizes instead of growing the allocator cache with every distinct
+  length (5.8GB cache on a 1GB live set, measured 2026-10-09).
+* ``LengthBucketSampler``: official DistributedBucketSampler semantics for
+  the CFM loader (boundary buckets on the spec-length proxy, per-bucket
+  pad-to-batch-multiple, seeded per-epoch in-bucket shuffle + batch-order
+  shuffle) — the pattern the official s2_train_v3_lora.py itself uses.
+  Opt-in via ``--length-buckets``; the default loader order (seed-1234 flat
+  shuffle) is the official V3/V4 loader semantics and stays untouched.
+
 The 24k ffmpeg resample replicates tools/my_utils.load_audio: ``ffmpeg -i in
 -f f32le -acodec pcm_f32le -ac 1 -ar 24000 -`` (bit-parity matters for the
 mel target; the loader caches nothing and streams ffmpeg stdout).
@@ -269,26 +285,43 @@ def _collate_common(batch, max_mel_len: int, max_ssl_len: int | None = None,
                    mel_lengths=mel_lengths)
 
 
-def collate_v3(batch):
-    """TextAudioSpeakerCollateV3."""
+def _pad_to_multiple(x: int, multiple: int) -> int:
+    """Round x up to a multiple (0 -> multiple, like the official 8*((m//8)+1))."""
+    return ((x + multiple - 1) // multiple) * multiple if x > 0 else multiple
+
+
+def collate_v3(batch, pad_multiple: int | None = None):
+    """TextAudioSpeakerCollateV3 (pad_multiple: see module docstring)."""
     max_ssl_len = max(b[0].shape[2] for b in batch)
     max_ssl_len1 = 8 * (max_ssl_len // 8 + 1)
     max_ssl_len = 2 * (max_ssl_len // 2 + 1)
     max_spec_len = 2 * (max(b[1].shape[1] for b in batch) // 2 + 1)
     max_mel_len = int(max_ssl_len1 * 1.25 * 1.5)
+    if pad_multiple:
+        max_ssl_len = _pad_to_multiple(max_ssl_len, pad_multiple)
+        max_spec_len = _pad_to_multiple(max_spec_len, pad_multiple)
+        max_mel_len = _pad_to_multiple(max_mel_len, pad_multiple)
     return _collate_common(batch, max_mel_len, max_ssl_len=max_ssl_len,
                            max_spec_len=max_spec_len)
 
 
-def collate_v4(batch):
+def collate_v4(batch, pad_multiple: int | None = None):
     """TextAudioSpeakerCollateV4 (v4/v5dev/v5turbo)."""
     max_ssl_len = 2 * (max(b[0].shape[2] for b in batch) // 2 + 1)
     max_spec_len = 2 * (max(b[1].shape[1] for b in batch) // 2 + 1)
-    return _collate_common(batch, max_spec_len * 2, max_ssl_len=max_ssl_len,
+    mel_w = max_spec_len * 2
+    if pad_multiple:
+        max_ssl_len = _pad_to_multiple(max_ssl_len, pad_multiple)
+        max_spec_len = _pad_to_multiple(max_spec_len, pad_multiple)
+        mel_w = _pad_to_multiple(mel_w, pad_multiple)
+    return _collate_common(batch, mel_w, max_ssl_len=max_ssl_len,
                            max_spec_len=max_spec_len)
 
 
-def collate_for(version: str):
+def collate_for(version: str, pad_multiple: int | None = None):
+    if pad_multiple:
+        return lambda batch: (collate_v3 if version == "v3" else collate_v4)(
+            batch, pad_multiple=pad_multiple)
     return collate_v3 if version == "v3" else collate_v4
 
 
@@ -330,3 +363,88 @@ def bucket_batches(lengths: list[int], batch_size: int,
                 batches.append(chunk)
     rng.shuffle(batches)
     return batches
+
+
+# ---------------------------------------------------------------------------
+# Length-bucket sampler for the CFM trainer (official DistributedBucket
+# sampler semantics, single replica — the pattern s2_train_v3_lora.py itself
+# uses on the V3/V4 datasets; opt-in via --length-buckets)
+# ---------------------------------------------------------------------------
+
+CFM_BUCKET_BOUNDARIES = [32, 300, 400, 500, 600, 700, 800, 900, 1000]
+
+
+class LengthBucketSampler:
+    """DistributedBucketSampler(num_replicas=1) over the CFM dataset.
+
+    Same bucket math as the GAN trainer's BucketSampler (gsovits_mlx/train/
+    s2_data.py): bisect each spec-length proxy into (b_i, b_{i+1}] buckets,
+    pad each bucket to a batch-size multiple by index repetition, in-bucket
+    shuffle + batch-order shuffle. RNG differs from the torch Philox
+    generator exactly like the GAN port (numpy default_rng(seed + epoch);
+    documented divergence, same lineage as s2_data.py).
+
+    Determinism contract: same (seed, epoch) -> identical batch list
+    (tests/test_train_s2v3.py::test_length_bucket_sampler_determinism).
+    """
+
+    def __init__(self, lengths: list[int], batch_size: int,
+                 boundaries=None, seed: int = 1234):
+        self.lengths = list(lengths)
+        self.batch_size = batch_size
+        self.boundaries = list(boundaries or CFM_BUCKET_BOUNDARIES)
+        self.seed = seed
+        self.epoch = 0
+        self.buckets, self.num_samples_per_bucket = self._create_buckets()
+
+    def _bisect(self, x: int) -> int:
+        b = self.boundaries
+        for i in range(len(b) - 1):
+            if b[i] < x <= b[i + 1]:
+                return i
+        return -1
+
+    def _create_buckets(self):
+        buckets = [[] for _ in range(len(self.boundaries) - 1)]
+        for i, length in enumerate(self.lengths):
+            idx_bucket = self._bisect(length)
+            if idx_bucket != -1:
+                buckets[idx_bucket].append(i)
+        i = len(buckets) - 1
+        while i >= 0:
+            if len(buckets[i]) == 0:
+                buckets.pop(i)
+                self.boundaries.pop(i + 1)
+            i -= 1
+        num_samples_per_bucket = []
+        for bucket in buckets:
+            rem = (self.batch_size - (len(bucket) % self.batch_size)) \
+                % self.batch_size
+            num_samples_per_bucket.append(len(bucket) + rem)
+        return buckets, num_samples_per_bucket
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def batch_indices(self, epoch: int | None = None) -> list[list[int]]:
+        epoch = self.epoch if epoch is None else epoch
+        rng = np.random.default_rng(self.seed + epoch)
+        indices = [rng.permutation(len(bucket)).tolist()
+                   for bucket in self.buckets]
+        batches = []
+        for i, bucket in enumerate(self.buckets):
+            ids = indices[i]
+            rem = self.num_samples_per_bucket[i] - len(bucket)
+            ids = (ids + ids * (rem // len(bucket))
+                   + ids[: (rem % len(bucket))])
+            for j in range(len(ids) // self.batch_size):
+                batches.append([bucket[k] for k in
+                                ids[j * self.batch_size:(j + 1) * self.batch_size]])
+        batch_ids = rng.permutation(len(batches)).tolist()
+        return [batches[k] for k in batch_ids]
+
+    def __iter__(self):
+        return iter(self.batch_indices())
+
+    def __len__(self) -> int:
+        return sum(self.num_samples_per_bucket) // self.batch_size

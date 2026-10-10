@@ -78,6 +78,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-batch-mel", type=int, default=None,
                    help="skip batches whose collated mel width exceeds this"
                         " (smoke memory aid; frames)")
+    p.add_argument("--length-buckets", action="store_true",
+                   help="OPT-IN length-bucketed batch sampler (official "
+                        "DistributedBucketSampler semantics on the CFM "
+                        "loader): similar-length batches, big Metal-cache "
+                        "win. Default off = official flat shuffle order.")
+    p.add_argument("--pad-multiple", type=int, default=None,
+                   help="OPT-IN pad quantization: round collated ssl/spec/"
+                        "mel widths up to this frame multiple (e.g. 64). "
+                        "Extra pad frames are masked out of the loss by "
+                        "x_lens/mel_lengths slicing (loss-neutral); the "
+                        "allocator reuses a small set of buffer sizes. "
+                        "Default None = official collate widths.")
     p.add_argument("--dit-fp32", action="store_true",
                    help="force fp32 fused DiT forward (debug only; banned at "
                         "max length on this machine — OOM'd twice)")
@@ -86,6 +98,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="two-pass checkpointed DiT backward (memory-safe "
                         "default; grad-verified vs fused)")
     p.add_argument("--no-dit-ckpt", dest="dit_ckpt", action="store_false")
+    p.add_argument("--dit-dtype", default=None, choices=["fp32", "fp16", "bf16"],
+                   help="EXPERIMENTAL DiT compute dtype override. Default: "
+                        "fp32 masters with ckpt mode (fp16 backward "
+                        "overflows — banned). bf16 keeps fp32's exponent "
+                        "range (no overflow) at half the GEMM traffic; "
+                        "gated experiment, see .tmp/TRAINING.md addendum.")
     p.add_argument("--dump-batches", default=None,
                    help="dump collated batches as npz into this dir and exit"
                         " (for the torch CPU reference driver)")
@@ -130,7 +148,8 @@ def main(argv=None) -> None:
     from gsovits_mlx.train.lora import inject_lora
     from gsovits_mlx.train.s2_cfm import S2V3TrainModel, upcast_training_model
     from gsovits_mlx.train.s2_v3_data import (TextAudioSpeakerLoaderV3V4,
-                                              bucket_batches, collate_for)
+                                              bucket_batches, collate_for,
+                                              LengthBucketSampler)
     from gsovits_mlx.train.optim import AdamW
     from gsovits_mlx.train.mixed_precision import GradScaler
     from gsovits_mlx.train.loop import Trainer
@@ -152,7 +171,7 @@ def main(argv=None) -> None:
                              "/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-CPUFast"),
               models_root=args.models_root)
     dataset = TextAudioSpeakerLoaderV3V4(args.exp_dir, args.version)
-    collate = collate_for(args.version)
+    collate = collate_for(args.version, pad_multiple=args.pad_multiple)
     os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     # -- model ------------------------------------------------------------------
@@ -162,8 +181,19 @@ def main(argv=None) -> None:
     # ckpt mode NEEDS fp32 DiT weights (fp16 backward overflows — measured);
     # fp16 is only valid for the fused-forward path which is banned at max
     # length anyway. Keep --dit-fp32 as an explicit override for fused mode.
-    upcast_training_model(model, dit_fp16=(not args.dit_ckpt
-                                            and not args.dit_fp32))
+    # --dit-dtype bf16 (gated experiment): bf16 has fp32's exponent range so
+    # the BACKWARD cannot overflow; LoRA masters stay fp32 (optimizer), the
+    # per-block GEMMs run bf16 with the fp32 residual stream.
+    dit_dtype = {"fp32": mx.float32, "fp16": mx.float16,
+                 "bf16": mx.bfloat16}.get(args.dit_dtype)
+    upcast_training_model(
+        model,
+        dit_fp16=(not args.dit_ckpt and not args.dit_fp32
+                  and dit_dtype is None),
+        dit_dtype=dit_dtype)
+    if dit_dtype is not None and args.dit_dtype == "bf16":
+        print("[mode] bf16 DiT experiment: bf16 weights + fp32 stream "
+              "(grad-overflow-safe by exponent range)", flush=True)
 
     adapters = None if args.no_lora else \
         inject_lora(model.cfm.estimator, rank=args.lora_rank, seed=args.seed)
@@ -188,6 +218,32 @@ def main(argv=None) -> None:
 
     os.makedirs(args.out, exist_ok=True)
     loss_log = args.loss_log or os.path.join(args.out, "loss.jsonl")
+    fp_log_path = os.path.join(args.out, "footprint_steps.jsonl")
+    fp_log = open(fp_log_path, "a", buffering=1)
+
+    def step_mem_rec(step: int, loss: float, t_step: float) -> dict:
+        """One per-step memory record: phys_footprint + Metal counters."""
+        try:
+            fp = FootprintSampler.read_phys_footprint(os.getpid())
+        except Exception:
+            fp = 0
+        try:
+            act = int(mx.metal.get_active_memory())
+            cache = int(mx.metal.get_cache_memory())
+        except Exception:
+            act = cache = 0
+        return {"step": step, "loss": loss, "footprint": fp,
+                "metal_active": act, "metal_cache": cache,
+                "metal_active_plus_cache": act + cache, "t_step": t_step}
+
+    def log_step_footprint(rec: dict, flush: bool = False):
+        """Append to footprint_steps.jsonl. cache+active steady state is the
+        allocator-recycling gate for --length-buckets/--pad-multiple
+        (task cfm-mem-opt)."""
+        fp_log.write(json.dumps(rec) + "\n")
+        if flush:
+            fp_log.flush()
+            os.fsync(fp_log.fileno())
 
     # -- export-only path ----------------------------------------------------------
     if args.export_only:
@@ -203,12 +259,23 @@ def main(argv=None) -> None:
     # -- data -----------------------------------------------------------------------
     # loaded ABOVE (before the model) because the frontend bootstrap chdirs
     # into the CPUFast checkout; the loop below only reads dataset[i].
+    def epoch_batches(epoch: int):
+        """Batch index lists for one epoch (official flat order or the
+        opt-in length-bucket sampler; both deterministic per seed/epoch)."""
+        if args.length_buckets:
+            sampler = LengthBucketSampler(dataset.lengths, args.batch_size,
+                                          seed=args.seed)
+            sampler.set_epoch(epoch)
+            return sampler.batch_indices()
+        return bucket_batches(dataset.lengths, args.batch_size,
+                              seed=args.seed + epoch)
+
     if args.dump_batches:
         import numpy as _np
         os.makedirs(args.dump_batches, exist_ok=True)
         n = 0
-        for bidx in bucket_batches(dataset.lengths, args.batch_size,
-                                   seed=args.seed):
+        for bidx in epoch_batches(0):
+            batch = collate([dataset[i] for i in bidx])
             batch = collate([dataset[i] for i in bidx])
             if args.max_batch_mel and batch.mel.shape[-1] > args.max_batch_mel:
                 continue
@@ -266,6 +333,7 @@ def main(argv=None) -> None:
         print(f"resumed at step {start_step}")
 
     # -- loop ------------------------------------------------------------------------
+    from gsovits_mlx.train.loop import FootprintSampler
     t0 = time.time()
     step = start_step
     n_bad = 0
@@ -274,8 +342,7 @@ def main(argv=None) -> None:
     for epoch in range(args.epochs):
         if stop:
             break
-        for bidx in bucket_batches(dataset.lengths, args.batch_size,
-                                   seed=args.seed + epoch):
+        for bidx in epoch_batches(epoch):
             batch = collate([dataset[i] for i in bidx])
             if args.max_batch_mel and batch.mel.shape[-1] > args.max_batch_mel:
                 continue
@@ -315,16 +382,20 @@ def main(argv=None) -> None:
                     mx.clear_cache()
                 except Exception:
                     pass
-                from gsovits_mlx.train.loop import FootprintSampler
-                _fp = FootprintSampler.read_phys_footprint(os.getpid())
-                if _fp > 8 * 1024 * 1024 * 1024:
+                t_step = time.time() - t0
+                rec = step_mem_rec(step + 1, float(loss), t_step)
+                log_step_footprint(rec, flush=(step + 1) % 10 == 0)
+                if rec["footprint"] > 8 * 1024 * 1024 * 1024:
                     release_lock()
                     raise SystemExit(
-                        f"[abort] step {step} footprint {_fp/1e9:.2f} GB > 8GB "
+                        f"[abort] step {step} footprint "
+                        f"{rec['footprint']/1e9:.2f} GB > 8GB "
                         "gate — aborting before machine risk")
             else:
                 loss = trainer.train_step(batch, forward_fn, backward_fn)
                 sync_adapters()
+                rec = step_mem_rec(step + 1, float(loss), time.time() - t0)
+                log_step_footprint(rec, flush=(step + 1) % 10 == 0)
             step += 1
             if _REFRESH_LOCK is not None and step % 40 == 0:
                 _REFRESH_LOCK()  # 10-min freshness for long runs
@@ -341,6 +412,7 @@ def main(argv=None) -> None:
 
     trainer.stop_footprint_sampler()
     mem = trainer.memory_report()
+    fp_log.close()
 
     save_resume(os.path.join(args.out, "resume_ckpt"), masters, [opt],
                 step=trainer.step, epoch=trainer.epoch,
