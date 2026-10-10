@@ -221,16 +221,33 @@ class S1TrainModel:
 
         h0, x_len, targets_np = self._embed_head(p16, batch)
         mx.eval(h0)
-        h = h0
-        hs = [h0]
         attn_mask = self._mask_for(batch, dtype)
-        for i in range(self.num_layers):
-            pre = f"block.{i}."
-            pt = {k: p16[pre + k] for k in self._BLOCK_KEYS}
-            h = self._block_core(pt, h, attn_mask)
-            mx.eval(h)
-            hs.append(h)
-
+        G = self.ckpt_groups
+        if G == 1:
+            # historical per-layer pass 1 (official default path)
+            h = h0
+            hs = [h0]
+            for i in range(self.num_layers):
+                pre = f"block.{i}."
+                pt = {k: p16[pre + k] for k in self._BLOCK_KEYS}
+                h = self._block_core(pt, h, attn_mask)
+                mx.eval(h)
+                hs.append(h)
+        else:
+            # grouped pass 1: one eval per GROUP of G layers; retain ONLY the
+            # group-boundary inputs hs[g*G] (the backward recomputes whole
+            # groups from those, so interior activations are never needed).
+            h = h0
+            hs = [h0]
+            for gstart in range(0, self.num_layers, G):
+                for i in range(gstart, gstart + G):
+                    pre = f"block.{i}."
+                    pt = {k: p16[pre + k] for k in self._BLOCK_KEYS}
+                    h = self._block_core(pt, h, attn_mask)
+                mx.eval(h)
+                if gstart + G < self.num_layers:
+                    hs.append(h)  # next group's input
+            # hs now = [h0, h_G, h_2G, ..., h_{L-G}]; final h = h_L
         loss, logits32, targets = self._predict_head(h, p16, x_len, targets_np)
 
         # -- backward: predict head --
@@ -252,18 +269,17 @@ class S1TrainModel:
 
         # -- backward: blocks, one GROUP at a time (item-A blitz) ----------
         # G = ckpt_groups: each grad call recomputes the G layers of one
-        # group; retained inputs = group boundaries only (hs stride G).
-        # Same math as per-layer (each layer recomputed exactly once; the
-        # per-layer reduction (out*g).sum() composes identically through a
-        # group), so grads are IDENTICAL up to fp reduction order (fp16
-        # forward + fp32 reduction, as before).
-        G = self.ckpt_groups
+        # group from its BOUNDARY input; retained inputs = group boundaries
+        # only (hs has L/G+1 entries when G>1). Same math as per-layer (each
+        # layer recomputed exactly once; the per-layer reduction (out*g).sum()
+        # composes identically through a group), so grads are IDENTICAL up
+        # to fp reduction order (fp16 forward + fp32 reduction, as before).
         g = g_h
         layer_params = {i: [p16[f"block.{i}." + k] for k in self._BLOCK_KEYS]
                         for i in range(self.num_layers)}
         for gstart in range(self.num_layers - G, -1, -G):
             glayers = range(gstart, gstart + G)
-            in_h = hs[gstart]
+            in_h = hs[gstart // G]  # boundary list: entry j = h_{j*G}
 
             def red(hh, *tts, _layers=tuple(glayers)):
                 out = hh
