@@ -236,10 +236,14 @@ def main(argv=None) -> None:
         except Exception:
             fp = 0
         try:
-            act = int(mx.metal.get_active_memory())
-            cache = int(mx.metal.get_cache_memory())
+            act = int(mx.get_active_memory())
+            cache = int(mx.get_cache_memory())
         except Exception:
-            act = cache = 0
+            try:
+                act = int(mx.metal.get_active_memory())
+                cache = int(mx.metal.get_cache_memory())
+            except Exception:
+                act = cache = 0
         return {"step": step, "loss": loss, "footprint": fp,
                 "metal_active": act, "metal_cache": cache,
                 "metal_active_plus_cache": act + cache, "t_step": t_step}
