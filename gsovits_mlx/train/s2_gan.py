@@ -99,6 +99,23 @@ def slice_segments(x: mx.array, ids_str, segment_size: int) -> mx.array:
     return mx.stack(ret, 0)
 
 
+def slice_segments_gather(x: mx.array, ids_str, segment_size: int) -> mx.array:
+    """Compile-safe equivalent of slice_segments (identical selection).
+
+    The reference loop calls int(ids_str[i]) per row — a graph break under
+    mx.compile that BAKES the row offsets as constants (stale slices on
+    every later call). This variant keeps ids_str an array and gathers:
+    x[:, :, ids[i] + j] for j in range(segment_size), numerically identical
+    (same elements, same order) and gradient-identical (pure gather).
+    """
+    b = x.shape[0]
+    off = mx.arange(segment_size, dtype=ids_str.dtype)  # (S,)
+    idx = ids_str.reshape(b, 1) + off.reshape(1, segment_size)  # (B, S)
+    idx = idx.reshape(b, 1, segment_size) + mx.zeros((1, x.shape[1], 1),
+                                                     dtype=ids_str.dtype)
+    return mx.take_along_axis(x, idx, axis=2)
+
+
 def rand_slice_segments(x: mx.array, x_lengths: mx.array, segment_size: int,
                         key: mx.array | None = None):
     """torch commons.rand_slice_segments: ids = floor(rand*b @ (len-seg+1))."""
@@ -107,6 +124,17 @@ def rand_slice_segments(x: mx.array, x_lengths: mx.array, segment_size: int,
     r = mx.random.uniform(shape=(b,), key=key)
     ids_str = (r * ids_str_max).astype(mx.int32)
     return slice_segments(x, ids_str, segment_size), ids_str
+
+
+def rand_slice_segments_gather(x: mx.array, x_lengths: mx.array,
+                               segment_size: int,
+                               key: mx.array | None = None):
+    """rand_slice_segments with the compile-safe gather slice."""
+    b = x.shape[0]
+    ids_str_max = x_lengths - segment_size + 1
+    r = mx.random.uniform(shape=(b,), key=key)
+    ids_str = (r * ids_str_max).astype(mx.int32)
+    return slice_segments_gather(x, ids_str, segment_size), ids_str
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +436,11 @@ class SynthesizerTrnTrain:
         self.sv_emb_weight = self.sv_emb_bias = None
         self.ge_to512_weight = self.ge_to512_bias = None
         self.prelu_weight = None
+        # compile-safety knob: when set, forward() uses the gather-based
+        # segment slice (identical math; see slice_segments_gather) — the
+        # reference loop's int(ids_str[i]) is a graph break that BAKES
+        # stale offsets under mx.compile.
+        self.use_gather_slice = False
 
     # -- bind the flat dict ---------------------------------------------------
     def bind(self, params: dict) -> None:
@@ -523,8 +556,12 @@ class SynthesizerTrnTrain:
         z, m_q, logs_q, x_mask = self.enc_q(y, y_lengths, g=ge, key=key,
                                            strict_noise=strict_noise)
         z_p = self.flow(z, x_mask, g=ge)
-        z_slice, ids_slice = rand_slice_segments(z, y_lengths, self.segment_size,
-                                                 key=key)
+        if self.use_gather_slice:
+            z_slice, ids_slice = rand_slice_segments_gather(
+                z, y_lengths, self.segment_size, key=key)
+        else:
+            z_slice, ids_slice = rand_slice_segments(
+                z, y_lengths, self.segment_size, key=key)
         o = self.dec(z_slice, g=ge)
         return (o, kl_ssl, ids_slice, y_mask2,
                 (z, z_p, m_p, logs_p, m_q, logs_q), quantized)

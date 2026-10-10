@@ -171,6 +171,26 @@ def parse_args(argv=None):
                         "input z_slice actually computes in low precision "
                         "(the fp32 randn silently promotes flow+dec). "
                         "Default on; disable for exact-legacy fp16 numerics.")
+    p.add_argument("--pad-multiple", type=int, default=None,
+                   help="quantize collated ssl/spec/text widths (and wav, in "
+                        "hop units) up to multiples of N frames — CFM "
+                        "trainer's proven pattern; recycles Metal buffer "
+                        "sizes; OFF by default (official collate semantics).")
+    p.add_argument("--fixed-shape", action="store_true",
+                   help="force ALL batches to one global padded shape (dataset "
+                        "max widths quantized to 64). Extra pad is masked "
+                        "from losses exactly like official padding (zero "
+                        "columns beyond every length; masks/slices length-"
+                        "bounded). Recycles ONE working set of buffer sizes; "
+                        "mx.compile prerequisite.")
+    p.add_argument("--compile-mode", choices=("none", "step", "fwd"),
+                   default="none",
+                   help="mx.compile experiment (needs --fixed-shape for stable "
+                        "shapes): none=default eager; step=wrap the phase-"
+                        "split eval'd step helper in mx.compile; fwd=wrap the "
+                        "inner G/D forward functions (finer granularity). "
+                        "Exploratory — expect MLX 0.32.2 failures on custom "
+                        "ops/dynamic shapes; results recorded in TRAINING.md.")
     p.add_argument("--memory-limit-mb", type=int,
                    default=int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "8192")),
                    help="Metal wired limit; 8GB default for training (lead "
@@ -249,7 +269,23 @@ def _run(args, device, mx):
         filter_length=TRAIN["filter_length"],
         hop_length=TRAIN["hop_length"], win_length=TRAIN["win_length"])
     print(f"[data] {dataset.stats}")
-    collate = TextAudioSpeakerCollate(version=args.version)
+    fixed_widths = None
+    if args.fixed_shape:
+        # one global padded shape: dataset maxima quantized to 64
+        # (spec/ssl in frames, wav in samples = spec_frames*640, text rows)
+        q = lambda x: ((x + 63) // 64) * 64
+        mx_spec = max(int(l) for l in dataset.lengths)
+        # wav samples = frames*hop exactly (stft center=False, hop 640)
+        fixed_widths = dict(ssl=q(mx_spec), spec=q(mx_spec),
+                            wav=q(mx_spec) * 640)
+        # text width: max phoneme-id count over the dataset (cheap scan)
+        mx_text = max(len(ds_t[1]) for ds_t in dataset.audiopaths_sid_text)
+        fixed_widths["text"] = q(mx_text)
+        print(f"[fixed-shape] spec/ssl {fixed_widths['spec']} frames, wav "
+              f"{fixed_widths['wav']} samples, text {fixed_widths['text']}")
+    collate = TextAudioSpeakerCollate(version=args.version,
+                                      pad_multiple=args.pad_multiple,
+                                      fixed_widths=fixed_widths)
     sampler = BucketSampler(dataset.lengths, args.batch_size, shuffle=True)
 
     # ---- models ----
@@ -405,6 +441,33 @@ def _run(args, device, mx):
         return (loss_gen + loss_fm + loss_mel + kl_ssl * 1.0 + loss_kl,
                 (loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl))
 
+    # -- mx.compile experiment, fwd arm (ITEM 2) ---------------------------
+    # Compiled wrappers over the inner G forward / D call. Weights are
+    # passed as ARGUMENTS (never captured): a captured mx array becomes a
+    # compile-time constant and the optimizer's updates would be silently
+    # ignored (stale-weight hazard). net_g.bind(p16_) / load_mpd_weights
+    # run INSIDE the traced body on the input dicts. None = eager
+    # (official semantics).
+    g_fwd_c = d_call_c = None
+    if args.compile_mode == "fwd":
+        def _g_fwd_c(p16_, ssl_, spec_in_, y_lengths_, text_, text_lengths_,
+                     sv_, key_, quant_in_, strict_):
+            net_g.bind(p16_)
+            o, kl_ssl, ids_slice, y_mask, ql, _ = net_g.forward(
+                ssl_, spec_in_, y_lengths_, text_, text_lengths_, sv_emb=sv_,
+                key=key_, quantized_in=quant_in_, strict_noise=strict_)
+            return o, kl_ssl, ids_slice, y_mask, ql
+        g_fwd_c = mx.compile(_g_fwd_c)
+
+        def _d_call_c(d16_, y32_, yhat32_):
+            load_mpd_weights(net_d, d16_)
+            return net_d(y32_, yhat32_)
+        d_call_c = mx.compile(_d_call_c)
+
+    # compiled G-forward (fwd arm) must use the gather slice: the loop's
+    # int(ids_str[i]) is a graph break under mx.compile (bakes stale offsets)
+    net_g.use_gather_slice = (args.compile_mode == "fwd")
+
     def fused_loss_fn(d16, p16, arrays, sv, key):
         """Single-trace joint (D, G) loss — official one-forward structure.
 
@@ -416,6 +479,9 @@ def _run(args, device, mx):
             documented pre-update-D deviation); grads flow ONLY into p16.
         One rand_slice + one posterior-noise draw (key) shared by both
         branches — official single-draw RNG.
+        g_fwd_c/d_call_c (the --compile-mode fwd experiment) inject compiled
+        G/D forwards; None = eager (default; official semantics). They are
+        transparent to mx.value_and_grad and bit-identical when uncompiled.
         """
         # ---- shared single G forward (official net_g call #1) ----
         (ssl, ssl_lengths, spec, spec_lengths, wav, wav_lengths, text,
@@ -427,11 +493,17 @@ def _run(args, device, mx):
             spec_in = spec.astype(compute_dtype)
         y_lengths = spec_lengths
         quant, commit = net_g.quantize_ssl(ssl)
-        o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
-            net_g.forward(ssl, spec_in, y_lengths, text.astype(mx.int32),
-                          text_lengths, sv_emb=sv, key=key,
-                          quantized_in=(quant, commit),
-                          strict_noise=args.bf16_strict_noise)
+        if g_fwd_c is None:
+            o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
+                net_g.forward(ssl, spec_in, y_lengths, text.astype(mx.int32),
+                              text_lengths, sv_emb=sv, key=key,
+                              quantized_in=(quant, commit),
+                              strict_noise=args.bf16_strict_noise)
+        else:
+            o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
+                g_fwd_c(p16, ssl, spec_in, y_lengths, text.astype(mx.int32),
+                        text_lengths, sv, key, (quant, commit),
+                        args.bf16_strict_noise)
         mel = G.spec_to_mel(spec.astype(mx.float32), mel_basis)
         y_mel = G.slice_segments(mel, ids_slice, seg_frames)
         y_hat_mel = G.mel_spectrogram_train(
@@ -442,14 +514,16 @@ def _run(args, device, mx):
         y32 = y.astype(mx.float32)
 
         # ---- D branch (official: net_d(y, y_hat.detach())) ----
-        load_mpd_weights(net_d, d16)
-        y_d_hat_r_d, y_d_hat_g_d, _, _ = net_d(y32, mx.stop_gradient(o).astype(mx.float32))
+        dcall = d_call_c if d_call_c is not None else (
+            lambda dd, y_, yh_: (load_mpd_weights(net_d, dd), net_d(y_, yh_))[1])
+        y_d_hat_r_d, y_d_hat_g_d, _, _ = dcall(
+            d16, y32, mx.stop_gradient(o).astype(mx.float32))
         loss_d, _, _ = G.discriminator_loss(y_d_hat_r_d, y_d_hat_g_d)
 
         # ---- G branch (official: net_d(y, y_hat) on updated D; ours: pre-update D) ----
         d_const = {k: mx.stop_gradient(v) for k, v in d16.items()}
-        load_mpd_weights(net_d, d_const)
-        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y32, o.astype(mx.float32))
+        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = dcall(d_const, y32,
+                                                     o.astype(mx.float32))
         loss_mel = mx.mean(mx.abs(y_mel - y_hat_mel)) * TRAIN["c_mel"]
         loss_kl = G.kl_loss(z_p, logs_q, m_p, logs_p, y_mask) * TRAIN["c_kl"]
         loss_fm = G.feature_loss(fmap_r, fmap_g)
@@ -459,6 +533,25 @@ def _run(args, device, mx):
                                        kl_ssl, loss_kl)
 
     # ---- loop -----------------------------------------------------------------
+    # step arm: wrap the joint value_and_grad helper in mx.compile. Outputs
+    # stay lazy; the loop below still evals phase-1 (D branch + dgrads)
+    # then phase-2 (G parts + ggrads) exactly like eager — compile cannot
+    # fuse both backwards into one peak (the 8GB-gate lesson from the
+    # first fused attempt).
+    if args.compile_mode == "step":
+        def _joint_step(d16_, p16_, ssl_, ssl_len_, spec_, spec_len_, wav_,
+                        wav_len_, text_, text_len_, sv_, key_):
+            arrays_ = (ssl_, ssl_len_, spec_, spec_len_, wav_, wav_len_,
+                       text_, text_len_)
+            (total, parts), (dgrads, ggrads) = mx.value_and_grad(
+                fused_loss_fn, argnums=(0, 1))(d16_, p16_, arrays_, sv_, key_)
+            return parts, dgrads, ggrads
+        joint_step_c = mx.compile(_joint_step)
+    else:
+        joint_step_c = None
+    if args.compile_mode and args.compile_mode != "none" and not args.fixed_shape:
+        print("[compile] WARNING: compile without --fixed-shape re-specializes "
+              "on every distinct width (expect slowness)")
     logf = open(os.path.join(args.out, "loss.jsonl"), "a")
     fp_log = open(os.path.join(args.out, "footprint_steps.jsonl"), "a",
                   buffering=1)
@@ -529,8 +622,12 @@ def _run(args, device, mx):
                 # 8GB gate). Phase-split: eval D branch -> step D -> free ->
                 # eval G branch (reuses the SAME G-forward primals — the
                 # compute win stays, the peak matches double mode).
-                (total, parts), (dgrads, ggrads) = mx.value_and_grad(
-                    fused_loss_fn, argnums=(0, 1))(d16, p16, arrays, sv, kd)
+                if joint_step_c is not None:
+                    parts, dgrads, ggrads = joint_step_c(
+                        d16, p16, *arrays, sv, kd)
+                else:
+                    (total, parts), (dgrads, ggrads) = mx.value_and_grad(
+                        fused_loss_fn, argnums=(0, 1))(d16, p16, arrays, sv, kd)
                 # fp16 keeps the legacy GradScaler machinery; bf16 bypasses
                 # (CFM precedent — no scaler needed, fp32 grads/heads).
                 if args.precision == "fp16":

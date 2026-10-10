@@ -5,6 +5,19 @@ TextAudioSpeakerCollate / DistributedBucketSampler (single-process; the
 official num_replicas=1 CPU case) reading the exp_dir produced by
 tools/prepare_data.py (task-2 layout: .npy feature files instead of torch .pt).
 
+GAN-trainer memory additions (this port, OFF by default — see
+pad_multiple/fixed_widths below; --pad-multiple / --fixed-shape in
+tools/train_s2.py): quantized or fully-fixed collated widths recycle a
+small set of Metal buffer sizes instead of fragmenting the allocator
+cache with ~1 distinct width per batch (measured 83 distinct spec widths
+in 120 b3 batches of the 939-item exp set). Extra pad is zero columns
+beyond every *_lengths entry; all loss/mask consumption paths are
+length-bounded (y_mask/x_mask from sequence_mask, kl summed under z_mask,
+segment slices in-bounds), so losses are pad-neutral EXCEPT the posterior
+randn draw, whose width follows the padded shape exactly like official
+torch (torch.randn over the padded tensor) — fixed/quantized widths shift
+the draw in the SAME way official torch pads do; NOT a semantic deviation.
+
 Semantics replicated exactly (verified against the official source):
   * dataset construction: intersect 2-name2text ∩ 4-cnhubert ∩ 5-wav32k
     (+7-sv_cn for Pro), the <100-file duplication loop, random.seed(1234)
@@ -181,8 +194,11 @@ class TextAudioSpeakerLoader:
 
 
 class TextAudioSpeakerCollate:
-    def __init__(self, version: str = "v2"):
+    def __init__(self, version: str = "v2", pad_multiple: int | None = None,
+                 fixed_widths: dict | None = None):
         self.is_v2pro = version in ("v2Pro", "v2ProPlus")
+        self.pad_multiple = pad_multiple
+        self.fixed_widths = fixed_widths  # {name: width} overrides ALL maxima
 
     def __call__(self, batch):
         # ids sorted by spec length desc (torch.sort stable for equal keys)
@@ -193,6 +209,19 @@ class TextAudioSpeakerCollate:
         max_spec_len = int(2 * ((max_spec_len // 2) + 1))
         max_wav_len = max(x[2].shape[0] for x in batch)
         max_text_len = max(x[3].shape[0] for x in batch)
+        if self.pad_multiple:
+            m = self.pad_multiple
+            max_ssl_len = ((max_ssl_len + m - 1) // m) * m
+            max_spec_len = ((max_spec_len + m - 1) // m) * m
+            # hop 640: wav width stays spec-aligned (20480 % 640 == 0)
+            max_wav_len = ((max_wav_len + m * 640 - 1) // (m * 640)) * (m * 640)
+            max_text_len = ((max_text_len + m - 1) // m) * m
+        if self.fixed_widths:
+            fw = self.fixed_widths
+            max_ssl_len = fw.get("ssl", max_ssl_len)
+            max_spec_len = fw.get("spec", max_spec_len)
+            max_wav_len = fw.get("wav", max_wav_len)
+            max_text_len = fw.get("text", max_text_len)
 
         n = len(batch)
         n_freq = batch[0][1].shape[0]
