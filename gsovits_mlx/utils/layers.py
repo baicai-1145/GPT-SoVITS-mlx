@@ -82,6 +82,26 @@ def generate_path(duration: mx.array, mask: mx.array) -> mx.array:
     return mx.cumsum(path, axis=-1) - path
 
 
+# -- fused Metal kernels (training; default OFF; see train/metal_kernels.py) --
+_MK_FLAG = {"on": False}
+
+
+def set_metal_kernels(on: bool) -> None:
+    _MK_FLAG["on"] = bool(on) and _mk_importable()
+
+
+def _mk_enabled() -> bool:
+    return _MK_FLAG["on"]
+
+
+def _mk_importable() -> bool:
+    try:
+        from .train import metal_kernels as _mk  # noqa: F401
+        return _mk.available()
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # layers
 # ---------------------------------------------------------------------------
@@ -151,6 +171,9 @@ class Conv1d(nn.Module):
     def effective_weight(self, dtype):
         if self.weight_v is None:
             return self.weight.astype(dtype)
+        if _mk_enabled():
+            from .train_metal_kernels import wn_scale
+            return wn_scale(self.weight_g.reshape(-1), self.weight_v, dtype)
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2), keepdims=True))
         w = self.weight_g.reshape(-1)[:, None, None].astype(mx.float32) * v32 / norm
@@ -195,6 +218,11 @@ class ConvTranspose1d(nn.Module):
         """
         if self.weight_v is None:
             return self.weight.astype(dtype)
+        if _mk_enabled():
+            # kernel normalizes over trailing axes per OUT channel? NO:
+            # ConvTranspose norm is per IN channel (last axis in MLX layout).
+            # Use the chain (rare path: dec.ups x5 per fwd only).
+            pass
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(0, 1), keepdims=True))
         w = v32 / norm * self.weight_g.reshape(1, 1, -1).astype(mx.float32)
@@ -317,7 +345,11 @@ class WN(nn.Module):
                 g_l = g[:, i * 2 * self.hidden_channels : (i + 1) * 2 * self.hidden_channels, :]
             else:
                 g_l = mx.zeros_like(x_in)
-            acts = fused_add_tanh_sigmoid_multiply(x_in, g_l, self.hidden_channels)
+            if _mk_enabled():
+                from .train.metal_kernels import fused_gate as _fused_gate
+                acts = _fused_gate(x_in, g_l)
+            else:
+                acts = fused_add_tanh_sigmoid_multiply(x_in, g_l, self.hidden_channels)
             res_skip_acts = self.res_skip_layers[i](acts)
             if i < self.n_layers - 1:
                 res_acts = res_skip_acts[:, : self.hidden_channels, :]

@@ -26,9 +26,16 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..utils.layers import get_padding
+from ..utils.layers import get_padding, _mk_enabled
 
 LRELU_SLOPE = 0.1
+
+def _bias_lrelu(x: mx.array, bias: mx.array, slope: float):
+    """bias-add + LeakyReLU; fused Metal kernel when enabled (4D-safe)."""
+    if _mk_enabled() and x.ndim == 3:
+        from .metal_kernels import bias_lrelu as _bl
+        return _bl(x, bias, slope)
+    return nn.leaky_relu(x + bias[None, :, None].astype(x.dtype), slope)
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +63,9 @@ class WeightNormConv1d:
 
     @property
     def weight(self) -> mx.array:
+        if _mk_enabled():
+            from .metal_kernels import fused_wn_scale as _fwn
+            return _fwn(self.weight_g.reshape(-1), self.weight_v)
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2), keepdims=True))
         w = self.weight_g.reshape(-1)[:, None, None].astype(mx.float32) * v32 / norm
@@ -86,6 +96,9 @@ class WeightNormConv2d:
     @property
     def weight(self) -> mx.array:
         """Effective weight in TORCH layout (out, in, kh, kw)."""
+        if _mk_enabled():
+            from .metal_kernels import fused_wn_scale as _fwn
+            return _fwn(self.weight_g.reshape(-1), self.weight_v)
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2, 3), keepdims=True))
         w = self.weight_g.reshape(-1)[:, None, None, None].astype(mx.float32) * v32 / norm
@@ -124,7 +137,7 @@ class DiscriminatorS:
         fmap = []
         for l in self.convs:
             x = l(x)
-            x = nn.leaky_relu(x, LRELU_SLOPE)
+            x = _bias_lrelu(x, l.bias, LRELU_SLOPE)
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)
@@ -159,7 +172,7 @@ class DiscriminatorP:
         x = mx.reshape(x, (b, c, t // self.period, self.period))
         for l in self.convs:
             x = l(x)
-            x = nn.leaky_relu(x, LRELU_SLOPE)
+            x = _bias_lrelu(x, l.bias, LRELU_SLOPE)
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)

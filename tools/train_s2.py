@@ -191,6 +191,11 @@ def parse_args(argv=None):
                         "inner G/D forward functions (finer granularity). "
                         "Exploratory — expect MLX 0.32.2 failures on custom "
                         "ops/dynamic shapes; results recorded in TRAINING.md.")
+    p.add_argument("--metal-kernels", action="store_true",
+                   help="use fused custom Metal kernels (mx.fast.metal_kernel) "
+                        "for the hot dispatch chains: WN weight-norm scale, "
+                        "WN tanh*sigmoid gating, D bias+LeakyReLU tails "
+                        "(gsovits_mlx/train/metal_kernels.py; default OFF)")
     p.add_argument("--memory-limit-mb", type=int,
                    default=int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "8192")),
                    help="Metal wired limit; 8GB default for training (lead "
@@ -229,6 +234,19 @@ def main(argv=None) -> int:
         _lock_held = True
     import mlx.core as mx
     device = resolve_device(flag_gpu=not args.cpu, verbose=True)
+    if args.metal_kernels:
+        from gsovits_mlx.utils.layers import set_metal_kernels
+        from gsovits_mlx.train import metal_kernels as _mk
+        if not _mk.available():
+            raise SystemExit("[metal-kernels] not available (need GPU + "
+                             "mx.fast.metal_kernel)")
+        if args.precision != "fp32":
+            print("[metal-kernels] WARNING: kernels accumulate fp32 and cast "
+                  "at write; fp16/bf16 parity vs the eager chain is "
+                  "approximate (documented) — continuing")
+        set_metal_kernels(True)
+        print("[metal-kernels] fused kernels ON: wn-scale, wn-gate, "
+              "bias+lrelu(D)")
     try:
         return _run(args, device, mx)
     finally:

@@ -56,7 +56,7 @@ from ..sovits.models_v1v2 import (
     TextEncoder,
     _nearest_interp,
 )
-from ..utils.layers import Conv1d, WN, sequence_mask
+from ..utils.layers import Conv1d, WN, sequence_mask, _mk_enabled
 
 __all__ = [
     "SynthesizerTrnTrain", "spec_to_mel", "mel_spectrogram_train",
@@ -297,6 +297,9 @@ class _WeightNormMixin:
     def _effective_weight(self, dtype):
         if getattr(self, "weight_v", None) is None:
             return self.weight.astype(dtype)
+        if _mk_enabled():
+            from .metal_kernels import fused_wn_scale as _fwn
+            return _fwn(self.weight_g.reshape(-1), self.weight_v).astype(dtype)
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2), keepdims=True))
         w = self.weight_g[:, None, None].astype(mx.float32) * v32 / norm
