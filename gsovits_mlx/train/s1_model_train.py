@@ -209,9 +209,10 @@ class S1TrainModel:
         one at a time keeping ONLY h_i inputs; loss from the small predict
         head graph.
         Pass 2 (backward): grad of the predict head wrt (h_L, predict
-        params); then per block i=L-1..0 grad of (block(h_i, p_i) *
-        g_{i+1}).astype(fp32).sum() wrt (h_i, p_i) — one block live at a
-        time; finally grad of (embed(h0 params) * g_0).sum() for the head.
+        params); then per group of G=ckpt_groups layers (default 1: per
+        layer) grad of (blocks(h_i, p_i) * g_out).astype(fp32).sum() wrt
+        (h_i, p_i) — one group graph live at a time; finally grad of
+        (embed(h0 params) * g_0).sum() for the head.
         Returns (loss_f, acc, grads {name: fp32}).
         """
         dtype = self.dtype
@@ -249,23 +250,43 @@ class S1TrainModel:
         acc = top3_accuracy(mx.transpose(logits32, (0, 2, 1)), targets,
                             self.EOS)
 
-        # -- backward: blocks, one at a time --
+        # -- backward: blocks, one GROUP at a time (item-A blitz) ----------
+        # G = ckpt_groups: each grad call recomputes the G layers of one
+        # group; retained inputs = group boundaries only (hs stride G).
+        # Same math as per-layer (each layer recomputed exactly once; the
+        # per-layer reduction (out*g).sum() composes identically through a
+        # group), so grads are IDENTICAL up to fp reduction order (fp16
+        # forward + fp32 reduction, as before).
+        G = self.ckpt_groups
         g = g_h
-        for i in range(self.num_layers - 1, -1, -1):
-            pre = f"block.{i}."
-            pt = [p16[pre + k] for k in self._BLOCK_KEYS]
+        layer_params = {i: [p16[f"block.{i}." + k] for k in self._BLOCK_KEYS]
+                        for i in range(self.num_layers)}
+        for gstart in range(self.num_layers - G, -1, -G):
+            glayers = range(gstart, gstart + G)
+            in_h = hs[gstart]
 
-            def red(hh, *tt, _i=i):
-                out = self._block_core(dict(zip(self._BLOCK_KEYS, tt)), hh,
-                                       attn_mask)
+            def red(hh, *tts, _layers=tuple(glayers)):
+                out = hh
+                for li, i in enumerate(_layers):
+                    pt = dict(zip(
+                        self._BLOCK_KEYS,
+                        tts[li * len(self._BLOCK_KEYS):
+                            (li + 1) * len(self._BLOCK_KEYS)]))
+                    out = self._block_core(pt, out, attn_mask)
                 return (out.astype(mx.float32) * g.astype(mx.float32)).sum()
 
-            res = mx.grad(red, argnums=tuple(range(len(pt) + 1)))(
-                hs[i], *pt)
+            group_pt = [p for i in glayers for p in layer_params[i]]
+            res = mx.grad(red, argnums=tuple(range(len(group_pt) + 1)))(
+                in_h, *group_pt)
             g = res[0]
-            for k, key in enumerate(self._BLOCK_KEYS):
-                grads[pre + key] = res[k + 1].astype(mx.float32)
-            mx.eval(g, *(grads[pre + key] for key in self._BLOCK_KEYS))
+            gi = 1
+            for i in glayers:
+                pre = f"block.{i}."
+                for k in self._BLOCK_KEYS:
+                    grads[pre + k] = res[gi].astype(mx.float32)
+                    gi += 1
+            mx.eval(g, *(grads[f"block.{i}.{k}"].astype(mx.float32)
+                         for i in glayers for k in self._BLOCK_KEYS))
 
         # -- backward: embed head --
         head_keys = list(self._HEAD_KEYS)
@@ -291,7 +312,8 @@ class S1TrainModel:
             dtype=dtype)
 
     def __init__(self, config: dict, dropout: float | None = None,
-                 dtype=None, use_checkpoint: bool | None = None):
+                 dtype=None, use_checkpoint: bool | None = None,
+                 ckpt_groups: int | None = None):
         m = config["model"]
         self.model_dim = m["hidden_dim"]
         self.embedding_dim = m["embedding_dim"]
@@ -307,6 +329,16 @@ class S1TrainModel:
         if use_checkpoint is None:
             use_checkpoint = os.environ.get("GSOVITS_S1_GRAD_CKPT", "0") == "1"
         self.use_gradient_checkpoint = use_checkpoint
+        # group-checkpoint granularity (item-A blitz): backward recomputes
+        # GROUPS of layers per grad call instead of single layers. 1 = the
+        # historical per-layer behavior (default; official-semantics safe).
+        if ckpt_groups is None:
+            ckpt_groups = int(os.environ.get("GSOVITS_S1_CKPT_GROUPS", "1"))
+        if ckpt_groups < 1 or self.num_layers % ckpt_groups != 0:
+            raise ValueError(
+                f"ckpt_groups must divide num_layers ({self.num_layers}); "
+                f"got {ckpt_groups}")
+        self.ckpt_groups = ckpt_groups
         # forward dtype: fp16 (official 16-mixed) or fp32 (parity runs)
         if dtype is None:
             import mlx.core as _mx
