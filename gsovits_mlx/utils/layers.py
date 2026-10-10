@@ -96,10 +96,14 @@ def _mk_enabled() -> bool:
 
 def _mk_importable() -> bool:
     try:
-        from .train import metal_kernels as _mk  # noqa: F401
-        return _mk.available()
+        from ..gsovits_mlx.train import metal_kernels as _mk  # noqa: F401
     except Exception:
-        return False
+        try:
+            from gsovits_mlx.train import metal_kernels as _mk  # noqa: F401
+            return _mk.available()
+        except Exception:
+            return False
+    return _mk.available()
 
 
 # ---------------------------------------------------------------------------
@@ -172,8 +176,9 @@ class Conv1d(nn.Module):
         if self.weight_v is None:
             return self.weight.astype(dtype)
         if _mk_enabled():
-            from .train_metal_kernels import wn_scale
-            return wn_scale(self.weight_g.reshape(-1), self.weight_v, dtype)
+            from ..train.metal_kernels import fused_wn_scale as _fwn
+            from .layers import Conv1d as _self  # noqa: F401 (type ref)
+            return _fwn(self.weight_g.reshape(-1), self.weight_v).astype(dtype)
         v32 = self.weight_v.astype(mx.float32)
         norm = mx.sqrt(mx.sum(v32 * v32, axis=(1, 2), keepdims=True))
         w = self.weight_g.reshape(-1)[:, None, None].astype(mx.float32) * v32 / norm
@@ -346,7 +351,7 @@ class WN(nn.Module):
             else:
                 g_l = mx.zeros_like(x_in)
             if _mk_enabled():
-                from .train.metal_kernels import fused_gate as _fused_gate
+                from ..train.metal_kernels import fused_gate as _fused_gate
                 acts = _fused_gate(x_in, g_l)
             else:
                 acts = fused_add_tanh_sigmoid_multiply(x_in, g_l, self.hidden_channels)

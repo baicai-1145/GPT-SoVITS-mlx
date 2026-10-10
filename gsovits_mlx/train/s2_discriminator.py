@@ -31,11 +31,18 @@ from ..utils.layers import get_padding, _mk_enabled
 LRELU_SLOPE = 0.1
 
 def _bias_lrelu(x: mx.array, bias: mx.array, slope: float):
-    """bias-add + LeakyReLU; fused Metal kernel when enabled (4D-safe)."""
+    """bias-add + LeakyReLU; fused Metal kernel when enabled (3D only).
+
+    The fused kernel maps channel = (e // T) % C on the flattened (B,C,T)
+    row-major view; DiscriminatorP activations are 4D (B,C,H,W) and fall
+    back to the eager chain (their conv2d tail already returns fp32).
+    """
     if _mk_enabled() and x.ndim == 3:
         from .metal_kernels import bias_lrelu as _bl
         return _bl(x, bias, slope)
-    return nn.leaky_relu(x + bias[None, :, None].astype(x.dtype), slope)
+    shape = [1] * x.ndim
+    shape[1] = -1
+    return nn.leaky_relu(x + bias.reshape(shape).astype(x.dtype), slope)
 
 
 # ---------------------------------------------------------------------------
