@@ -100,7 +100,7 @@ def stack_gate(models_root: str, T: int = 300) -> dict:
     backward chain lengthens and is what overflows fp16 past block ~8.
     """
     import mlx.core as mx
-    from mlx.utils import tree_flatten, tree_map
+    from mlx.utils import tree_map
     from gsovits_mlx.pipeline import load_sovits_v3
 
     model, _ = load_sovits_v3(os.path.join(models_root, "v3"), "v3")
@@ -109,8 +109,10 @@ def stack_gate(models_root: str, T: int = 300) -> dict:
     report = {"mode": "block_stack", "T": T, "B": B, "n_blocks": L,
               "dtypes": {}}
 
-    # keep originals for recasting between dtype runs
-    orig = dict(tree_flatten(est.parameters()))
+    # keep the NESTED parameter tree for recasting between dtype runs
+    # (est.update needs the nested form — a flat tree fails on plain-object
+    # attrs like time_embed; DiT.parameters() custom walk)
+    orig = est.parameters()
 
     x0 = mx.random.normal((B, 100, T), key=mx.random.key(0))
     cond = mx.random.normal((B, 100, T), key=mx.random.key(1))
@@ -151,6 +153,7 @@ def stack_gate(models_root: str, T: int = 300) -> dict:
             blk.attn._qkv_w_cache = None
             blk.attn._cdtype = None
             blk._cdtype = None
+        est._timestep_cache.clear()
         entry = {"forward_finite": None, "loss": None,
                  "upstream_grad_absmax": {}, "first_overflow_block": None}
         try:
