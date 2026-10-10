@@ -117,13 +117,18 @@ def test_wn_scale_grad_parity():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-@pytest.mark.parametrize("shape", [
-    (3, 768, 960), (1, 768, 960), (3, 384, 20480), (2, 768, 17),
+@pytest.mark.parametrize("shape,tb", [
+    ((3, 768, 960), 960),   # flow/WN at trunk width (g_l full width)
+    ((3, 768, 960), 1),     # enc_q g_l broadcast over T (ge is (B,512,1))
+    ((1, 384, 7), 1),
+    ((2, 768, 17), 17),
+    ((3, 384, 20480), 1),   # decoder-width WN (not used in G dec but shape-safe)
 ])
-def test_gate_full_coverage_and_parity(shape):
+def test_gate_full_coverage_and_parity(shape, tb):
     rs = np.random.RandomState(2)
     a = mx.array((rs.randn(*shape) * 2).astype(np.float32))
-    b = mx.array((rs.randn(*shape) * 2).astype(np.float32))
+    bshape = (shape[0], shape[1], tb)
+    b = mx.array((rs.randn(*bshape) * 2).astype(np.float32))
     y = MK.fused_gate(a, b)
     mx.eval(y)
     h = shape[1] // 2

@@ -799,7 +799,14 @@ def _run(args, device, mx):
 
     logf.close()
     fp_log.close()
-    _save(ckpt_mod, args, optim_g, optim_d, step, epoch - 1, d_fresh)
+    # --save-every 0 means "no checkpoint writes at all" (disk law for
+    # acceptance runs): the per-loop save already respects it; the FINAL
+    # save must too (it wrote ~931MB resume/ dirs that filled the disk on
+    # 50-step acceptance matrices).
+    if args.save_every:
+        _save(ckpt_mod, args, optim_g, optim_d, step, epoch - 1, d_fresh)
+    else:
+        print("[ckpt] --save-every 0: skipping final resume save")
 
     peak = 0
     try:
