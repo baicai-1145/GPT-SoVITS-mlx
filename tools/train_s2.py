@@ -513,38 +513,53 @@ def _run(args, device, mx):
 
             ts = time.perf_counter()
             if args.g_forward == "single":
-                # ---- fused single-trace step ----
+                # ---- fused single-trace step, evaluated in TWO phases ----
+                # One trace = one G forward; the D-branch and G-branch
+                # outputs are separate lazy subgraphs. Evaluating them in
+                # ONE mx.eval would materialize both backwards
+                # simultaneously (measured 8.81GB phys at b3 fp32, over the
+                # 8GB gate). Phase-split: eval D branch -> step D -> free ->
+                # eval G branch (reuses the SAME G-forward primals — the
+                # compute win stays, the peak matches double mode).
                 (total, parts), (dgrads, ggrads) = mx.value_and_grad(
                     fused_loss_fn, argnums=(0, 1))(d16, p16, arrays, sv, kd)
-                (loss_d, loss_gen, loss_fm, loss_mel, kl_ssl,
-                 loss_kl) = [float(x) for x in parts]
                 # fp16 keeps the legacy GradScaler machinery; bf16 bypasses
                 # (CFM precedent — no scaler needed, fp32 grads/heads).
                 if args.precision == "fp16":
                     scale = scaler.get_scale()
                     dgrads = {k: v * scale for k, v in dgrads.items()}
                     ggrads = {k: v * scale for k, v in ggrads.items()}
-                mx.eval(total, *dgrads.values(), *ggrads.values())
+                # -- phase 1: D branch only (official D-step-first order) --
+                mx.eval(parts[0], *dgrads.values())
                 optim_d.param_groups[0]["grads"] = {
                     k: v.astype(mx.float32) for k, v in dgrads.items()}
+                if args.precision == "fp16":
+                    scaler.unscale_(optim_d)
+                gn_d = grad_norm_sq(optim_d.param_groups[0]["grads"]) ** 0.5
+                if args.precision == "fp16":
+                    scaler.step(optim_d)
+                else:
+                    optim_d.step()
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
+                # -- phase 2: G branch (same G-forward primals, D as consts) --
+                mx.eval(*parts[1:], *ggrads.values())
                 for g_ in optim_g.param_groups:
                     g_["grads"] = {k: ggrads[k].astype(mx.float32)
                                    for k in g_["params"] if k in ggrads}
                 if args.precision == "fp16":
-                    scaler.unscale_(optim_d)
                     scaler.unscale_(optim_g)
-                gn_d = grad_norm_sq(optim_d.param_groups[0]["grads"]) ** 0.5
                 gn_g = sum(grad_norm_sq(g_["grads"])
                            for g_ in optim_g.param_groups) ** 0.5
                 if args.precision == "fp16":
-                    scaler.step(optim_d)
                     scaler.step(optim_g)
                     scaler.update()
                 else:
-                    # D first, then G — official order (same step's weights
-                    # either way; separate optimizers, no cross-coupling).
-                    optim_d.step()
                     optim_g.step()
+                (loss_d, loss_gen, loss_fm, loss_mel, kl_ssl,
+                 loss_kl) = [float(x) for x in parts]
             else:
                 # ---- legacy double-forward step ----
                 key_d = kd
