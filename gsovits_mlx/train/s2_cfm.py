@@ -748,7 +748,12 @@ class S2V3TrainModel:
                 mx.array(b_np["mel"]), mx.array(b_np["ssl_lengths"]),
                 spec_lengths, mx.array(b_np["text"].astype(np.int32)),
                 mx.array(b_np["text_lengths"]), mel_lengths, None)
-            return (fea2.astype(mx.float32)
+            # slice to the SAME minn the DiT head consumed: official collate
+            # always has fea width == minn (no-op), but pad-quantized widths
+            # (--pad-multiple) can make the trunk's natural fea wider than
+            # the mel target — the pad region is masked out of the loss, so
+            # the gradient comparison must exclude it too.
+            return (fea2[:, :, :minn].astype(mx.float32)
                     * g_fea_raw.astype(mx.float32)).sum()
 
         trunk_keys = [k for k in masters if not k.startswith("dit.")]

@@ -107,6 +107,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--dump-batches", default=None,
                    help="dump collated batches as npz into this dir and exit"
                         " (for the torch CPU reference driver)")
+    p.add_argument("--memory-limit-mb", type=int, default=8192,
+                   help="Metal allocator cache cap in MB (default 8192; "
+                        "GAN trainer parity). The cap is a cache-EVICTION "
+                        "limit, not a hard bound: lower it when the 8GB "
+                        "footprint gate trips on cache growth (task-6 "
+                        "precedent: v2 b3 rerun at 6GB).")
     p.add_argument("--gpu", action="store_true")
     return p
 
@@ -135,11 +141,13 @@ def main(argv=None) -> None:
     device = resolve_device(args.gpu, verbose=True)
     if device == "gpu":
         import mlx.core as mx
+        _limit = args.memory_limit_mb * 1024 * 1024
         try:
-            mx.metal.set_memory_limit(8 * 1024 * 1024 * 1024)
+            mx.metal.set_memory_limit(_limit)
         except Exception:
             pass
-        print("[metal] memory limit set to 8GB", flush=True)
+        print(f"[metal] memory limit set to {_limit/1024/1024/1024:.0f}GB",
+              flush=True)
 
     import numpy as np
     import mlx.core as mx
