@@ -253,6 +253,14 @@ def _run(args, device, mx):
     sampler = BucketSampler(dataset.lengths, args.batch_size, shuffle=True)
 
     # ---- models ----
+    # Seed the GLOBAL mx RNG before model construction (official
+    # torch.manual_seed(hps.train.seed)): the fresh-D init draws from the
+    # global stream; without this the SAME config is not reproducible
+    # run-to-run (measured: 3 runs, 3 different step-0 loss_mel values —
+    # loss_mel is D-independent, so the divergence was upstream: D-init
+    # consumed different global-stream offsets, shifting the split-derived
+    # step keys). Step RNG is unaffected (key = mx.random.key(seed)).
+    mx.random.seed(args.seed)
     net_g = G.SynthesizerTrnTrain(version=args.version, segment_size=seg_frames,
                                   **hps)
     params32 = load_train_params_npz(args.train_npz)
