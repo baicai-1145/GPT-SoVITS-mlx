@@ -594,11 +594,25 @@ def _run(args, device, mx):
 
     while not stop:
         sampler.set_epoch(epoch)
-        batches = [collate([dataset[i] for i in b]) for b in iter(sampler)]
-        for bi, batch in enumerate(batches):
+        if args.fixed_shape or args.pad_multiple:
+            # width knobs inflate per-batch numpy size (fixed 960-frame
+            # trunk ≈ 28MB/batch × 315 batches ≈ 8.9GB if the whole epoch is
+            # pre-collated — measured as a phys_footprint (CPU RAM) gate
+            # trip, not GPU). Collate lazily per step instead; official
+            # eager order preserved (same batch sequence).
+            batch_ids = list(iter(sampler))
+            batches = None
+        else:
+            batches = [collate([dataset[i] for i in b])
+                       for b in iter(sampler)]
+            batch_ids = None
+        bi_it = range(len(batch_ids if batch_ids is not None else batches))
+        for bi in bi_it:
             if step >= args.steps:
                 stop = True
                 break
+            batch = (collate([dataset[i] for i in batch_ids[bi]])
+                     if batch_ids is not None else batches[bi])
             key, kd, kg = mx.random.split(key, 3)
             arrays, sv = prep_batch(batch)
 
@@ -762,7 +776,7 @@ def _run(args, device, mx):
         sched_d.step()
         if args.epochs is not None and epoch - 1 >= args.epochs:
             stop = True
-        if not batches:
+        if not batches and not batch_ids:
             stop = True
 
     logf.close()
