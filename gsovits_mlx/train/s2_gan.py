@@ -339,7 +339,7 @@ class PosteriorEncoderTrain:
         self.proj.weight = params["enc_q.proj.weight"]
         self.proj.bias = params["enc_q.proj.bias"]
 
-    def __call__(self, x, x_lengths, g=None, key=None):
+    def __call__(self, x, x_lengths, g=None, key=None, strict_noise=False):
         if g is not None:
             g = mx.stop_gradient(g)
         x_mask = sequence_mask(x_lengths, x.shape[2]).astype(x.dtype)
@@ -348,6 +348,11 @@ class PosteriorEncoderTrain:
         stats = self.proj(x) * x_mask
         m, logs = stats[:, : self.out_channels], stats[:, self.out_channels:]
         noise = mx.random.normal(m.shape, key=key)
+        if strict_noise:
+            # low-precision training: cast the randn to the compute dtype so
+            # z (-> flow -> z_slice -> dec) actually computes in bf16/fp16;
+            # the fp32 randn otherwise silently promotes the whole graph.
+            noise = noise.astype(m.dtype)
         z = (m + noise * mx.exp(logs)) * x_mask
         return z, m, logs, x_mask
 
@@ -466,9 +471,16 @@ class SynthesizerTrnTrain:
 
     # -- forward (official SynthesizerTrn.forward) ---------------------------
     def forward(self, ssl, y, y_lengths, text, text_lengths,
-                sv_emb=None, key: mx.array | None = None, quantized_in: mx.array | None = None):
+                sv_emb=None, key: mx.array | None = None,
+                quantized_in: mx.array | None = None,
+                strict_noise: bool = False):
         """Returns (y_hat, kl_ssl, ids_slice, y_mask, (z,z_p,m_p,logs_p,m_q,logs_q),
         stats_ssl).
+
+        strict_noise: cast the posterior randn to the compute dtype (bf16/fp16
+        training) so the decoder path actually runs in low precision — the
+        fp32 randn silently promotes z/flow/dec to fp32 otherwise. fp32 mode
+        is unaffected (cast is a no-op semantically).
 
         kl_ssl is the RVQ commit loss VALUE (official: mse(quantized, x)
         computed even with freeze_quantizer=True — net_g is in train mode, so
@@ -508,7 +520,8 @@ class SynthesizerTrnTrain:
         x, m_p, logs_p, y_mask2 = self.enc_p(
             quantized.astype(y.dtype), y_lengths, text, text_lengths,
             ge512 if self.is_v2pro else ge)
-        z, m_q, logs_q, x_mask = self.enc_q(y, y_lengths, g=ge, key=key)
+        z, m_q, logs_q, x_mask = self.enc_q(y, y_lengths, g=ge, key=key,
+                                           strict_noise=strict_noise)
         z_p = self.flow(z, x_mask, g=ge)
         z_slice, ids_slice = rand_slice_segments(z, y_lengths, self.segment_size,
                                                  key=key)

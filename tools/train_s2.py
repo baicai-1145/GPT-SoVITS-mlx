@@ -25,20 +25,53 @@ Semantics (official s2_train.py, verified line-by-line):
   * clip_grad_value_(None): NO-OP on grads (official commons only clamps
     when clip_value is not None); we compute the grad norm for logging.
   * freeze_quantizer=True: ssl_proj + quantizer excluded from optimizers
-    (official no_grad+eval); quantizer runs fp32 outside the fp16 graph.
+    (official no_grad+eval); quantizer runs fp32 outside the low-precision
+    graph.
   * fp16 autocast for the G forward; fp32 losses (mel/kl/fm/gen).
 
+G-forward modes (--g-forward):
+  * single (default): ONE G forward per step inside ONE traced
+    value_and_grad over (d16, p16) jointly — official torch structure
+    (official runs net_g() once and reuses y_hat: net_d(y, y_hat.detach())
+    for D, net_d(y, y_hat) for G). The D branch sees y_hat through
+    stop_gradient (grad-free, like .detach()); the G branch sees D weights
+    through stop_gradient (D as constants). Both losses + the 5 loss parts
+    come back as the aux output of the single trace. Official RNG
+    semantics: ONE rand_slice_segments draw + ONE posterior-noise draw per
+    step, shared by both branches.
+  * double (legacy): the pre-optimization structure — separate D-step and
+    G-step traces, each with its OWN G forward. Matches the old behavior
+    except the RNG: both forwards now use the SAME key (official
+    single-draw semantics; the legacy code drew kd/kg separately, an
+    undocumented deviation). --double-split-draw restores the exact legacy
+    RNG (different draws per forward) for A/B.
+
 Deviations (documented, unavoidable or measured):
-  * G forward runs TWICE per step (once for the D-step trace with p16
-    constant, once for the G-step grad trace). Torch runs it once and
-    reuses y_hat; MLX graphs require the forward inside each traced loss.
-    Same RNG key per pair -> identical y_hat draws; no semantic change,
-    ~2x forward cost per step (backward passes are single each).
+  * G-step D forward uses the PRE-update D weights (official torch
+    sequential-overlap artifact: net_d.step() has updated the .data of the
+    same tensors the G-step forward reads; MLX traced grads need frozen
+    inputs, so the G step sees the pre-step D). Measured immaterial on
+    200-step smokes; kept identical across all modes/precisions here.
   * DDP gradient averaging absent (single process).
   * Bucket sampler randperm: numpy PCG64, not torch Philox (s2_data.py).
   * v1/v2 have NO pretrained s2D on this machine (checked /Volumes/2T
     .../pretrained_models and the whole repo tree): D inits fresh for
     v1/v2; v2Pro/ProPlus load s2Dv2Pro*.pth.
+
+Precision (--precision):
+  * fp32: no autocast, no GradScaler (official s2 config default,
+    fp16_run=false). fp16 is proven unstable here: KL exp(-2*logs_p)
+    overflows fp16 range and the scaler collapses (scale 1e-56 in the v2
+    smoke); use fp32.
+  * fp16: autocast+GradScaler (official fp16_run=True semantics).
+    Retained for reproducibility; unstable (see above).
+  * bf16: bf16 G/D compute graph, fp32 loss heads (mel/kl/fm/gen cast to
+    fp32 at entry — KL's exp(-2*logs_p) is evaluated in fp32; bf16 shares
+    fp32's exponent range so the fp16 overflow mode cannot occur), fp32
+    masters/optimizer, GradScaler bypassed (CFM precedent: bf16 needs no
+    scaler). Frozen fp32 exemptions kept: ssl_proj/quantizer (frozen32) and
+    sv_emb/ge_to512/prelu (v2Pro export policy). OPT-IN; fp32 stays the
+    default.
 """
 
 from __future__ import annotations
@@ -108,13 +141,36 @@ def parse_args(argv=None):
     p.add_argument("--save-every", type=int, default=200)
     p.add_argument("--export-inference", action="store_true")
     p.add_argument("--init-scale", type=float, default=65536.0)
-    p.add_argument("--precision", choices=("fp16", "fp32"), default="fp16",
+    p.add_argument("--precision", choices=("fp16", "fp32", "bf16"),
+                   default="fp16",
                    help="fp16: autocast+GradScaler (official fp16_run=True "
                         "semantics); fp32: no autocast/scaler — official "
-                        "s2 config default (fp16_run=false). fp16 proven "
+                        "s2 config default (fp16_run=false); bf16: bf16 G/D "
+                        "compute + fp32 loss heads + fp32 masters/optimizer, "
+                        "no GradScaler (CFM precedent). fp16 proven "
                         "unstable here: KL exp(-2*logs_p) overflows fp16 "
                         "range and the scaler collapses (scale 1e-56 in "
-                        "the v2 smoke); use fp32.")
+                        "the v2 smoke); use fp32 (default for real runs) "
+                        "or bf16 (opt-in speed path).")
+    p.add_argument("--g-forward", choices=("single", "double"), default="single",
+                   help="single: ONE G forward per step inside one joint "
+                        "(D,G) grad trace — official torch structure (net_g "
+                        "runs once; y_hat detached-reused). double: legacy "
+                        "two-trace structure (G forward in the D trace AND "
+                        "in the G trace) for A/B.")
+    p.add_argument("--double-split-draw", action="store_true",
+                   help="(double mode only) use DIFFERENT RNG keys for the "
+                        "two G forwards — exact legacy RNG behavior "
+                        "(pre-official-parity fix). Default: same key for "
+                        "both forwards (official single-draw semantics).")
+    p.add_argument("--bf16-strict-noise", action="store_true", default=True)
+    p.add_argument("--no-bf16-strict-noise", dest="bf16_strict_noise",
+                   action="store_false",
+                   help="posterior noise cast to the compute dtype in "
+                        "low-precision modes (bf16/fp16) so the decoder "
+                        "input z_slice actually computes in low precision "
+                        "(the fp32 randn silently promotes flow+dec). "
+                        "Default on; disable for exact-legacy fp16 numerics.")
     p.add_argument("--memory-limit-mb", type=int,
                    default=int(os.environ.get("GSOVITS_METAL_LIMIT_MB", "8192")),
                    help="Metal wired limit; 8GB default for training (lead "
@@ -147,8 +203,9 @@ def main(argv=None) -> int:
             raise SystemExit("[gpu.lock] other GPU python processes running:\n  "
                              + "\n  ".join(gpu_procs[:5]))
         from gsovits_mlx.gpu_lock import acquire_lock
-        acquire_lock(f"tools/train_s2.py s2-GAN {args.version} task-6 "
-                     f"exp={args.exp_dir}")
+        acquire_lock(f"tools/train_s2.py s2-GAN {args.version} "
+                     f"gfw={args.g_forward} prec={args.precision} "
+                     f"gan-speed-opt")
         _lock_held = True
     import mlx.core as mx
     device = resolve_device(flag_gpu=not args.cpu, verbose=True)
@@ -259,7 +316,16 @@ def _run(args, device, mx):
     frozen32 = {n: params32[n] for n in net_g.parameter_names(include_frozen=True)
                 if n not in set(all_names)}
 
-    def make_fp16(params_f32: dict) -> dict:
+    compute_dtype = {"fp16": mx.float16, "fp32": mx.float32,
+                     "bf16": mx.bfloat16}[args.precision]
+
+    def make_compute(params_f32: dict) -> dict:
+        """Working copy of G params in the compute dtype (or fp32).
+
+        fp32 exemptions (unchanged across modes):
+          * sv_emb./ge_to512./prelu — v2Pro export policy (F32 exports);
+          * the frozen32 block (ssl_proj/quantizer) is merged back fp32.
+        """
         out = {}
         for k, v in params_f32.items():
             if args.precision == "fp32":
@@ -267,7 +333,7 @@ def _run(args, device, mx):
             elif k.startswith(("sv_emb.", "ge_to512.", "prelu")):
                 out[k] = v  # sv family stays fp32 (v2Pro export policy)
             else:
-                out[k] = v.astype(mx.float16)
+                out[k] = v.astype(compute_dtype)
         out.update(frozen32)  # fp32 constants (ssl_proj/quantizer)
         return out
 
@@ -281,15 +347,19 @@ def _run(args, device, mx):
         (ssl, ssl_lengths, spec, spec_lengths, wav, wav_lengths, text,
          text_lengths) = arrays
         net_g.bind(p16)
-        spec16 = spec if args.precision == "fp32" else spec.astype(mx.float16)
+        if args.precision == "fp32":
+            spec_in = spec
+        else:
+            spec_in = spec.astype(compute_dtype)
         y_lengths = spec_lengths  # y frames == spec frames (official)
-        # frozen fp32 quantizer block (outside the fp16 graph); commit value
-        # feeds loss_gen_all (official kl_ssl*1) and is logged per step
+        # frozen fp32 quantizer block (outside the low-precision graph);
+        # commit value feeds loss_gen_all (official kl_ssl*1) and is logged
         quant, commit = net_g.quantize_ssl(ssl)
         o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
-            net_g.forward(ssl, spec16, y_lengths, text.astype(mx.int32),
+            net_g.forward(ssl, spec_in, y_lengths, text.astype(mx.int32),
                           text_lengths, sv_emb=sv, key=key,
-                          quantized_in=(quant, commit))
+                          quantized_in=(quant, commit),
+                          strict_noise=args.bf16_strict_noise)
         mel = G.spec_to_mel(spec.astype(mx.float32), mel_basis)
         y_mel = G.slice_segments(mel, ids_slice, seg_frames)
         y_hat_mel = G.mel_spectrogram_train(
@@ -300,6 +370,7 @@ def _run(args, device, mx):
         return o, y, y_mel, y_hat_mel, kl_ssl, commit, \
             (z, z_p, m_p, logs_p, m_q, logs_q), y_mask
 
+    # legacy helper retained for double mode
     def d_loss_fn(d16, p16, arrays, sv, key):
         """D loss wrt d16; G forward under captured p16 (constants)."""
         load_mpd_weights(net_d, d16)
@@ -326,8 +397,63 @@ def _run(args, device, mx):
         return (loss_gen + loss_fm + loss_mel + kl_ssl * 1.0 + loss_kl,
                 (loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl))
 
+    def fused_loss_fn(d16, p16, arrays, sv, key):
+        """Single-trace joint (D, G) loss — official one-forward structure.
+
+        Returns (loss_d + loss_g, (loss_d, gen_parts...)) with gradient
+        paths partitioned by stop_gradient:
+          * D branch: y_hat detached (== official net_d(y, y_hat.detach()));
+            grads flow ONLY into d16.
+          * G branch: D weights detached (D is a constant function — our
+            documented pre-update-D deviation); grads flow ONLY into p16.
+        One rand_slice + one posterior-noise draw (key) shared by both
+        branches — official single-draw RNG.
+        """
+        # ---- shared single G forward (official net_g call #1) ----
+        (ssl, ssl_lengths, spec, spec_lengths, wav, wav_lengths, text,
+         text_lengths) = arrays
+        net_g.bind(p16)
+        if args.precision == "fp32":
+            spec_in = spec
+        else:
+            spec_in = spec.astype(compute_dtype)
+        y_lengths = spec_lengths
+        quant, commit = net_g.quantize_ssl(ssl)
+        o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
+            net_g.forward(ssl, spec_in, y_lengths, text.astype(mx.int32),
+                          text_lengths, sv_emb=sv, key=key,
+                          quantized_in=(quant, commit),
+                          strict_noise=args.bf16_strict_noise)
+        mel = G.spec_to_mel(spec.astype(mx.float32), mel_basis)
+        y_mel = G.slice_segments(mel, ids_slice, seg_frames)
+        y_hat_mel = G.mel_spectrogram_train(
+            o.astype(mx.float32).squeeze(1), mel_basis,
+            TRAIN["filter_length"], TRAIN["hop_length"], TRAIN["win_length"])
+        y = G.slice_segments(wav, ids_slice * TRAIN["hop_length"],
+                             TRAIN["segment_size"])
+        y32 = y.astype(mx.float32)
+
+        # ---- D branch (official: net_d(y, y_hat.detach())) ----
+        load_mpd_weights(net_d, d16)
+        y_d_hat_r_d, y_d_hat_g_d, _, _ = net_d(y32, mx.stop_gradient(o).astype(mx.float32))
+        loss_d, _, _ = G.discriminator_loss(y_d_hat_r_d, y_d_hat_g_d)
+
+        # ---- G branch (official: net_d(y, y_hat) on updated D; ours: pre-update D) ----
+        d_const = {k: mx.stop_gradient(v) for k, v in d16.items()}
+        load_mpd_weights(net_d, d_const)
+        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y32, o.astype(mx.float32))
+        loss_mel = mx.mean(mx.abs(y_mel - y_hat_mel)) * TRAIN["c_mel"]
+        loss_kl = G.kl_loss(z_p, logs_q, m_p, logs_p, y_mask) * TRAIN["c_kl"]
+        loss_fm = G.feature_loss(fmap_r, fmap_g)
+        loss_gen, _ = G.generator_loss(y_d_hat_g)
+        loss_g_total = loss_gen + loss_fm + loss_mel + kl_ssl * 1.0 + loss_kl
+        return loss_d + loss_g_total, (loss_d, loss_gen, loss_fm, loss_mel,
+                                       kl_ssl, loss_kl)
+
     # ---- loop -----------------------------------------------------------------
     logf = open(os.path.join(args.out, "loss.jsonl"), "a")
+    fp_log = open(os.path.join(args.out, "footprint_steps.jsonl"), "a",
+                  buffering=1)
     step, epoch = 0, 1
     key = mx.random.key(args.seed)
     t0 = time.perf_counter()
@@ -336,6 +462,26 @@ def _run(args, device, mx):
 
     def grad_norm_sq(gr):
         return sum(float(mx.sum(g_.astype(mx.float32) ** 2)) for g_ in gr.values())
+
+    def _step_mem(step_i, extra):
+        try:
+            fp = __import__("gsovits_mlx.train.loop", fromlist=["x"]) \
+                .FootprintSampler.read_phys_footprint(os.getpid())
+        except Exception:
+            fp = 0
+        try:
+            act = int(mx.get_active_memory())
+            cache = int(mx.get_cache_memory())
+        except Exception:
+            try:
+                act = int(mx.metal.get_active_memory())
+                cache = int(mx.metal.get_cache_memory())
+            except Exception:
+                act = cache = 0
+        rec = {"step": step_i, "footprint": fp, "metal_active": act,
+               "metal_cache": cache, "metal_active_plus_cache": act + cache}
+        rec.update(extra)
+        return rec
 
     while not stop:
         sampler.set_epoch(epoch)
@@ -350,57 +496,103 @@ def _run(args, device, mx):
             masters = {}
             for g_ in optim_g.param_groups:
                 masters.update(g_["params"])
-            p16 = make_fp16(masters)
+            p16 = make_compute(masters)
             d_masters = dict(optim_d.param_groups[0]["params"])
-            d16 = {k: v.astype(mx.float16) for k, v in d_masters.items()}
+            if args.precision == "fp32":
+                d16 = dict(d_masters)
+            else:
+                d16 = {k: v.astype(compute_dtype) for k, v in d_masters.items()}
 
             # ---- lr warmup (smoke aid; official has none) ----
             if args.warmup_steps > 0:
                 w = min(1.0, (step + 1) / args.warmup_steps)
                 for g_ in optim_g.param_groups:
                     g_["lr"] = g_["base_lr"] * w
-                optim_d.param_groups[0]["lr"] = optim_d.param_groups[0]["base_lr"] * w
+                optim_d.param_groups[0]["lr"] = \
+                    optim_d.param_groups[0]["base_lr"] * w
 
-            # ---- D step (pre-update scale) ----
-            (loss_d, dgrads) = mx.value_and_grad(d_loss_fn)(d16, p16, arrays, sv, kd)
-            if args.precision == "fp16":
-                dgrads = {k: v * scaler.get_scale() for k, v in dgrads.items()}
-            mx.eval(loss_d, *dgrads.values())
-            optim_d.param_groups[0]["grads"] = {
-                k: v.astype(mx.float32) for k, v in dgrads.items()}
-            if args.precision == "fp16":
-                scaler.unscale_(optim_d)
-            gn_d = grad_norm_sq(optim_d.param_groups[0]["grads"]) ** 0.5
-            if args.precision == "fp16":
-                scaler.step(optim_d)
+            ts = time.perf_counter()
+            if args.g_forward == "single":
+                # ---- fused single-trace step ----
+                (total, parts), (dgrads, ggrads) = mx.value_and_grad(
+                    fused_loss_fn, argnums=(0, 1))(d16, p16, arrays, sv, kd)
+                (loss_d, loss_gen, loss_fm, loss_mel, kl_ssl,
+                 loss_kl) = [float(x) for x in parts]
+                # fp16 keeps the legacy GradScaler machinery; bf16 bypasses
+                # (CFM precedent — no scaler needed, fp32 grads/heads).
+                if args.precision == "fp16":
+                    scale = scaler.get_scale()
+                    dgrads = {k: v * scale for k, v in dgrads.items()}
+                    ggrads = {k: v * scale for k, v in ggrads.items()}
+                mx.eval(total, *dgrads.values(), *ggrads.values())
+                optim_d.param_groups[0]["grads"] = {
+                    k: v.astype(mx.float32) for k, v in dgrads.items()}
+                for g_ in optim_g.param_groups:
+                    g_["grads"] = {k: ggrads[k].astype(mx.float32)
+                                   for k in g_["params"] if k in ggrads}
+                if args.precision == "fp16":
+                    scaler.unscale_(optim_d)
+                    scaler.unscale_(optim_g)
+                gn_d = grad_norm_sq(optim_d.param_groups[0]["grads"]) ** 0.5
+                gn_g = sum(grad_norm_sq(g_["grads"])
+                           for g_ in optim_g.param_groups) ** 0.5
+                if args.precision == "fp16":
+                    scaler.step(optim_d)
+                    scaler.step(optim_g)
+                    scaler.update()
+                else:
+                    # D first, then G — official order (same step's weights
+                    # either way; separate optimizers, no cross-coupling).
+                    optim_d.step()
+                    optim_g.step()
             else:
-                optim_d.step()
+                # ---- legacy double-forward step ----
+                key_d = kd
+                key_g = kd if not args.double_split_draw else kg
+                (loss_d, dgrads) = mx.value_and_grad(d_loss_fn)(
+                    d16, p16, arrays, sv, key_d)
+                if args.precision == "fp16":
+                    dgrads = {k: v * scaler.get_scale() for k, v in dgrads.items()}
+                mx.eval(loss_d, *dgrads.values())
+                optim_d.param_groups[0]["grads"] = {
+                    k: v.astype(mx.float32) for k, v in dgrads.items()}
+                if args.precision == "fp16":
+                    scaler.unscale_(optim_d)
+                gn_d = grad_norm_sq(optim_d.param_groups[0]["grads"]) ** 0.5
+                if args.precision == "fp16":
+                    scaler.step(optim_d)
+                else:
+                    optim_d.step()
 
-            # ---- G step ----
-            (loss_g, parts), ggrads = mx.value_and_grad(g_loss_fn)(
-                p16, d16, arrays, sv, kg)
-            if args.precision == "fp16":
-                ggrads = {k: v * scaler.get_scale() for k, v in ggrads.items()}
-            mx.eval(loss_g, *ggrads.values())
-            for g_ in optim_g.param_groups:
-                g_["grads"] = {k: ggrads[k].astype(mx.float32)
-                               for k in g_["params"] if k in ggrads}
-            if args.precision == "fp16":
-                scaler.unscale_(optim_g)
-            gn_g = sum(grad_norm_sq(g_["grads"]) for g_ in optim_g.param_groups) ** 0.5
-            if args.precision == "fp16":
-                scaler.step(optim_g)
-                scaler.update()
-            else:
-                optim_g.step()
+                (loss_g, gparts), ggrads = mx.value_and_grad(g_loss_fn)(
+                    p16, d16, arrays, sv, key_g)
+                if args.precision == "fp16":
+                    ggrads = {k: v * scaler.get_scale() for k, v in ggrads.items()}
+                mx.eval(loss_g, *ggrads.values())
+                for g_ in optim_g.param_groups:
+                    g_["grads"] = {k: ggrads[k].astype(mx.float32)
+                                   for k in g_["params"] if k in ggrads}
+                if args.precision == "fp16":
+                    scaler.unscale_(optim_g)
+                gn_g = sum(grad_norm_sq(g_["grads"])
+                           for g_ in optim_g.param_groups) ** 0.5
+                if args.precision == "fp16":
+                    scaler.step(optim_g)
+                    scaler.update()
+                else:
+                    optim_g.step()
+                loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl = [
+                    float(x) for x in gparts]
+                loss_d = float(loss_d)
+            t_step = time.perf_counter() - ts
 
             # ---- logging ----
             if step % args.log_interval == 0 or step == args.steps - 1:
                 rec = dict(step=step, epoch=epoch, batch=bi,
-                           loss_disc=float(loss_d),
-                           loss_gen=float(parts[0]), loss_fm=float(parts[1]),
-                           loss_mel=float(parts[2]), loss_kl_ssl=float(parts[3]),
-                           loss_kl=float(parts[4]),
+                           loss_disc=loss_d,
+                           loss_gen=loss_gen, loss_fm=loss_fm,
+                           loss_mel=loss_mel, loss_kl_ssl=kl_ssl,
+                           loss_kl=loss_kl,
                            grad_norm_d=round(gn_d, 3) if gn_d == gn_d else None,
                            grad_norm_g=round(gn_g, 3) if gn_g == gn_g else None,
                            scale=scaler.get_scale() if args.precision == "fp16" else 1.0,
@@ -411,11 +603,14 @@ def _run(args, device, mx):
                 logf.flush()
                 if first_rec is None:
                     first_rec = rec
+            fp_log.write(json.dumps(_step_mem(
+                step, {"t_step": round(t_step, 3),
+                       "loss_disc": loss_d, "loss_mel": loss_mel})) + "\n")
             if step == 1:
                 # silent no-train regression net: compare the JUST-FINISHED
                 # step-1 losses against the logged step-0 record
-                assert (float(loss_d) != first_rec["loss_disc"]
-                        or float(parts[2]) != first_rec["loss_mel"]), \
+                assert (loss_d != first_rec["loss_disc"]
+                        or loss_mel != first_rec["loss_mel"]), \
                     "silent no-train: step-1 losses identical to step-0 " \
                     "(optimizer update path dead?)"
             step += 1
@@ -443,6 +638,7 @@ def _run(args, device, mx):
             stop = True
 
     logf.close()
+    fp_log.close()
     _save(ckpt_mod, args, optim_g, optim_d, step, epoch - 1, d_fresh)
 
     peak = 0
@@ -454,6 +650,7 @@ def _run(args, device, mx):
     summary = dict(steps=step, epochs=epoch - 1, peak_metal_bytes=peak,
                    elapsed_s=round(time.perf_counter() - t0, 1),
                    disc_init="fresh" if d_fresh else "pretrained",
+                   g_forward=args.g_forward, precision=args.precision,
                    device=device)
     print("[done]", json.dumps(summary))
     with open(os.path.join(args.out, "summary.json"), "w") as f:
