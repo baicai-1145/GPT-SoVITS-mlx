@@ -53,6 +53,7 @@ net_g.cfm).
 from __future__ import annotations
 
 import math
+import os
 import random
 
 import numpy as np
@@ -595,12 +596,31 @@ class S2V3TrainModel:
         h0, mask, rope, emb, tail = dit_ckpt_heads(
             est, xt_t, prompt_t, x_lens, t, dt, fea)
         est._ckpt_h0 = h0  # long_skip residual (v3: unused)
-        hs = [h0]
-        h = h0
-        for i in range(len(est.transformer_blocks)):
-            h = dit_ckpt_block_fwd(est, adapters, i, h, mask, rope, emb)
-            mx.eval(h)
-            hs.append(h)
+        # group granularity (item-B blitz): G blocks per pass-1 eval and per
+        # backward grad call; retained inputs = group boundaries only.
+        # Default 1 = historical per-block. Env: GSOVITS_S2_CKPT_GROUPS.
+        G = int(os.environ.get("GSOVITS_S2_CKPT_GROUPS", "1"))
+        n_blocks = len(est.transformer_blocks)
+        if G < 1 or n_blocks % G != 0:
+            raise ValueError(
+                f"GSOVITS_S2_CKPT_GROUPS must divide {n_blocks}; got {G}")
+        if G == 1:
+            hs = [h0]
+            h = h0
+            for i in range(n_blocks):
+                h = dit_ckpt_block_fwd(est, adapters, i, h, mask, rope, emb)
+                mx.eval(h)
+                hs.append(h)
+        else:
+            hs = [h0]
+            h = h0
+            for gstart in range(0, n_blocks, G):
+                for i in range(gstart, gstart + G):
+                    h = dit_ckpt_block_fwd(est, adapters, i, h, mask, rope,
+                                           emb)
+                mx.eval(h)
+                if gstart + G < n_blocks:
+                    hs.append(h)
 
         # -- tail + CFM loss (live graph; small) -----------------------------
         def tail_loss(h_last):
@@ -623,66 +643,69 @@ class S2V3TrainModel:
 
         grads = {}
 
-        # -- pass 2: blocks, one at a time ------------------------------------
+        # -- pass 2: blocks, one GROUP at a time ------------------------------
         g = g_h
-        for i in range(len(est.transformer_blocks) - 1, -1, -1):
-            block = est.transformer_blocks[i]
+        for gstart in range(n_blocks - G, -1, -G):
+            glayers = range(gstart, gstart + G)
             lora_params = []
             names = []
-            for suffix in ("to_q", "to_k", "to_v", "to_out.0"):
-                nm = f"dit.blocks.{i}.attn.{suffix}"
-                if nm in adapters:
-                    lora_params.extend([masters[f"{nm}.lora_A"],
-                                        masters[f"{nm}.lora_B"]])
-                    names.extend([f"{nm}.lora_A", f"{nm}.lora_B"])
+            for i in glayers:
+                for suffix in ("to_q", "to_k", "to_v", "to_out.0"):
+                    nm = f"dit.blocks.{i}.attn.{suffix}"
+                    if nm in adapters:
+                        lora_params.extend([masters[f"{nm}.lora_A"],
+                                            masters[f"{nm}.lora_B"]])
+                        names.extend([f"{nm}.lora_A", f"{nm}.lora_B"])
 
-            def red(hh, *lp, _i=i, _np=lora_params, _names=names):
-                # recompute block i with CURRENT lora params
+            def red(hh, *lp, _layers=tuple(glayers), _names=names):
+                # recompute the group's blocks with CURRENT lora params
                 a_map = {}
                 for j, nm in enumerate(_names):
-                    suffix = nm.rsplit(".", 2)[-2] if nm.endswith("B") \
-                        else nm.rsplit(".", 2)[-2]
                     base = nm.rsplit(".", 1)[0]
-                    a_map.setdefault(base, {})["A" if nm.endswith("A") else "B"] = lp[j]
-                block = est.transformer_blocks[_i]
-                attn = block.attn
-                saved = {}
-                for suffix, attr in (("to_q", "to_q_w"), ("to_k", "to_k_w"),
-                                     ("to_v", "to_v_w"),
-                                     ("to_out.0", "to_out_0_w")):
-                    nm2 = f"dit.blocks.{_i}.attn.{suffix}"
-                    if nm2 not in a_map:
-                        continue
-                    base_w = getattr(attn, attr)
-                    saved[attr] = base_w
-                    A = a_map[nm2]["A"]
-                    Bm = a_map[nm2]["B"]
-                    setattr(attn, attr,
-                            base_w + (Bm @ A).astype(base_w.dtype))
-                if saved:
-                    attn._qkv_w_cache = None
-                try:
-                    out = block(hh, emb, mask, rope)
-                    return (out.astype(mx.float32) * g.astype(mx.float32)).sum()
-                finally:
-                    for attr, w in saved.items():
-                        setattr(attn, attr, w)
+                    a_map.setdefault(base, {})[
+                        "A" if nm.endswith("A") else "B"] = lp[j]
+                out = hh
+                for i in _layers:
+                    attn = est.transformer_blocks[i].attn
+                    saved = {}
+                    for suffix, attr in (("to_q", "to_q_w"), ("to_k", "to_k_w"),
+                                         ("to_v", "to_v_w"),
+                                         ("to_out.0", "to_out_0_w")):
+                        nm2 = f"dit.blocks.{i}.attn.{suffix}"
+                        if nm2 not in a_map:
+                            continue
+                        base_w = getattr(attn, attr)
+                        saved[attr] = base_w
+                        A = a_map[nm2]["A"]
+                        Bm = a_map[nm2]["B"]
+                        setattr(attn, attr,
+                                base_w + (Bm @ A).astype(base_w.dtype))
                     if saved:
                         attn._qkv_w_cache = None
+                    try:
+                        out = est.transformer_blocks[i](out, emb, mask, rope)
+                    finally:
+                        for attr, w in saved.items():
+                            setattr(attn, attr, w)
+                        if saved:
+                            attn._qkv_w_cache = None
+                return (out.astype(mx.float32) * g.astype(mx.float32)).sum()
 
             if lora_params:
                 res = mx.grad(red, argnums=tuple(range(len(lora_params) + 1)))(
-                    hs[i], *lora_params)
+                    hs[gstart // G], *lora_params)
                 g = res[0]
                 for j, nm in enumerate(names):
                     grads[nm] = res[j + 1].astype(mx.float32)
                 mx.eval(g, *(grads[nm] for nm in names))
             else:
-                # no adapters on this block (shouldn't happen for v3)
-                def red0(hh, _i=i):
-                    out = est.transformer_blocks[_i](hh, emb, mask, rope)
+                # no adapters on any block of this group
+                def red0(hh, _layers=tuple(glayers)):
+                    out = hh
+                    for i in _layers:
+                        out = est.transformer_blocks[i](out, emb, mask, rope)
                     return (out.astype(mx.float32) * g.astype(mx.float32)).sum()
-                g = mx.grad(red0)(hs[i])
+                g = mx.grad(red0)(hs[gstart // G])
                 mx.eval(g)
 
         # -- ge-side trunk grads (small graph) --------------------------------
