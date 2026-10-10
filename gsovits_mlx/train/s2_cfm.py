@@ -66,7 +66,8 @@ from ..sovits.models_v3 import SynthesizerTrnV3
 from .lora import LoRALinear
 
 __all__ = ["CFMTrainingLoss", "S2V3TrainModel", "dit_lora_forward",
-           "FROZEN_PARAM_PREFIXES", "FULL_TRAIN_PARAM_PREFIXES"]
+           "FROZEN_PARAM_PREFIXES", "FULL_TRAIN_PARAM_PREFIXES",
+           "EAGER_MIN_MEL_T", "eager_shape_estimate"]
 
 # official freeze set (freeze_quantizer=True): ssl_proj + quantizer + enc_p
 FROZEN_PARAM_PREFIXES = ("ssl_proj.", "enc_p.")
@@ -253,6 +254,35 @@ def dit_ckpt_block_fwd(dit, adapters, i, h, mask, rope, emb):
             attn._qkv_w_cache = None
 
 
+# eager (non-checkpointed) backward: keep ALL block activations in one
+# lazy graph; single mx.grad over the whole loss (trunk + lora in one call).
+# Memory guard rails (measured/pattern-derived; the per-step footprint gate
+# is the hard law, these are pre-run estimates):
+#   per-frame residual-stream activation h (B=3, T frames, fp32): 12KB/frame
+#   retained by ONE big grad graph over 22 blocks at T=320: ~86MB stream +
+#   per-block SDPA/FFN intermediates; projected ~8GB total footprint under
+#   the 10GB authorized gate but in-graph SDPA may materialize more -> the
+#   3-step probe (gate 3) is mandatory before any long run.
+EAGER_MIN_MEL_T = 128  # don't eager tiny batches (<~0.5GB anyway) — keep
+# this a single code path for numeric comparability across the A/B.
+
+
+def eager_shape_estimate(batch_mel: np.ndarray, batch_size: int,
+                         n_blocks: int = 22) -> dict:
+    """Pre-run shape estimate for the eager path (GPU law: shape estimate
+    before runs). Returns MB figures for documentation/gates."""
+    B, C, T = batch_mel.shape
+    per_frame_stream = B * 1024 * 4  # h bytes per frame (fp32 residual)
+    stream_mb = per_frame_stream * T * n_blocks / 1e6
+    # FFN inner (2048) activations + SDPA qkv per block (bf16 weights, fp32
+    # stream; SDPA itself upcasts scores internally)
+    ffn_mb = B * T * 2048 * 4 * 2 * n_blocks / 1e6  # h + gelu out
+    sdpa_mb = B * 16 * T * T * 4 * n_blocks / 1e6  # score matrices fp32
+    return {"B": B, "T": T, "stream_mb": stream_mb, "ffn_mb": ffn_mb,
+            "sdpa_mb": sdpa_mb,
+            "total_activation_mb": stream_mb + ffn_mb + sdpa_mb}
+
+
 def dit_sequence_mask(x_lens, max_length: int) -> mx.array:
     ids = mx.arange(max_length)
     return (ids[None, :] < mx.asarray(x_lens)[:, None]).astype(mx.float32)
@@ -273,6 +303,22 @@ def _attn_adapter_name(dit, block, attn, suffix: str) -> str:
 # ---------------------------------------------------------------------------
 # CFM training loss (models.py CFM.forward)
 # ---------------------------------------------------------------------------
+
+# Parity regime switch: tests (and any bit-parity comparison against the
+# UNTRACED two-pass forward) set this to disable mx.compile for BOTH paths
+# — nn.gelu/gelu_approx are @mx.compile-wrapped and round differently
+# inside a value_and_grad trace (measured; see train_loss_and_grads_eager).
+_PARITY_COMPILE_DISABLED = [False]
+
+
+def set_parity_compile_disabled(flag: bool = True) -> None:
+    """Enable/disable the bit-parity regime (mx.compile off, both paths)."""
+    _PARITY_COMPILE_DISABLED[0] = bool(flag)
+    if flag:
+        mx.disable_compile()
+    else:
+        mx.enable_compile()
+
 
 class CFMTrainingLoss:
     """CFM.forward port. x1/mu: (B, C, T); returns fp32 scalar loss.
@@ -546,7 +592,7 @@ class S2V3TrainModel:
             gate = det["gate"]
             pl = [int(p) for p in det["prompt_lens"]]
         else:
-            key = mx.random.key(random.getrandbits(63))
+            key = mx.random.key(self.rng.getrandbits(63))
             key, sub = mx.random.split(key)
             t = mx.random.uniform(0.0, 1.0, (B,), key=key).astype(mx.float32)
             x0_full = mx.random.normal((B, 100, b_np["mel"].shape[2]), key=sub)
@@ -574,8 +620,11 @@ class S2V3TrainModel:
         info = {"two_step": False}
         if gate < 0.3:
             info["two_step"] = True
-            base = mx.array([self.rng.randint(2, 7) for _ in range(B)],
-                            dtype=mx.float32)
+            if det is not None and "base" in det:
+                base = det["base"].astype(mx.float32)
+            else:
+                base = mx.array([self.rng.randint(2, 7) for _ in range(B)],
+                                dtype=mx.float32)
             d = 1.0 / mx.power(2.0, base)
             d_input = mx.where(d < 1e-2, mx.zeros_like(d), d)
             v1 = mx.stop_gradient(mx.transpose(
@@ -785,6 +834,237 @@ class S2V3TrainModel:
             grads[k] = tg[k].astype(mx.float32)
         mx.eval(*(grads[k] for k in trunk_keys))
         return loss_f, info, grads
+
+    # -- eager (non-checkpointed) backward ---------------------------------
+    #
+    # The s1-eager play applied to CFM: ONE DiT forward with all 22 blocks
+    # in a single lazy graph (ALL activations retained) + ONE mx.grad over
+    # the whole loss (trunk params + LoRA A/B as one flat pytree). The
+    # two-pass recompute (22 extra block forwards) and the 23 separate
+    # python-dispatched grad graphs disappear; MLX streams the backward as
+    # one deep graph. Gate evidence (tests + RUN_PLAN): same-draw loss is
+    # BIT-EXACT vs two-pass (identical op sequence); grads agree to
+    # fp-accumulation-reorder tolerance (single full-graph reduction vs
+    # per-block chains). Memory: activations for all 22 blocks live at once
+    # (~+1.5GB over ckpt at b3/T~320; the per-step footprint gate is the
+    # hard law). v3-family long_skip is absent (v3/v4/v5 checkpoints carry
+    # no dit.long_skip) — guarded anyway for safety.
+
+    def _eager_estimator(self, xt, prompt, x_lens, t, d, mu) -> mx.array:
+        """Single-graph DiT training forward (all 22 blocks lazy). The
+        module weights already carry the materialized W + B@A (set by the
+        enclosing loss fn). Returns (B, T, C) like DiT.__call__.
+        EXACTLY the two-pass dit_ckpt_heads + block-walk + tail op
+        sequence, minus the evals (the graph must stay lazy end-to-end)."""
+        est = self.model.cfm.estimator
+        x = mx.transpose(xt, (0, 2, 1))
+        cond = mx.transpose(prompt, (0, 2, 1))
+        text = mx.transpose(mu, (0, 2, 1))
+        seq_len = x.shape[1]
+        mask = (mx.arange(seq_len)[None, :]
+                < mx.asarray(x_lens)[:, None].astype(mx.float32))
+        mask = mask.astype(mx.bool_)
+        text_embed = est.text_embed(text.astype(mx.float32), seq_len)
+        h = est.input_embed(x, cond, text_embed)
+        h0 = h
+        rope = est._rope(seq_len, mx.float32)
+        t0w = getattr(est.time_embed, "time_mlp_0_w", None)
+        td = t0w.dtype if t0w is not None else mx.float32
+        emb = est.time_embed(t.astype(td))
+        if getattr(est, "use_step_embedding", False):
+            d0w = getattr(est.d_embed, "time_mlp_0_w", None)
+            dtd = d0w.dtype if d0w is not None else mx.float32
+            emb = emb + est.d_embed(d.astype(dtd))
+        for blk in est.transformer_blocks:
+            h = blk(h, emb, mask, rope)
+        if getattr(est, "long_skip_w", None) is not None:
+            h = mx.concatenate([h, h0], axis=-1) @ est.long_skip_w.T
+        y = est.norm_out(h, emb)
+        return y @ est.proj_out_w.T + est.proj_out_b
+
+    def _materialize_lora(self, a_map):
+        """Swap W + B@A onto the DiT attention modules (differentiable in
+        the lora params; base weights frozen). Returns (saved, touched)."""
+        est = self.model.cfm.estimator
+        saved = {}
+        touched = []
+        for bi, blk in enumerate(est.transformer_blocks):
+            attn = blk.attn
+            blk_touched = False
+            for suffix, attr in (("to_q", "to_q_w"), ("to_k", "to_k_w"),
+                                 ("to_v", "to_v_w"),
+                                 ("to_out.0", "to_out_0_w")):
+                nm = f"dit.blocks.{bi}.attn.{suffix}"
+                if nm not in a_map:
+                    continue
+                base_w = getattr(attn, attr)
+                saved[(bi, attr)] = base_w
+                A, Bm = a_map[nm]["A"], a_map[nm]["B"]
+                setattr(attn, attr,
+                        base_w + (Bm @ A).astype(base_w.dtype))
+                blk_touched = True
+            if blk_touched:
+                attn._qkv_w_cache = None
+                touched.append(bi)
+        return saved, touched
+
+    def _restore_lora(self, saved, touched):
+        est = self.model.cfm.estimator
+        for (bi, attr), w in saved.items():
+            setattr(est.transformer_blocks[bi].attn, attr, w)
+        for bi in touched:
+            est.transformer_blocks[bi].attn._qkv_w_cache = None
+
+    def _eager_cfm_state(self, b_np, fea, det):
+        """CFM draw state shared verbatim with the two-pass path (same
+        draws, same math → bit-exact same-draw loss)."""
+        B = b_np["ssl"].shape[0]
+        ml_np = b_np["mel_lengths"]
+        if det is not None:
+            t = det["t"].astype(mx.float32)
+            x0_full = det["x0"].astype(mx.float32)
+            gate = det["gate"]
+            pl = [int(p) for p in det["prompt_lens"]]
+        else:
+            key = mx.random.key(self.rng.getrandbits(63))
+            key, sub = mx.random.split(key)
+            t = mx.random.uniform(0.0, 1.0, (B,), key=key).astype(mx.float32)
+            x0_full = mx.random.normal(
+                (B, 100, b_np["mel"].shape[2]), key=sub)
+            gate = self.rng.random()
+            pr = mx.random.uniform(0.0, 1.0, (B,), key=sub)
+            pr_np = np.asarray(pr)
+            pl = []
+            for i in range(B):
+                pl.append(int(np.floor(pr_np[i] * (ml_np[i] * 2.0 / 3.0))))
+        return t, x0_full, gate, pl
+
+    def train_loss_and_grads_eager(self, masters: dict, batch: dict,
+                                   det: dict | None = None) \
+            -> tuple[float, dict, dict]:
+        """Eager single-graph forward+backward. Contract identical to
+        train_loss_and_grads (loss_f, info, grads).
+
+        NUMICS NOTE (mlx 0.32.2, measured): nn.gelu / nn.gelu_approx are
+        @mx.compile-wrapped; a graph node produced inside a value_and_grad
+        trace rounds gelu differently than the same op evaluated untraced
+        (different compile fusion; ~1e-6 fp32, and up to ~0.3 rel on GRAD
+        tensors via amplification). The two-pass forward runs its blocks
+        UNTRACED, so for bit-parity this method disables mx.compile around
+        the whole grad call (gelu then uses the plain erf/tanh path in both
+        regimes; probe-verified bit-exact loss AND grads vs two-pass under
+        disable_compile on CPU)."""
+        est = self.model.cfm.estimator
+        adapters = self.adapter_by_name if self.use_lora else {}
+
+        b_np = {k: np.asarray(getattr(batch, k)) for k in (
+            "ssl", "spec", "mel", "ssl_lengths", "spec_lengths",
+            "text", "text_lengths", "mel_lengths")}
+        B = b_np["ssl"].shape[0]
+        mel_lengths = mx.array(b_np["mel_lengths"].astype(np.float32))
+        spec_lengths = mx.array(b_np["spec_lengths"])
+        ml_np = b_np["mel_lengths"]
+
+        # the grad pytree: every trainable param (trunk + lora). The loss
+        # fn reads params from this dict ONLY (module weights are written
+        # from it inside the fn — the graph is a pure function of `p`).
+        p0 = dict(masters)  # {name: fp32 array}
+
+        def loss_fn(p):
+            # trunk params onto the modules (differentiable through
+            # apply_params' setattr — the graph consumes the pytree leafs)
+            self.apply_params({k: v for k, v in p.items()
+                               if not k.startswith("dit.")})
+            # lora deltas materialized as module weights (differentiable
+            # in A/B: fused = base + (B@A).astype(dtype))
+            a_map = {}
+            if self.use_lora:
+                for name in p:
+                    if not name.startswith("dit."):
+                        continue
+                    base = name.rsplit(".", 1)[0]
+                    a_map.setdefault(base, {})[
+                        "A" if name.endswith("lora_A") else "B"] = p[name]
+            saved, touched = self._materialize_lora(a_map)
+            try:
+                ge, fea = self._prep_ckpt(
+                    mx.array(b_np["ssl"]), mx.array(b_np["spec"]),
+                    mx.array(b_np["mel"]), mx.array(b_np["ssl_lengths"]),
+                    spec_lengths, mx.array(b_np["text"].astype(np.int32)),
+                    mx.array(b_np["text_lengths"]), mel_lengths, None)
+                t, x0_full, gate, pl = self._eager_cfm_state(b_np, fea, det)
+                minn = min(b_np["mel"].shape[2], fea.shape[-1])
+                mel = mx.array(b_np["mel"])[:, :, :minn]
+                fea = fea[:, :, :minn]
+                x0 = x0_full[:, :, :minn]
+                vt = mel - x0
+                xt = x0 + t[:, None, None] * vt
+                dt = mx.zeros((B,), dtype=mx.float32)
+                prompt = mx.zeros_like(mel)
+                for i in range(B):
+                    if pl[i] > 0:
+                        prompt[i, :, :pl[i]] = mel[i, :, :pl[i]]
+                        xt[i, :, :pl[i]] = 0.0
+                x_lens = mel_lengths
+
+                info = {"two_step": False}
+                if gate < 0.3:
+                    info["two_step"] = True
+                    if det is not None and "base" in det:
+                        base = det["base"].astype(mx.float32)
+                    else:
+                        base = mx.array(
+                            [self.rng.randint(2, 7) for _ in range(B)],
+                            dtype=mx.float32)
+                    d = 1.0 / mx.power(2.0, base)
+                    d_input = mx.where(d < 1e-2, mx.zeros_like(d), d)
+                    # detached 2-step estimator calls (official .detach());
+                    # stop_gradient + eval keeps them out of the big graph
+                    v1 = mx.stop_gradient(mx.transpose(
+                        self._eager_estimator(xt, prompt, x_lens, t,
+                                              d_input, fea), (0, 2, 1)))
+                    mx.eval(v1)
+                    x_mid = xt + d[:, None, None] * v1
+                    v2 = mx.stop_gradient(mx.transpose(
+                        self._eager_estimator(x_mid, prompt, x_lens, t + d,
+                                              d_input, fea), (0, 2, 1)))
+                    mx.eval(v2)
+                    vt = mx.stop_gradient((v1 + v2) / 2)
+                    mx.eval(vt)
+                    dt = 2 * d
+
+                vt_pred = mx.transpose(
+                    self._eager_estimator(xt, prompt, x_lens, t, dt, fea),
+                    (0, 2, 1))
+                total = mx.zeros((), dtype=mx.float32)
+                for i in range(B):
+                    lo, hi = pl[i], int(ml_np[i])
+                    if hi <= lo:
+                        continue
+                    pred = vt_pred[i, :, lo:hi].astype(mx.float32)
+                    tgt = vt[i, :, lo:hi].astype(mx.float32)
+                    total = total + mx.sum((pred - tgt) ** 2) / pred.size
+                self._eager_last_info = info
+                return total / B
+            finally:
+                self._restore_lora(saved, touched)
+
+        # compile toggle: the eager grad call must run with mx.compile
+        # DISABLED (gelu fusion parity; see docstring). An outer parity
+        # regime (tests set _PARITY_COMPILE_DISABLED) is honored — we never
+        # re-enable what we didn't disable.
+        outer = _PARITY_COMPILE_DISABLED[0]
+        if not outer:
+            mx.disable_compile()
+        try:
+            loss, grads = mx.value_and_grad(loss_fn)(p0)
+            mx.eval(loss, *grads.values())
+        finally:
+            if not outer:
+                mx.enable_compile()
+        info = getattr(self, "_eager_last_info", {"two_step": False})
+        self._eager_last_info = None
+        return float(loss), info, grads
 
     def forward(self, ssl, spec, mel, ssl_lengths, spec_lengths, text,
                 text_lengths, mel_lengths, key: mx.array | None = None,

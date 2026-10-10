@@ -105,6 +105,14 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="two-pass checkpointed DiT backward (memory-safe "
                         "default; grad-verified vs fused)")
     p.add_argument("--no-dit-ckpt", dest="dit_ckpt", action="store_false")
+    p.add_argument("--eager-backward", action="store_true",
+                   help="OPT-IN single-graph eager DiT backward (all 22 "
+                         "blocks in one lazy graph + one mx.grad over the "
+                         "whole loss). Trades ~+1.5GB peak footprint for "
+                         "dropping the two-pass recompute + per-block grad "
+                         "dispatch chains (the s1-eager play; gates in "
+                         ".tmp/cfm_eager/RUN_PLAN.md). Incompatible with "
+                         "--no-dit-ckpt / GSOVITS_S2_CKPT_GROUPS>1.")
     p.add_argument("--dit-dtype", default=None, choices=["fp32", "fp16", "bf16"],
                    help="EXPERIMENTAL DiT compute dtype override. Default: "
                         "fp32 masters with ckpt mode (fp16 backward "
@@ -312,10 +320,22 @@ def main(argv=None) -> None:
     batch_holder = {}
 
     use_ckpt = args.dit_ckpt and tm.use_lora
-    if use_ckpt:
+    use_eager = args.eager_backward and tm.use_lora
+    if use_eager and (os.environ.get("GSOVITS_S2_CKPT_GROUPS", "1") != "1"
+                      or not args.dit_ckpt):
+        raise SystemExit("--eager-backward is incompatible with "
+                         "--no-dit-ckpt and GSOVITS_S2_CKPT_GROUPS>1")
+    if use_eager:
+        print("[mode] EAGER single-graph DiT backward (all-blocks graph + "
+              "one mx.grad; footprint-gated)", flush=True)
+    elif use_ckpt:
         print("[mode] two-pass checkpointed DiT backward (memory-safe; "
               "grad-verified vs fused: bit-exact loss, grads <=1e-6)",
               flush=True)
+
+    trainer = Trainer(None, [opt], scaler=(None if (use_ckpt or use_eager)
+                                           else scaler),
+                      log_interval=1, loss_log_path=loss_log)
 
     def loss_of(pdict: dict) -> mx.array:
         tm.apply_params(pdict)
@@ -336,9 +356,6 @@ def main(argv=None) -> None:
     def backward_fn(p16, loss):
         _, grads = value_and_grad(masters)
         return grads
-
-    trainer = Trainer(None, [opt], scaler=(None if use_ckpt else scaler),
-                      log_interval=1, loss_log_path=loss_log)
 
     start_step = 0
     if args.resume:
@@ -364,13 +381,17 @@ def main(argv=None) -> None:
             batch = collate([dataset[i] for i in bidx])
             if args.max_batch_mel and batch.mel.shape[-1] > args.max_batch_mel:
                 continue
-            if use_ckpt and args.warmup_steps > 0 and step < args.warmup_steps:
+            if use_ckpt or use_eager:
                 opt.param_groups[0]["lr"] = (
-                    args.lr * (step + 1) / args.warmup_steps)
+                    args.lr * (step + 1) / args.warmup_steps
+                    if (args.warmup_steps > 0 and step < args.warmup_steps)
+                    else args.lr)
+            if use_eager:
+                loss_f, info, grads = tm.train_loss_and_grads_eager(
+                    masters, batch)
             elif use_ckpt:
-                opt.param_groups[0]["lr"] = args.lr
-            if use_ckpt:
                 loss_f, info, grads = tm.train_loss_and_grads(masters, batch)
+            if use_ckpt or use_eager:
                 import math as _math
                 if not _math.isfinite(loss_f) or any(
                         _math.isnan(float(mx.abs(g).max())) for g in grads.values()):
