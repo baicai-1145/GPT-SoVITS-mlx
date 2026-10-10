@@ -405,23 +405,41 @@ def _run(args, device, mx):
                           quantized_in=(quant, commit),
                           strict_noise=args.bf16_strict_noise)
         mel = G.spec_to_mel(spec.astype(mx.float32), mel_basis)
-        y_mel = G.slice_segments(mel, ids_slice, seg_frames)
+        if net_g.use_gather_slice:
+            # compile-safe path (fwd arm): loop slice is a graph break
+            y_mel = G.slice_segments_gather(mel, ids_slice, seg_frames)
+            y = G.slice_segments_gather(
+                wav, ids_slice * TRAIN["hop_length"],
+                TRAIN["segment_size"])
+        else:
+            y_mel = G.slice_segments(mel, ids_slice, seg_frames)
+            y = G.slice_segments(wav, ids_slice * TRAIN["hop_length"],
+                                 TRAIN["segment_size"])
         y_hat_mel = G.mel_spectrogram_train(
             o.astype(mx.float32).squeeze(1), mel_basis,
             TRAIN["filter_length"], TRAIN["hop_length"], TRAIN["win_length"])
-        y = G.slice_segments(wav, ids_slice * TRAIN["hop_length"],
-                             TRAIN["segment_size"])
         return o, y, y_mel, y_hat_mel, kl_ssl, commit, \
             (z, z_p, m_p, logs_p, m_q, logs_q), y_mask
+
+    if args.compile_mode == "fwd":
+        # fwd arm: compile the driver's whole g_forward helper (weights as
+        # args — p16 rebinds inside; the gather slice keeps it traceable)
+        g_forward = mx.compile(g_forward)
 
     # legacy helper retained for double mode
     def d_loss_fn(d16, p16, arrays, sv, key):
         """D loss wrt d16; G forward under captured p16 (constants)."""
-        load_mpd_weights(net_d, d16)
-        o, y, *_ = g_forward(p16, arrays, sv, key)
-        y32 = y.astype(mx.float32)
-        y_hat32 = mx.stop_gradient(o).astype(mx.float32)
-        y_d_hat_r, y_d_hat_g, _, _ = net_d(y32, y_hat32)
+        if d_call_c is not None:
+            o, y, *_ = g_forward(p16, arrays, sv, key)
+            y32 = y.astype(mx.float32)
+            y_hat32 = mx.stop_gradient(o).astype(mx.float32)
+            y_d_hat_r, y_d_hat_g, _, _ = d_call_c(d16, y32, y_hat32)
+        else:
+            load_mpd_weights(net_d, d16)
+            o, y, *_ = g_forward(p16, arrays, sv, key)
+            y32 = y.astype(mx.float32)
+            y_hat32 = mx.stop_gradient(o).astype(mx.float32)
+            y_d_hat_r, y_d_hat_g, _, _ = net_d(y32, y_hat32)
         loss, _, _ = G.discriminator_loss(y_d_hat_r, y_d_hat_g)
         return loss
 
@@ -432,9 +450,14 @@ def _run(args, device, mx):
         z, z_p, m_p, logs_p, m_q, logs_q = ql
         loss_mel = mx.mean(mx.abs(y_mel - y_hat_mel)) * TRAIN["c_mel"]
         loss_kl = G.kl_loss(z_p, logs_q, m_p, logs_p, y_mask) * TRAIN["c_kl"]
-        load_mpd_weights(net_d, d16)
         y32 = y.astype(mx.float32)
-        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y32, o.astype(mx.float32))
+        if d_call_c is not None:
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = d_call_c(
+                d16, y32, o.astype(mx.float32))
+        else:
+            load_mpd_weights(net_d, d16)
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(
+                y32, o.astype(mx.float32))
         loss_fm = G.feature_loss(fmap_r, fmap_g)
         loss_gen, _ = G.generator_loss(y_d_hat_g)
         # official: loss_gen + loss_fm + loss_mel + kl_ssl * 1 + loss_kl
@@ -442,23 +465,16 @@ def _run(args, device, mx):
                 (loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl))
 
     # -- mx.compile experiment, fwd arm (ITEM 2) ---------------------------
-    # Compiled wrappers over the inner G forward / D call. Weights are
-    # passed as ARGUMENTS (never captured): a captured mx array becomes a
-    # compile-time constant and the optimizer's updates would be silently
-    # ignored (stale-weight hazard). net_g.bind(p16_) / load_mpd_weights
-    # run INSIDE the traced body on the input dicts. None = eager
-    # (official semantics).
-    g_fwd_c = d_call_c = None
+    # ONE compiled wrapper over the driver's g_forward helper (below —
+    # defined before this point and referenced lazily via closure), plus
+    # one over the D call. Weights are ARGUMENTS (never captured): a
+    # captured mx array becomes a compile-time constant and the
+    # optimizer's updates would be silently ignored (stale-weight hazard).
+    # Under fwd, g_forward's mel/wav segment slices use the gather variant
+    # (the loop slice's int(ids_str[i]) is a compile graph break that
+    # bakes stale offsets). None = eager (official semantics).
+    d_call_c = None
     if args.compile_mode == "fwd":
-        def _g_fwd_c(p16_, ssl_, spec_in_, y_lengths_, text_, text_lengths_,
-                     sv_, key_, quant_in_, strict_):
-            net_g.bind(p16_)
-            o, kl_ssl, ids_slice, y_mask, ql, _ = net_g.forward(
-                ssl_, spec_in_, y_lengths_, text_, text_lengths_, sv_emb=sv_,
-                key=key_, quantized_in=quant_in_, strict_noise=strict_)
-            return o, kl_ssl, ids_slice, y_mask, ql
-        g_fwd_c = mx.compile(_g_fwd_c)
-
         def _d_call_c(d16_, y32_, yhat32_):
             load_mpd_weights(net_d, d16_)
             return net_d(y32_, yhat32_)
@@ -479,9 +495,9 @@ def _run(args, device, mx):
             documented pre-update-D deviation); grads flow ONLY into p16.
         One rand_slice + one posterior-noise draw (key) shared by both
         branches — official single-draw RNG.
-        g_fwd_c/d_call_c (the --compile-mode fwd experiment) inject compiled
-        G/D forwards; None = eager (default; official semantics). They are
-        transparent to mx.value_and_grad and bit-identical when uncompiled.
+        d_call_c (the --compile-mode fwd experiment) is a compiled D call;
+        the G forward here reuses g_forward's body inline (eager) — the
+        fwd arm compiles g_forward itself where the double traces use it.
         """
         # ---- shared single G forward (official net_g call #1) ----
         (ssl, ssl_lengths, spec, spec_lengths, wav, wav_lengths, text,
@@ -493,37 +509,29 @@ def _run(args, device, mx):
             spec_in = spec.astype(compute_dtype)
         y_lengths = spec_lengths
         quant, commit = net_g.quantize_ssl(ssl)
-        if g_fwd_c is None:
-            o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
-                net_g.forward(ssl, spec_in, y_lengths, text.astype(mx.int32),
-                              text_lengths, sv_emb=sv, key=key,
-                              quantized_in=(quant, commit),
-                              strict_noise=args.bf16_strict_noise)
-        else:
-            o, kl_ssl, ids_slice, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), _ = \
-                g_fwd_c(p16, ssl, spec_in, y_lengths, text.astype(mx.int32),
-                        text_lengths, sv, key, (quant, commit),
-                        args.bf16_strict_noise)
-        mel = G.spec_to_mel(spec.astype(mx.float32), mel_basis)
-        y_mel = G.slice_segments(mel, ids_slice, seg_frames)
-        y_hat_mel = G.mel_spectrogram_train(
-            o.astype(mx.float32).squeeze(1), mel_basis,
-            TRAIN["filter_length"], TRAIN["hop_length"], TRAIN["win_length"])
-        y = G.slice_segments(wav, ids_slice * TRAIN["hop_length"],
-                             TRAIN["segment_size"])
+        o, y, y_mel, y_hat_mel, kl_ssl, _commit, ql, y_mask = g_forward(
+            p16, arrays, sv, key)
+        z, z_p, m_p, logs_p, m_q, logs_q = ql
         y32 = y.astype(mx.float32)
 
         # ---- D branch (official: net_d(y, y_hat.detach())) ----
-        dcall = d_call_c if d_call_c is not None else (
-            lambda dd, y_, yh_: (load_mpd_weights(net_d, dd), net_d(y_, yh_))[1])
-        y_d_hat_r_d, y_d_hat_g_d, _, _ = dcall(
-            d16, y32, mx.stop_gradient(o).astype(mx.float32))
+        if d_call_c is not None:
+            y_d_hat_r_d, y_d_hat_g_d, _, _ = d_call_c(
+                d16, y32, mx.stop_gradient(o).astype(mx.float32))
+        else:
+            load_mpd_weights(net_d, d16)
+            y_d_hat_r_d, y_d_hat_g_d, _, _ = net_d(
+                y32, mx.stop_gradient(o).astype(mx.float32))
         loss_d, _, _ = G.discriminator_loss(y_d_hat_r_d, y_d_hat_g_d)
 
         # ---- G branch (official: net_d(y, y_hat) on updated D; ours: pre-update D) ----
         d_const = {k: mx.stop_gradient(v) for k, v in d16.items()}
-        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = dcall(d_const, y32,
-                                                     o.astype(mx.float32))
+        if d_call_c is not None:
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = d_call_c(
+                d_const, y32, o.astype(mx.float32))
+        else:
+            load_mpd_weights(net_d, d_const)
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y32, o.astype(mx.float32))
         loss_mel = mx.mean(mx.abs(y_mel - y_hat_mel)) * TRAIN["c_mel"]
         loss_kl = G.kl_loss(z_p, logs_q, m_p, logs_p, y_mask) * TRAIN["c_kl"]
         loss_fm = G.feature_loss(fmap_r, fmap_g)
