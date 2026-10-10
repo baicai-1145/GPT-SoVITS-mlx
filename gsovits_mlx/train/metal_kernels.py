@@ -117,10 +117,13 @@ uint t_len = @T@;
 uint idx = e % (h_len * t_len);     // position within (H, T)
 uint h = idx / t_len;               // channel within half
 uint bt = e / (h_len * t_len);      // batch*T block
-uint base_a = bt * (2 * h_len * t_len) + h * t_len + (idx % t_len);
+uint tt = idx % t_len;
+uint base_a = bt * (2 * h_len * t_len) + h * t_len + tt;
 uint base_b = base_a + h_len * t_len;
-float u = static_cast<float>(a_[base_a]) + static_cast<float>(b_[base_a]);
-float u2 = static_cast<float>(a_[base_b]) + static_cast<float>(b_[base_b]);
+uint base_gb = bt * (2 * h_len * @TB@) + h * @TB@ + (tt % @TB@);
+uint base_gb2 = base_gb + h_len * @TB@;
+float u = static_cast<float>(a_[base_a]) + static_cast<float>(b_[base_gb]);
+float u2 = static_cast<float>(a_[base_b]) + static_cast<float>(b_[base_gb2]);
 float t_v = metal::precise::tanh(u);
 float s = 1.0f / (1.0f + metal::fast::exp(-u2));
 y_[e] = static_cast<T>(t_v * s);
@@ -265,10 +268,14 @@ def fused_gate(a: mx.array, b: mx.array):
     <=1e-6 rel — precise::tanh + fast::exp vs MLX's implementations).
     """
     blks, two_h, t = a.shape
+    tb = b.shape[2]
+    assert b.shape[0] == blks and b.shape[1] == two_h and tb in (1, t), \
+        f"fused_gate: b {b.shape} must broadcast over T against a {a.shape}"
     h = two_h // 2
     nel = blks * h * t
     body = (_GATE_BODY.replace("@NEL@", str(nel))
-            .replace("@H@", str(h)).replace("@T@", str(t)))
+            .replace("@H@", str(h)).replace("@T@", str(t))
+            .replace("@TB@", str(tb)))
     k = _get_kernel("gate", body)
     return k(inputs=[a, b], template=[("T", a.dtype)],
              grid=(nel, 1, 1), threadgroup=(256, 1, 1),
@@ -280,11 +287,14 @@ def _gate_vjp(*args):
     primals, cot = args[0], args[-2]
     a, b = primals
     h = a.shape[1] // 2
-    v = a + b
+    tb = b.shape[2]
+    v = a + b                      # broadcast over T when tb == 1
     t_act = mx.tanh(v[:, :h, :])
     s_act = mx.sigmoid(v[:, h:, :])
-    # dy/du for the tanh half: (1 - t^2) * s ; for the sigmoid half: t * s * (1-s)
     du1 = (1.0 - t_act * t_act) * s_act
     du2 = t_act * (s_act * (1.0 - s_act))
     ga = mx.concatenate([cot * du1, cot * du2], axis=1)
+    if tb == 1:
+        gb = mx.sum(ga, axis=2, keepdims=True)
+        return (ga, gb)
     return (ga, ga)
