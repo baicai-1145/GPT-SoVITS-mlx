@@ -276,7 +276,6 @@ def main(argv=None) -> None:
         n = 0
         for bidx in epoch_batches(0):
             batch = collate([dataset[i] for i in bidx])
-            batch = collate([dataset[i] for i in bidx])
             if args.max_batch_mel and batch.mel.shape[-1] > args.max_batch_mel:
                 continue
             _np.savez(os.path.join(args.dump_batches, f"batch_{n:03d}.npz"),
@@ -378,10 +377,10 @@ def main(argv=None) -> None:
                 loss = loss_f
                 trainer.step += 1
                 trainer._log(loss)
-                try:
-                    mx.clear_cache()
-                except Exception:
-                    pass
+                # sample Metal counters BEFORE clear_cache: cache holds the
+                # buffers the step just freed — the steady-state allocator
+                # footprint the acceptance gate measures (after clear it
+                # would read ~0 and hide growth)
                 t_step = time.time() - t0
                 rec = step_mem_rec(step + 1, float(loss), t_step)
                 log_step_footprint(rec, flush=(step + 1) % 10 == 0)
@@ -391,6 +390,10 @@ def main(argv=None) -> None:
                         f"[abort] step {step} footprint "
                         f"{rec['footprint']/1e9:.2f} GB > 8GB "
                         "gate — aborting before machine risk")
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
             else:
                 loss = trainer.train_step(batch, forward_fn, backward_fn)
                 sync_adapters()
