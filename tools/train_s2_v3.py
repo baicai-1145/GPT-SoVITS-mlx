@@ -43,6 +43,13 @@ DEFAULT_MODELS_ROOT = os.environ.get(
 
 _REFRESH_LOCK = None  # set when --gpu: long-run freshness keeper
 
+# Per-step footprint abort gate (GB). Default 8 (the machine law this
+# trainer shipped with); override via env for explicitly authorized
+# batch-scaling probes ONLY (e.g. GSOVITS_FOOTPRINT_LIMIT_GB=10).
+_FOOTPRINT_LIMIT_BYTES = int(
+    float(os.environ.get("GSOVITS_FOOTPRINT_LIMIT_GB", "8"))
+    * 1024 * 1024 * 1024)
+
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -396,12 +403,14 @@ def main(argv=None) -> None:
                 t_step = time.time() - t0
                 rec = step_mem_rec(step + 1, float(loss), t_step)
                 log_step_footprint(rec, flush=(step + 1) % 10 == 0)
-                if rec["footprint"] > 8 * 1024 * 1024 * 1024:
+                if rec["footprint"] > _FOOTPRINT_LIMIT_BYTES:
                     release_lock()
                     raise SystemExit(
                         f"[abort] step {step} footprint "
-                        f"{rec['footprint']/1e9:.2f} GB > 8GB "
-                        "gate — aborting before machine risk")
+                        f"{rec['footprint']/1e9:.2f} GB > "
+                        f"{_FOOTPRINT_LIMIT_BYTES/1e9:.0f}GB "
+                        "gate — aborting before machine risk "
+                        "(override: GSOVITS_FOOTPRINT_LIMIT_GB)")
                 try:
                     mx.clear_cache()
                 except Exception:
