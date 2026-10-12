@@ -144,12 +144,9 @@ class Attention(nn.Module):
         self._rope_masked = False  # task-10: set on v5 full-length fast path
 
     def _qkv_w(self):
-        # task-10: fused (3*inner, dim) weight + bias, built once.
-        # task-12: evaluate the packed arrays at build time. The lazy
-        # concatenate made every compiled step re-materialize the W/b packs
-        # (dense probe: 528 W + 528 b copy dispatches per sentence, 1.03 GiB
-        # of W payload). Exact-op packing; eval happens before the compiled
-        # step first sees the arrays.
+        # Fused (3*inner, dim) weight + bias, built and EVALUATED once at
+        # build time: a lazy concatenate re-materializes the W/b packs in
+        # every compiled step (dense probe: 1.03 GiB of W payload copies).
         w = getattr(self, "_qkv_w_cache", None)
         if w is None:
             w = (mx.concatenate([self.to_q_w, self.to_k_w, self.to_v_w], axis=0),
@@ -170,13 +167,10 @@ class Attention(nn.Module):
         q_h = q.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
         k_h = k.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
         v = v.reshape(b, t, self.heads, self.dim_head).transpose(0, 2, 1, 3)
-        # task-10: head 0 carries RoPE angles that ROTATE WITH POSITION; for
-        # the v5 rolling chunk the prompt region is IDENTICAL every step, so
-        # zeroing its angles is equivalent to applying then re-applying the
-        # same rotation — without the 2x concatenate copies (frequencies are
-        # cached; the zero mask multiplies only the (1,1,T,D/2) angle slab).
-        # Probe-verified bitwise-equal on non-prompt rows; exact-zero on
-        # prompt rows is what the subsequent mask multiply produces anyway.
+        # For the v5 rolling chunk the prompt region's RoPE angles are
+        # IDENTICAL every step: zeroing them equals apply-then-reapply of
+        # the same rotation, without the 2x concatenate copies.
+        # Probe-verified bitwise-equal on non-prompt rows.
         if getattr(self, "_rope_masked", False) and rope is not None and mask is not None:
             rope0 = rope * mask[0, : rope.shape[0]][:, None].astype(rope.dtype)
         else:
@@ -184,14 +178,11 @@ class Attention(nn.Module):
         q_h = mx.concatenate([apply_rope(q_h[:, :1], rope0), q_h[:, 1:]], axis=1)
         k_h = mx.concatenate([apply_rope(k_h[:, :1], rope0), k_h[:, 1:]], axis=1)
 
-        # SDPA in the stream dtype (pure-fp16 semantics, 2026-10-08): matches
-        # the CUDA project's F.scaled_dot_product_attention under is_half=True
-        # (native fp16 attention, no fp32 island). No-op when inputs are fp32.
-        # MASK SEMANTICS: mx.fast's mask is ADDITIVE for float inputs but a
-        # keep-mask for BOOL. The 0/1 float mask passed here before 2026-10-09
-        # added +1 to unmasked scores (softmax-invariant when all-ones — why
-        # inference parity never caught it) and leaked padding keys for
-        # padded batches (training; ~4% velocity error on short samples).
+        # SDPA in the stream dtype (CUDA F.scaled_dot_product_attention
+        # under is_half=True parity; no-op for fp32 inputs). MASK SEMANTICS:
+        # mx.fast masks are ADDITIVE for float but keep-masks for BOOL —
+        # never pass a raw 0/1 float mask (see PARITY_NOTES "s2 training
+        # addendum" finding 1).
         out = mx.fast.scaled_dot_product_attention(
             q_h, k_h, v, scale=1.0 / math.sqrt(self.dim_head),
             mask=(mask[:, None, None, :].astype(mx.bool_)
@@ -434,12 +425,9 @@ class DiT(nn.Module):
         return self._timestep_cache[key]
 
     def _rope(self, seq_len: int, dtype) -> mx.array:
-        # cached per seq_len; RAW angles (T, dim_head/2) — apply_rope derives
-        # interleaved cos/sin. (torch RotaryEmbedding: inv_freq = theta**-arange(0,d,2)/d,
-        # freqs = t[:, None] * inv_freq[None, :], then stack((f,f),-1).reshape.)
-        # The cache ALWAYS stays fp32: fp16 angles at long T quantize coarsely
-        # (ulp ~0.5 rad near 934) and corrupt cos/sin. `dtype` is accepted for
-        # call-site compatibility; cos/sin are cast in apply_rope instead.
+        # Raw angles (T, dim_head/2) cached per seq_len, fp32 ALWAYS: fp16
+        # angles at long T quantize coarsely and corrupt cos/sin. `dtype`
+        # is call-site compatibility only; cast happens in apply_rope.
         cache = getattr(self, "_rope_cache", None)
         if cache is None or cache.shape[0] < seq_len:
             half = self.dim_head // 2
@@ -489,13 +477,9 @@ class DiT(nn.Module):
             mask = sequence_mask_2d(x_lens, x.shape[1]).astype(x.dtype)
 
         batch, seq_len = x.shape[0], x.shape[1]
-        # torch: t = time_embed(time); dt = d_embed(dt_base) (first call) or dt_cache;
-        #        t += dt; returns dt (the d_embed OUTPUT, not time+d) as the cache value.
-        # CUDA reference: freqs built fp32 (build-time), timestep follows model
-        # dtype in v5 (`torch.full(..., dtype=state_dtype)`). Keep the fp32
-        # frequency table (identical construction), cast the product to the
-        # first weight's dtype when available (tests monkeypatch time_embed as
-        # a plain function; fall back to fp32 = old behavior there).
+        # torch returns the d_embed OUTPUT (not time+d) as the cached dt;
+        # freqs are built fp32, the product follows the model dtype in v5
+        # (tests monkeypatch time_embed; fp32 fallback = old behavior).
         t0w = getattr(self.time_embed, "time_mlp_0_w", None) if not callable(self.time_embed) else None
         td = t0w.dtype if t0w is not None else mx.float32
         t = self.time_embed(time.astype(td)) if timestep_cache is None else timestep_cache["time"]
@@ -518,12 +502,9 @@ class DiT(nn.Module):
             text_embed = text_cache if (infer and text_cache is not None) else self.text_embed(
                 text, seq_len, drop_text=drop_text)
             x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond)
-        # GSOVITS_DIT_FP16_BLOCKS=1 (perf experiments only): run the residual
-        # stream in fp16 as well. Default design: stream/conditioning stay
-        # fp32; each block quantizes only its GEMM/SDPA inputs to the weight
-        # dtype (DiTBlock / AdaLayerNormZero). Gated trajectory diffs (task-1):
-        # full-fp16 stream fails the 2e-2 gate (v5turbo 1.3e-1); block-internal
-        # fp16 with fp32 stream passes.
+        # GSOVITS_DIT_FP16_BLOCKS=1 (perf experiments only): fp16 residual
+        # stream too. Default: fp32 stream + block-internal fp16 (full-fp16
+        # stream FAILS the 2e-2 trajectory gate; block-internal passes).
         import os as _os
         if _os.environ.get("GSOVITS_DIT_FP16_BLOCKS", "0") == "1":
             x = x.astype(self.transformer_blocks[0].attn.to_q_w.dtype)

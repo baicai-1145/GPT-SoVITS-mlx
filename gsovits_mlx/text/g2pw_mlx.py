@@ -78,13 +78,10 @@ def _load_model(model_dir: str) -> dict:
     import mlx.core as mx
 
     arrays = mx.load(_resolve_weights(model_dir))
-    # fp16 G2PW is the DEFAULT (2026-10-08, user decision after parity
-    # evidence: 45/45 multilingual sentences phones-exact vs the fp32 path,
-    # .tmp/multi_fe). Halves weight residency (635->317MB) and Metal traffic.
-    # The argmax near-tie risk is real in principle; set GSOVITS_G2PW_FP16=0
-    # to fall back to the fp32 path if a future corpus flips a polyphone.
-    # (Note: the CUDA project's g2pW.onnx is fp32; this is a deliberate,
-    # verified deviation.)
+    # fp16 G2PW is the DEFAULT (verified: 45/45 multilingual sentences
+    # phones-exact vs fp32; halves residency 635->317MB). Deliberate
+    # deviation from the CUDA project's fp32 onnx — GSOVITS_G2PW_FP16=0
+    # falls back if a future corpus flips an argmax near-tie.
     if os.environ.get("GSOVITS_G2PW_FP16", "1") == "1":
         arrays = {k: (v.astype(mx.float16) if v.dtype == mx.float32 else v)
                   for k, v in arrays.items()}

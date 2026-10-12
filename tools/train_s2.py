@@ -308,12 +308,9 @@ def _run(args, device, mx):
 
     # ---- models ----
     # Seed the GLOBAL mx RNG before model construction (official
-    # torch.manual_seed(hps.train.seed)): the fresh-D init draws from the
-    # global stream; without this the SAME config is not reproducible
-    # run-to-run (measured: 3 runs, 3 different step-0 loss_mel values —
-    # loss_mel is D-independent, so the divergence was upstream: D-init
-    # consumed different global-stream offsets, shifting the split-derived
-    # step keys). Step RNG is unaffected (key = mx.random.key(seed)).
+    # torch.manual_seed parity): fresh-D init draws from the global stream;
+    # without this the same config is not reproducible run-to-run. Step RNG
+    # is unaffected (keyed streams are pure; docs/TRAINING.md §1).
     mx.random.seed(args.seed)
     net_g = G.SynthesizerTrnTrain(version=args.version, segment_size=seg_frames,
                                   **hps)
@@ -482,15 +479,11 @@ def _run(args, device, mx):
         return (loss_gen + loss_fm + loss_mel + kl_ssl * 1.0 + loss_kl,
                 (loss_gen, loss_fm, loss_mel, kl_ssl, loss_kl))
 
-    # -- mx.compile experiment, fwd arm (ITEM 2) ---------------------------
-    # ONE compiled wrapper over the driver's g_forward helper (below —
-    # defined before this point and referenced lazily via closure), plus
-    # one over the D call. Weights are ARGUMENTS (never captured): a
-    # captured mx array becomes a compile-time constant and the
-    # optimizer's updates would be silently ignored (stale-weight hazard).
-    # Under fwd, g_forward's mel/wav segment slices use the gather variant
-    # (the loop slice's int(ids_str[i]) is a compile graph break that
-    # bakes stale offsets). None = eager (official semantics).
+    # -- mx.compile experiment, fwd arm -----------------------------------
+    # Compiled wrappers over g_forward + the D call; weights are ARGUMENTS
+    # (a captured array becomes a compile constant; optimizer updates
+    # would be silently ignored). fwd arm needs the gather segment slice
+    # (the loop slice is a graph break). None = eager (official).
     d_call_c = None
     if args.compile_mode == "fwd":
         def _d_call_c(d16_, y32_, yhat32_):
@@ -558,12 +551,11 @@ def _run(args, device, mx):
         return loss_d + loss_g_total, (loss_d, loss_gen, loss_fm, loss_mel,
                                        kl_ssl, loss_kl)
 
-    # ---- loop -----------------------------------------------------------------
-    # step arm: wrap the joint value_and_grad helper in mx.compile. Outputs
-    # stay lazy; the loop below still evals phase-1 (D branch + dgrads)
-    # then phase-2 (G parts + ggrads) exactly like eager — compile cannot
-    # fuse both backwards into one peak (the 8GB-gate lesson from the
-    # first fused attempt).
+    # ---- loop -------------------------------------------------------------
+    # step arm: mx.compile over the joint value_and_grad helper; outputs
+    # stay lazy and the loop still evals the two phases separately —
+    # compile must NOT fuse both backwards into one peak (8GB-gate law,
+    # docs/TRAINING.md §5).
     if args.compile_mode == "step":
         def _joint_step(d16_, p16_, ssl_, ssl_len_, spec_, spec_len_, wav_,
                         wav_len_, text_, text_len_, sv_, key_):
@@ -654,14 +646,10 @@ def _run(args, device, mx):
 
             ts = time.perf_counter()
             if args.g_forward == "single":
-                # ---- fused single-trace step, evaluated in TWO phases ----
-                # One trace = one G forward; the D-branch and G-branch
-                # outputs are separate lazy subgraphs. Evaluating them in
-                # ONE mx.eval would materialize both backwards
-                # simultaneously (measured 8.81GB phys at b3 fp32, over the
-                # 8GB gate). Phase-split: eval D branch -> step D -> free ->
-                # eval G branch (reuses the SAME G-forward primals — the
-                # compute win stays, the peak matches double mode).
+                # ---- fused single-trace step, TWO-phase eval ----
+                # One mx.eval would materialize BOTH backwards at once
+                # (8.81GB measured — over the 8GB gate). Phase-split: eval
+                # D branch -> step D -> free -> eval G branch (TRAINING.md §5).
                 if joint_step_c is not None:
                     parts, dgrads, ggrads = joint_step_c(
                         d16, p16, *arrays, sv, kd)

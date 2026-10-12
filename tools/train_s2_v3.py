@@ -182,13 +182,11 @@ def main(argv=None) -> None:
     np.random.seed(args.seed)
     rng = random.Random(args.seed + 1)   # CFM python rng (2-step branch)
 
-    # -- data -----------------------------------------------------------------------
-    # The vendored official text package needs the CPUFast repo as cwd for
-    # its relative scratch paths (g2pw/japanese); bootstrap chdirs there.
-    # Dataset construction happens here (frontend use only); the worktree
-    # cwd is restored right after (AGENTS.md bootstrap-chdir rule: long-lived
-    # services must not keep the CPUFast cwd or gpu.lock root resolution
-    # breaks).
+    # -- data -------------------------------------------------------------
+    # The vendored text package needs CPUFast as cwd (g2pw/japanese scratch
+    # paths); bootstrap chdirs there, the worktree cwd is restored right
+    # after (AGENTS.md bootstrap-chdir rule — a kept CPUFast cwd breaks
+    # gpu.lock root resolution).
     from gsovits_mlx.text.preproc import bootstrap
     bootstrap(os.environ.get("GSOVITS_CPUFAST",
                              "/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-CPUFast"),
@@ -200,13 +198,10 @@ def main(argv=None) -> None:
     # -- model ------------------------------------------------------------------
     sovits_dir = os.path.join(args.models_root, args.sovits_dir or args.version)
     model, meta = load_sovits_v3(sovits_dir, args.version)
-    # fp32 trunk/LoRA masters + fp16 DiT (official autocast fp16_run=true)
-    # ckpt mode NEEDS fp32 DiT weights (fp16 backward overflows — measured);
-    # fp16 is only valid for the fused-forward path which is banned at max
-    # length anyway. Keep --dit-fp32 as an explicit override for fused mode.
-    # --dit-dtype bf16 (gated experiment): bf16 has fp32's exponent range so
-    # the BACKWARD cannot overflow; LoRA masters stay fp32 (optimizer), the
-    # per-block GEMMs run bf16 with the fp32 residual stream.
+    # fp32 trunk/LoRA masters + fp16 DiT only in the fused (banned) mode:
+    # fp16 BACKWARD overflows — banned for ckpt mode (PARITY_NOTES "s2
+    # training addendum" finding 3). --dit-dtype bf16 keeps fp32's exponent
+    # range so backward cannot overflow; LoRA masters stay fp32.
     dit_dtype = {"fp32": mx.float32, "fp16": mx.float16,
                  "bf16": mx.bfloat16}.get(args.dit_dtype)
     upcast_training_model(

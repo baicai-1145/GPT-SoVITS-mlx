@@ -267,13 +267,10 @@ class S1TrainModel:
         acc = top3_accuracy(mx.transpose(logits32, (0, 2, 1)), targets,
                             self.EOS)
 
-        # -- backward: blocks, one GROUP at a time (item-A blitz) ----------
-        # G = ckpt_groups: each grad call recomputes the G layers of one
-        # group from its BOUNDARY input; retained inputs = group boundaries
-        # only (hs has L/G+1 entries when G>1). Same math as per-layer (each
-        # layer recomputed exactly once; the per-layer reduction (out*g).sum()
-        # composes identically through a group), so grads are IDENTICAL up
-        # to fp reduction order (fp16 forward + fp32 reduction, as before).
+        # -- backward: blocks, one GROUP at a time -------------------------
+        # G = ckpt_groups: recompute the G layers of one group from its
+        # BOUNDARY input; grads identical up to fp reduction order. No
+        # speed win measured; memory-shape lever only (TRAINING.md §7).
         g = g_h
         layer_params = {i: [p16[f"block.{i}." + k] for k in self._BLOCK_KEYS]
                         for i in range(self.num_layers)}

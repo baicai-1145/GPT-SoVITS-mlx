@@ -345,12 +345,9 @@ class Text2SemanticDecoder:
             else:
                 sample = sample_result
             y = mx.concatenate([y, sample], axis=1)
-            # Realize per-step state (whole-process footprint fix, 2026-10-08):
-            # without this the concat-cache path keeps every step's k/v concat
-            # and y-concat graphs lazy until the final decode eval — the graph
-            # piles up O(T^2) and materializes as a 3-8GB end-of-run spike
-            # (measured: v2 6.6GB, v5turbo 10.0GB whole-process phys_footprint).
-            # Bit-identical outputs (eval is placement-only).
+            # Realize per-step state (placement-only eval; outputs bit-identical):
+            # without it the concat-cache graphs pile up O(T^2) lazy and
+            # materialize as a multi-GB end-of-run spike.
             state = [y, sample, logits, out]
             if not fast_cache:
                 state.extend(c.buffer if isinstance(c, KVBuffer) else c for c in k_cache)

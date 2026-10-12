@@ -148,12 +148,10 @@ class TextFrontend:
         else:
             _BERT_RESOURCES.clear()
         arrays = load_mlx_safetensors(os.path.join(bert_dir, "bert.safetensors"))
-        # GPU frontend (2026-10-08, user decision): BERT runs in its native
-        # fp16 export on the selected device — matching the CUDA project's
-        # bert_model.half() under is_half=True. The historical fp32 upcast
-        # existed because (1-am)*-1e9 overflows fp16 (0*inf=NaN); the mask is
-        # now clamped to -65504 (fp16 min) inside BertModel, which softmax
-        # treats identically. Set GSOVITS_FRONTEND_F32=1 for the old path.
+        # GPU frontend: BERT runs in its native fp16 export (CUDA-project
+        # bert_model.half() parity). The historical fp32 upcast existed
+        # because (1-am)*-1e9 overflows fp16; the mask is clamped to -65504
+        # inside BertModel instead. GSOVITS_FRONTEND_F32=1 = old path.
         if os.environ.get("GSOVITS_FRONTEND_F32", "0") != "1":
             arrays = {k: v for k, v in arrays.items() if "position_ids" not in k}
         else:

@@ -364,14 +364,10 @@ def run_semantic(args, timing: dict) -> None:
     sov, _meta = _load_sovits_v1v2(sov_dir, args.version)
     timing["stage3_model_load"] = time.perf_counter() - t0
 
-    # fp32 semantic quantization (PARITY choice): the converted weights are
-    # fp16 (production inference default) but the quantizer's expand-form L2
-    # (||x||^2+||e||^2-2xe) in fp16 suffers catastrophic cancellation
-    # (~10 distance error at |d|~700, flipping argmin on sub-0.5 margins,
-    # measured 24/2915 frames vs torch fp32). Upcast ssl_proj + codebook to
-    # fp32 and compute the diff-form distance — matches torch fp32 codes
-    # exactly; official CUDA is_half runs carry the same fp16 cancellation
-    # noise with a different rounding pattern (not bit-replicable on MLX).
+    # PARITY choice: quantization runs fp32 even on fp16 exports — fp16
+    # expand-form L2 catastrophically cancels and flips argmin; fp32
+    # diff-form matches torch codes exactly (PARITY_NOTES "s2 training
+    # addendum" finding 2).
     import mlx.core as mx
     w32 = sov.ssl_proj.weight.astype(mx.float32)
     b32 = sov.ssl_proj.bias.astype(mx.float32)

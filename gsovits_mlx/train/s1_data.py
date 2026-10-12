@@ -203,12 +203,9 @@ class Text2SemanticDataset:
 
         phoneme_data = _read_phoneme_file(phoneme_path)
 
-        # cleaned_text_to_sequence via the vendored official text package.
-        # The official dataset reads os.environ["version"] at module import
-        # into a default; we pass the version explicitly per call, but also
-        # set the env var for parity with any vendored module that reads it.
+        # Env parity for vendored modules that read os.environ["version"].
         # bootstrap (chdir + bert_path) MUST precede load_cpufront — the
-        # G2PW converter resolves model_dir/tokenizer relative to cwd.
+        # G2PW converter resolves model_dir relative to cwd (AGENTS.md chdir rule).
         os.environ["version"] = version
         from gsovits_mlx.text import vendored_cpufront as vcf
 
@@ -392,11 +389,8 @@ class BucketBatchSampler:
                    for b in range(n_batch)]
         rng.shuffle(batches)
         # official drop_last=False: pad the index stream to total via
-        # repetition. With num_replicas=1 total == len(dataset) may exceed
-        # the shuffled stream only when batch_size * n_batch > len — the
-        # last batch is short, repeated indices top it up. Per-batch lists
-        # here never exceed batch_size (we keep the pad INSIDE the last
-        # batch like the official index stream).
+        # repetition (pad stays INSIDE the last batch, like the official
+        # index stream; per-batch lists never exceed batch_size).
         pad = len(self.dataset) - sum(len(b) for b in batches)
         if pad > 0:
             flat = [i for b in batches for i in b]

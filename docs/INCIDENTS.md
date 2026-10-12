@@ -29,6 +29,8 @@ The companion documents: `docs/PARITY_NOTES.md` (official-vs-MLX semantics),
 
 ## 2026-10-09 (afternoon) — s2-CFM GPU smokes OOM the machine repeatedly (freezes #2-#4)
 
+<a id="s2-cfm-oom-series"></a>
+
 - **Symptom**: multiple machine freezes/kills during early s2-CFM (task-5)
   GPU attempts; trainer jetsam-killed at step ~3 "due to low-swap" in one
   instance (18:39); first 200-step smoke attempt died at step 4/200.
@@ -63,6 +65,8 @@ The companion documents: `docs/PARITY_NOTES.md` (official-vs-MLX semantics),
 
 ## 2026-10-09/10 — fp16 GradScaler collapse (s2 GAN v2 smoke)
 
+<a id="fp16-scaler-collapse"></a>
+
 - **Symptom**: KL loss exp(-2·logs_p) overflows fp16 range → inf → the
   shared GradScaler's scale collapses (1e-56) → training dead.
 - **Root cause**: official `fp16_run=True` autocast keeps fp32 loss heads
@@ -93,6 +97,8 @@ The companion documents: `docs/PARITY_NOTES.md` (official-vs-MLX semantics),
 
 ## 2026-10-10 19:26-19:55 — LPM-on-battery timing contamination
 
+<a id="lpm-battery-timing-corruption"></a>
+
 - **Symptom**: every absolute t_step/wall number from an A/B session was
   power-contaminated (fp32-single 4.94 s/step "measured"); bf16 looked
   +14.8% slower; b4 throughput looked +19%.
@@ -109,6 +115,8 @@ The companion documents: `docs/PARITY_NOTES.md` (official-vs-MLX semantics),
   5.2→6.7s across 13 min) — interleave.
 
 ## 2026-10-11 ~07:23-07:27 — CFM eager single-graph backward: 18.79GB eval transient machine freeze (freeze #5)
+
+<a id="cfm-eager-1879gb-transient-freeze"></a>
 
 - **Symptom**: gate-4 A/B arm p1_eager froze the machine at step 9
   (SIGKILL exit 137, load avg ~50, user-observed full-memory freeze);
@@ -136,6 +144,8 @@ The companion documents: `docs/PARITY_NOTES.md` (official-vs-MLX semantics),
 
 ## Lock leaks (recurring, 2026-10-10/11)
 
+<a id="lock-leaks"></a>
+
 - **Symptom**: crashed/killed trainers leave `.tmp/gpu.lock.d` held;
   subsequent runs refuse ("lock held") until stale-lock takeover (>15 min
   mtime, owner dead). Hit by batch-probe (CFM probe #1 crashed pre-loop on
@@ -150,7 +160,8 @@ The companion documents: `docs/PARITY_NOTES.md` (official-vs-MLX semantics),
 
 ## Measurement-corruption near-misses (standing rules, no damage)
 
-- **PYTHONHASHSEED nondeterminism** (proven, 2026-10-10): s2 loaders build
+- **PYTHONHASHSEED nondeterminism** (proven, 2026-10-10):
+  <a id="pythonhashseed-nondeterminism"></a> s2 loaders build
   the file list via `list(set(...) & ...)` — set iteration order is
   hash-randomized per process → different batch composition at the same
   step across runs (3 construction probes → 2 distinct batch0 md5;

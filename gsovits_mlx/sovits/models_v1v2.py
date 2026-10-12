@@ -332,13 +332,9 @@ class SynthesizerTrn(nn.Module):
         z_p = m_p + mx.random.normal(m_p.shape, key=key) * mx.exp(logs_p) * noise_scale
         z = self.flow(z_p, y_mask, g=ge, reverse=True)
         zin = z * y_mask
-        # GSOVITS_HIFIGAN_FAST=1 (task-8): cast the decoder input to the
-        # weight dtype (fp16 exports) and use a compiled decoder closure.
-        # The flow emits fp32; without the cast every conv re-promotes to
-        # fp32 (measured: v2 decode 645ms compiled-fp16-in vs 681ms
-        # fp32-in; fp16 w with fp32 in = 0.999x). Compiled warm is a
-        # further ~5% over eager fp16; gates: corr 0.9995+ vs seed-0.
-        # default ON (gates: corr 0.99999-1.0 across the cell); opt out with =0
+        # GSOVITS_HIFIGAN_FAST=1 (default ON): cast decoder input to the
+        # weight dtype + compiled decoder closure; every conv re-promotes
+        # to fp32 otherwise. Gates: corr 0.9995+ vs seed-0 anchors; opt out =0.
         fp16_input = os.environ.get("GSOVITS_HIFIGAN_FAST", "1") != "0"
         trim = os.environ.get("GSOVITS_HIFIGAN_STAGE_TRIM") == "1"
         gin = ge

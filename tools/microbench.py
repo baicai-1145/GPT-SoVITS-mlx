@@ -445,10 +445,9 @@ def bench_sovits(component: str, models_root: str, iters: int, out_dir: str) -> 
 
 
 # ---------------------------------------------------------------------------
-# gemm bench helpers (task-11). CPU-testable: pure functions, no side effects
-# beyond the arrays they build. Every timed output is retained AND evaluated;
-# inputs are DISTINCT materialized arrays so identical-work elimination
-# cannot drop them from the graph or the run.
+# gemm bench helpers: pure functions; every timed output retained AND
+# evaluated; inputs are DISTINCT materialized arrays so identical-work
+# elimination cannot drop them (measurement doctrine: docs/BENCH.md).
 # ---------------------------------------------------------------------------
 
 def gemm_parse_shape(shape: str) -> tuple:
@@ -528,13 +527,10 @@ def bench_gemm(mx, M: int, K: int, N: int, q: int, rounds: int = 8) -> dict:
     out["indep_batch_flops"] = gemm_flops([(M, K, N)] * q)
     out["indep_batch_tf"] = round(out["indep_batch_flops"] / best / 1e12, 2)
 
-    # (c) dependent-chain latency: x @ W1 @ W2 ... compatible matrices, q
-    # links, every intermediate retained and evaluated once at the end.
-    # FLOPs from the ACTUAL per-link shapes: first link (M,K,N), then
-    # (M,N,N) for each following link. Chain weights are scaled by
-    # 1/sqrt(fan_in) and materialized OUTSIDE the timed region: unscaled
-    # N(0,1) weights overflow fp16 by link ~5 (lead repro), so every output
-    # is finite-checked OUTSIDE the timing loop.
+    # (c) dependent-chain latency: chained GEMMs, every intermediate
+    # retained and evaluated once at the end. Weights scaled 1/sqrt(fan_in)
+    # and materialized OUTSIDE the timed region (unscaled N(0,1) overflows
+    # fp16 by link ~5); outputs finite-checked outside the timing loop.
     w_first = (mx.random.normal((K, N), key=mx.random.key(31)) * (K ** -0.5)
                ).astype(mx.float16)
     chain_rest = [(mx.random.normal((N, N), key=mx.random.key(32 + i))

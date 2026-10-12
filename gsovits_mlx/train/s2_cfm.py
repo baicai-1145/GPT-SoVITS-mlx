@@ -179,17 +179,10 @@ def dit_lora_forward(dit, adapters: dict[str, LoRALinear], xt, prompt, x_lens,
                 block.attn._qkv_w_cache = None
 
 
-# ---------------------------------------------------------------------------
-# Two-pass checkpointed LoRA DiT forward+backward (s1 train_loss_and_grads
-# pattern). WHY: the fused-graph LoRA forward above holds ALL 22 blocks'
-# activation graphs (jetsam'd the machine at T=952), and the fp16 alternative
-# NaNs in BACKWARD (grad magnitudes grow block-on-block and overflow fp16
-# past block ~8; forward stays finite — see .tmp probes 2026-10-09). The
-# two-pass form keeps ONLY the block inputs (B×T×1024 fp32) and recomputes
-# one block at a time during backward — one block's graph alive at any
-# moment. fp32 weights everywhere: no overflow, and fwd/bwd numerics equal
-# the parity-verified fp32 path (grad check vs the fused path is the test).
-# ---------------------------------------------------------------------------
+# Two-pass checkpointed LoRA DiT forward+backward (s1 pattern): retain
+# ONLY block inputs; one block graph alive at a time (the fused graph OOMs
+# the machine; fp16 backward overflows) — PARITY_NOTES "s2 training
+# addendum" finding 3; INCIDENTS.md#s2-cfm-oom-series.
 
 def dit_ckpt_heads(dit, xt, prompt, x_lens, t, d, mu):
     """Eager head: everything before block 0 and after the last block.
@@ -254,15 +247,11 @@ def dit_ckpt_block_fwd(dit, adapters, i, h, mask, rope, emb):
             attn._qkv_w_cache = None
 
 
-# eager (non-checkpointed) backward: keep ALL block activations in one
-# lazy graph; single mx.grad over the whole loss (trunk + lora in one call).
-# Memory guard rails (measured/pattern-derived; the per-step footprint gate
-# is the hard law, these are pre-run estimates):
-#   per-frame residual-stream activation h (B=3, T frames, fp32): 12KB/frame
-#   retained by ONE big grad graph over 22 blocks at T=320: ~86MB stream +
-#   per-block SDPA/FFN intermediates; projected ~8GB total footprint under
-#   the 10GB authorized gate but in-graph SDPA may materialize more -> the
-#   3-step probe (gate 3) is mandatory before any long run.
+# eager (non-checkpointed) backward: single lazy graph + one mx.grad.
+# DEAD END on 16GB — the 18.79GB eval-instant cotangent transient is
+# invisible to per-step samplers (INCIDENTS.md#cfm-eager-1879gb-transient-freeze;
+# TRAINING.md §8). Pre-run estimates are NOT a gate; device peak counters
+# or <=0.2s OS RSS sampling are.
 EAGER_MIN_MEL_T = 128  # don't eager tiny batches (<~0.5GB anyway) — keep
 # this a single code path for numeric comparability across the A/B.
 
@@ -300,14 +289,11 @@ def _attn_adapter_name(dit, block, attn, suffix: str) -> str:
     return f"{prefix}.{suffix}"
 
 
-# ---------------------------------------------------------------------------
 # CFM training loss (models.py CFM.forward)
-# ---------------------------------------------------------------------------
 
-# Parity regime switch: tests (and any bit-parity comparison against the
-# UNTRACED two-pass forward) set this to disable mx.compile for BOTH paths
-# — nn.gelu/gelu_approx are @mx.compile-wrapped and round differently
-# inside a value_and_grad trace (measured; see train_loss_and_grads_eager).
+# Parity regime switch: bit-parity vs the UNTRACED two-pass forward
+# disables mx.compile for BOTH paths — nn.gelu is @mx.compile-wrapped
+# and rounds differently inside a trace (PARITY_NOTES "s2 training addendum").
 _PARITY_COMPILE_DISABLED = [False]
 
 
@@ -836,19 +822,10 @@ class S2V3TrainModel:
         return loss_f, info, grads
 
     # -- eager (non-checkpointed) backward ---------------------------------
-    #
-    # The s1-eager play applied to CFM: ONE DiT forward with all 22 blocks
-    # in a single lazy graph (ALL activations retained) + ONE mx.grad over
-    # the whole loss (trunk params + LoRA A/B as one flat pytree). The
-    # two-pass recompute (22 extra block forwards) and the 23 separate
-    # python-dispatched grad graphs disappear; MLX streams the backward as
-    # one deep graph. Gate evidence (tests + RUN_PLAN): same-draw loss is
-    # BIT-EXACT vs two-pass (identical op sequence); grads agree to
-    # fp-accumulation-reorder tolerance (single full-graph reduction vs
-    # per-block chains). Memory: activations for all 22 blocks live at once
-    # (~+1.5GB over ckpt at b3/T~320; the per-step footprint gate is the
-    # hard law). v3-family long_skip is absent (v3/v4/v5 checkpoints carry
-    # no dit.long_skip) — guarded anyway for safety.
+    # ONE DiT forward (all 22 blocks lazy) + ONE mx.grad; bit-exact vs
+    # two-pass under the parity regime (gates: tests/test_train_s2v3_eager.py).
+    # DEAD END on 16GB — eval transient froze the machine:
+    # INCIDENTS.md#cfm-eager-1879gb-transient-freeze; TRAINING.md §8.
 
     def _eager_estimator(self, xt, prompt, x_lens, t, d, mu) -> mx.array:
         """Single-graph DiT training forward (all 22 blocks lazy). The
