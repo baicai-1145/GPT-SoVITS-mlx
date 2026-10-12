@@ -236,5 +236,8 @@ AGENTS.md
 # macOS junk
 .DS_Store
 
-# local dev docs (not for remote)
-docs/
+# local dev docs (not for remote); tracked exceptions below
+docs/*
+!docs/PARITY_NOTES.md
+!docs/TRAINING.md
+!docs/INCIDENTS.md
