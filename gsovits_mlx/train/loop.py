@@ -1,36 +1,23 @@
-"""Training-loop skeleton: mixed-precision (fp16 compute / fp32 master) Trainer
-with JSONL loss logging and a whole-process footprint sampler.
+"""Training-loop skeleton: mixed-precision (fp16 compute / fp32 master)
+Trainer with JSONL loss logging and a whole-process footprint sampler.
 
-fp16 policy (chosen: fp32 MASTER WEIGHTS + per-forward cast):
-    The Trainer owns the authoritative parameters in fp32 (``master`` dicts,
-    one per optimizer param group). For each forward pass it materializes a
-    fp16 working copy (``cast_master_to_fp16``), runs the model's forward on
-    those, and after every optimizer application copies the updated fp32
-    values back — the fp16 copy is rebuilt from master each step, so there is
-    exactly ONE source of truth and resume-from-checkpoint parity is trivial
-    (checkpoints store the fp32 masters + optimizer states + step/epoch).
+fp16 policy: fp32 MASTER WEIGHTS + per-forward cast. The Trainer owns
+authoritative fp32 masters (per param group); each forward materializes
+an fp16 working copy (cast_master_to_fp16) and post-step copies updated
+fp32 values back — one source of truth, trivial checkpoint parity
+(fp32 masters + optimizer states + step/epoch). Rationale: training
+directly on fp16 params accumulates rounding in the param values and
+loses sub-resolution updates (~6e-8·|p|) — official 16-mixed never does
+that (torch keeps fp32 params, casts per autocast forward); this layout
+matches that semantic on MLX.
 
-    Rationale vs the alternative (train directly on fp16 params, copy into
-    fp32 after step): training on fp16 params accumulates rounding in the
-    parameter values themselves and loses small updates (lr*m/denom can be
-    below fp16 resolution ~6e-8·|p|), which official 16-mixed training never
-    does — torch keeps fp32 params and casts per forward under autocast.
-    This layout matches that semantic on MLX.
-
-Memory accounting (per run, JSON ``memory_report()``):
-    weights            -- analytic bytes of fp32 master params
-    optimizer_states   -- analytic bytes from param shapes (AdamW: 2x param
-                          bytes fp32; ScaledAdam: delta+exp_avg_sq+param_rms+
-                          scale_exp_avg_sq+scale_grads)
-    activations_peak   -- measured delta of mx.metal.get_active_memory across
-                          forward/backward (0 when running on CPU)
-    gpu_wired_peak     -- peak /usr/bin/footprint phys_footprint of OUR pid
-                          sampled every 0.3 s by a background thread (the
-                          closest public proxy for GPU-wired+resident; MLX
-                          wired buffers show up in phys_footprint)
-    total_peak_footprint -- the same sampler's whole-process peak
-
-The sampler thread is daemon; stop it with ``stop_footprint_sampler()``.
+memory_report() JSON keys: weights / optimizer_states (analytic bytes;
+AdamW 2x param bytes, ScaledAdam delta+exp_avg_sq+param_rms+
+scale_exp_avg_sq+scale_grads), activations_peak (mx.metal active-memory
+delta; 0 on CPU), gpu_wired_peak (peak /usr/bin/footprint phys_footprint
+of our pid sampled 0.3 s — the closest public proxy for GPU-wired; MLX
+wired buffers appear in phys_footprint), total_peak_footprint (same
+sampler's whole-process peak).
 """
 
 from __future__ import annotations

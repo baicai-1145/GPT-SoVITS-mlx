@@ -1,40 +1,14 @@
-"""Official GPT-SoVITS-CPUFast text front-end (phones + BERT features).
+"""Text preprocessing pipeline (official TextPreprocessor port) on the
+vendored official modules + MLX BERT/G2PW.
 
-Faithful re-implementation of
-GPT_SoVITS/TTS_infer_pack/TextPreprocessor.py::get_phones_and_bert_with_phone_units
-and its helpers (pre_seg_text, replace_consecutive_punctuation,
-merge_short_text_in_array, cut0..cut5 splitting, short-text recursion,
-all_zh/all_ja/all_ko/all_yue/all_zh_mix/all_ja_mix/en/auto/auto_yue modes,
-non-zh all-zero bert) on top of the vendored official modules
-(gsovits_mlx.text.vendored_cpufront) and the MLX BERT
-(gsovits_mlx.text.bert) / MLX G2PW (gsovits_mlx.text.g2pw_mlx).
-
-Official behaviours replicated here, in one place:
-* text = re.sub(r' {2,}', ' ', text) at the entry of
-  get_phones_and_bert_with_phone_units (NOT in pre_seg_text).
-* pre_seg_text: strip('\n') -> '。'/'.' prefix when the text does not start
-  with a split separator and its first segment is shorter than 4 chars ->
-  seg_method(text) (default cut0 = no-op) -> collapse '\n\n' -> split,
-  filter, merge_short_text_in_array(threshold=5), pad trailing separator,
-  split_big_text(>510 chars).
-* per-segment: clean_text_with_phone_units -> cleaned_text_to_sequence ->
-  bert: zh = MLX BERT on the normalized text (word2ph repeat, hidden layer
-  -3), everything else = all-zero (1024, len(phones)) (official get_bert_inf).
-* after all segments: if not final and len(phones) < 6 -> redo the WHOLE
-  text as "." + text with final=True (short-text recursion).
-* replace_consecutive_punctuation("!?…,.-" collapsed to the first) runs on
-  the raw input inside preprocess() before pre_seg_text.
-* batch zh preprocessing (official _preprocess_batch_zh) only batches the
-  BERT forwards; phones/norm come from the identical per-segment clean.
-  We keep the same batching condition (lang in {zh, all_zh} and no
-  [A-Za-z] in any segment) and the same output order.
-
-Differences from the official runner that are deliberate:
-* phone_units are not exposed (AR/SoVITS consume phones + bert only);
-* bert features are float32 numpy (1024, T), ready for mx.array;
-* add_reference_audio/ref text are handled by the caller (tools/e2e_v*.py):
-  the prompt text must NOT go through pre_seg_text '。'-prefixing
-  (official TTS.py runs prompt text through a separate, simpler path).
+Faithful re-implementation of get_phones_and_bert_with_phone_units and
+helpers (pre_seg_text, cut0..cut5, short-text recursion, all 10 language
+modes, non-zh all-zero bert). The replicated behaviour list (entry
+whitespace-collapapse, pre_seg_text details, per-segment
+clean+sequence+BERT, <6-phone recursion, punctuation collapsing, batch-zh
+condition) and the deliberate differences (no phone_units exposure, fp32
+numpy bert, prompt text handled by callers WITHOUT '。'-prefixing) live
+in docs/PARITY_NOTES.md §text preprocessing.
 """
 
 from __future__ import annotations

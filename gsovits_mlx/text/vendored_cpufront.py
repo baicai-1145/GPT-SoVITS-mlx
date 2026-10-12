@@ -1,48 +1,20 @@
-"""Loader that vendors the official CPUFast text front-end into sys.modules.
+"""Official CPUFast text front-end, executed IN PLACE from that checkout.
 
-The GPT-SoVITS-CPUFast checkout (GPT_SOVITS_CPUFAST env or explicit path) is
-the single source of truth for text-front-end semantics. Its modules are
-executed IN PLACE from that checkout (read-only use, data files included) so
-any official change is picked up verbatim; this package adds no copies of
-the official code.
+The GPT-SoVITS-CPUFast checkout (GPT_SOVITS_CPUFAST env or explicit path)
+is the single source of truth for text-front-end semantics — its modules
+run read-only from that checkout so official changes are picked up
+verbatim; this package adds no code copies.
 
-The loader exists because three official packages cannot be imported the
-normal way from a torch-free runtime:
-
-* ``text.LangSegmenter`` imports fast_langdetect UNGUARDED at module top
-  (the LID model is never actually used on the getTexts() path) -> we
-  substitute gsovits_mlx.text.lang_segmenter for it.
-* ``text.g2pw.__init__`` pulls ``g2pw.py`` -> ``torch_api.py`` (torch) -> we
-  register a stub package and inject gsovits_mlx.text.g2pw_mlx under the
-  name ``text.g2pw.torch_api`` (chinese2.py only imports
-  ``G2PWTorchConverter`` from there).
-* ``TTS_infer_pack/__init__`` imports TTS.py (torch) -> stub package, the
-  stdlib-only text_segmentation_method.py is executed directly.
-
-Everything else (text, text.symbols/symbols2, text.phone_units,
-text.tone_sandhi, text.zh_normalization.*, text.opencc_s2tw,
-text.jieba_posseg_fast, text.chinese, text.chinese2, text.japanese,
-text.english, text.korean, text.cantonese, text.cleaner,
-text_segmentation_method) is the official code executed as-is.
-
-Data-file contract (resolved via each module's __file__ inside the CPUFast
-checkout; read-only):
-    GPT_SoVITS/text/opencpop-strict.txt           zh pinyin->phone table
-    GPT_SoVITS/text/cmudict*.rep / *_cache.pickle english G2P dicts
-    GPT_SoVITS/text/namedict_cache.pickle         english names
-    GPT_SoVITS/text/jieba_posseg_assets_v1.pkl    zh posseg cache
-    GPT_SoVITS/text/opencc_s2tw_assets/           s2t conversion tables
-    GPT_SoVITS/text/ja_userdic/                   openjtalk user dictionary
-    GPT_SoVITS/text/G2PWModel/                    zh polyphonic assets
-        (g2pw.pth is NOT read; the MLX export g2pw.safetensors is loaded
-        instead -- see gsovits_mlx/text/g2pw_mlx.py)
-    GPT_SoVITS/pretrained_models/fast_langdetect/ optional, only used by
-        lang_segmenter.configure() for other fast_langdetect consumers
-
-Python-side requirements (importable in the runtime env, NOT in
-pyproject.toml): jieba_fast, pypinyin, jamo, ko_pron, ToJyutping, split_lang,
-g2p_en, g2pk2, cn2an (zh normalization), pyopenjtalk, nltk+cmudict (en),
-python_mecab_ko (ko). torch is NOT required.
+The loader only exists because three official packages cannot import in
+a torch-free runtime (guarded substitutions, details + the data-file
+contract in docs/PARITY_NOTES.md §text front-end loader):
+text.LangSegmenter (unguarded fast_langdetect import → our
+lang_segmenter), text.g2pw (torch_api → injected g2pw_mlx), and
+TTS_infer_pack (stub; stdlib-only text_segmentation_method.py executed
+directly). Everything else — text/symbols/symbols2/phone_units/
+tone_sandhi/zh_normalization/opencc_s2tw/jieba_posseg_fast/chinese/
+chinese2/japanese/english/korean/cantonese/cleaner — is official code
+executed as-is.
 """
 
 from __future__ import annotations

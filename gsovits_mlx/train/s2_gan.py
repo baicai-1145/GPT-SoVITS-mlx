@@ -1,46 +1,17 @@
-"""s2 (SoVITS v1/v2/v2Pro/v2ProPlus) GAN trainer in MLX.
+"""s2 GAN training core: official s2_train.py train_and_evaluate port.
 
-Port of the official GPT-SoVITS s2_train.py train_and_evaluate semantics on
-top of the task-1 shared core (train.GradScaler / train.AdamW / ExponentialLR
-below / train.ckpt exporters).
+Training-mode SynthesizerTrn reusing the inference modules
+(gsovits_mlx/sovits) plus a training PosteriorEncoder (enc_q: z = (m +
+randn*exp(logs))*mask, g DETACHED) and the v2Pro sv-conditioning path.
+Driven through a FLAT {name: mx.array} dict of torch-checkpoint names;
+modules re-bind from the fp16 working copy each forward (autocast
+equivalent; fp32 masters live in the optimizer).
 
-Training-step semantics replicated from s2_train.py (read line-by-line):
-
-  1. fp16 autocast forward of net_g (full SynthesizerTrn.forward including
-     the autocast-disabled fp32 ssl_proj+quantizer block; with
-     freeze_quantizer=True the forward eval()s ssl_proj+quantizer every
-     step, so the VQ self.training branches (commit loss, EMA update) never
-     run: kl_ssl is EXACTLY 0.0, and loss_gen_all's `+ kl_ssl * 1` term is
-     replicated verbatim as a logged 0.0)
-  2. mel = spec_to_mel(spec); y_mel = slice_segments(mel, ids_slice, 32);
-     y_hat_mel = mel_spectrogram(y_hat) — a FRESH stft on the generated
-     20480-sample slice (magnitude -> mel fb -> ln clamp 1e-5).
-  3. D step first: net_d(y, y_hat.detach()) with fp32 LSGAN losses;
-     scaler.scale(loss).backward(); scaler.unscale_(optim_d);
-     clip_grad_value_(None) — a NO-OP on grads (official commons.py only
-     clamps when clip_value is not None); scaler.step(optim_d).
-  4. G step: net_d(y, y_hat) feature maps; fp32 losses:
-     mel*45 + kl*1.0 + feature*2 + generator LS + kl_ssl*1; backward;
-     unscale_; no-op clip; scaler.step(optim_g); scaler.update() — the
-     SINGLE shared GradScaler updates ONLY here (the D step ran on the
-     pre-update scale, exactly like torch when update() is deferred).
-  5. ExponentialLR gamma=0.999875 per EPOCH (stepped after each epoch, plus
-     the official resume fast-forward loop).
-
-Model: training-mode SynthesizerTrn reusing inference modules from
-gsovits_mlx/sovits (TextEncoder / Generator / ResidualCouplingBlock /
-MelStyleEncoder / MRTE / WN) plus a training PosteriorEncoder (enc_q:
-z = (m + randn*exp(logs))*mask with g DETACHED, per official) and the v2Pro
-sv-conditioning path. Everything is driven through a FLAT {name: mx.array}
-dict of torch-checkpoint names (MLX tensor layouts) so the task-1
-optimizers and ckpt exporters work unchanged; modules re-bind references
-from the fp16 working copy each forward (the moral equivalent of torch
-autocast's per-forward cast; masters stay fp32 in the optimizer).
-
-fp16 policy: masters fp32 (AdamW groups); per step a fp16 copy is made for
-every non-quantizer param. The ssl_proj/quantizer block is computed in
-fp32 always (official autocast(enabled=False)); v2Pro sv_emb/ge_to512/
-prelu are also kept fp32 (models_local/v2pro exports them F32).
+The replicated step semantics (D-first with detached y_hat; fresh
+mel_spectrogram on the 20480-sample slice; the 5-loss G step;
+single shared GradScaler updating ONLY after the G step; kl_ssl exactly
+0.0 under freeze_quantizer; ExponentialLR per epoch) are the port
+contract in docs/PARITY_NOTES.md §s2 GAN trainer contract.
 """
 
 from __future__ import annotations

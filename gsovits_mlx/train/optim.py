@@ -1,48 +1,21 @@
-"""MLX optimizers for GPT-SoVITS training: torch-exact AdamW and the k2 ScaledAdam.
+"""MLX optimizers for GPT-SoVITS training: torch-exact AdamW and the
+official AR ScaledAdam (k2) math port.
 
-AdamW
-    Torch-update-math-exact AdamW (decoupled weight decay applied FIRST as
-    ``p *= (1 - lr*wd)`` using the pre-update parameter, bias-corrected
-    moments, fp32 m/v states). Gradients are treated as ALREADY unscaled:
-    the GradScaler divides fp32 grads before ``apply_group``.
+AdamW: decoupled weight decay FIRST (p *= (1-lr*wd) on the pre-update
+param), bias-corrected moments, fp32 m/v; grads arrive ALREADY unscaled
+(the GradScaler divides fp32 grads before apply_group).
 
-ScaledAdam
-    Port of the official AR trainer's optimizer
-    (GPT-SoVITS-cuda_graph_accel_v5/GPT_SoVITS/AR/modules/optim.py, Apache-2.0,
-    (c) 2022 Xiaomi Corp., authors: Daniel Povey). Only the MATH is ported:
-    the torch class's shape-batched stacking is a GPU kernel-launch
-    optimization with no numerical effect (verified: per-tensor state, no
-    stacking, reproduces the reference bit-for-bit modulo fp32 rounding —
-    see tests/test_train_core.py::test_scaled_adam_golden).
-
-    Reference quirks that are replicated faithfully (verified against the
-    torch source line by line; deviating from "what the code obviously
-    meant" would break golden parity):
-
-    * clipping_scale (gradient-norm clipping vs a running median) multiplies
-      the grad ONLY where it enters ``scale_grads`` (the per-tensor size/
-      scale update). ``_step()`` re-reads ``p.grad`` — the UNCLIPPED grad —
-      for exp_avg_sq and the momentum delta, so the main Adam-style update
-      is never actually clipped. Upstream bug faithfully preserved.
-    * the clipping ring buffer + threshold live per PARAM GROUP (torch calls
-      _get_clipping_scale once per group); the ring is stored in the state
-      of the group's first tensor.
-    * clipping quartile "median": sorted_norms[min(period-1, (period//4)*2)]
-      — index 2*period/4 of a sorted ascending window, with the last slot
-      reachable.
-    * ``_step()`` divides exp_avg_sq by bias_correction2 only when
-      bias_correction2 < 0.99 (an approximation switch, not a numerical-
-      stability guard).
-    * scalar tensors (numel==1) take the regular-Adam path with lr scaled by
-      scalar_lr_scale=0.1, and the parameter is clamped to ±scalar_max BEFORE
-      adding delta.
-    * param_rms is recomputed only every size_update_period steps (and only
-      refreshed at steps where step % period == period-1); the alpha used in
-      the main update is param_rms.clamp(min=param_min_rms).
-
-    Defaults match the official s1 trainer: lr=1e-2, betas=(0.9, 0.98),
-    size_update_period=4, clipping_scale=2.0 with clipping_update_period=1000.
-
+ScaledAdam: math port of the official AR trainer optimizer (Xiaomi
+Apache-2.0, cuda_graph AR/modules/optim.py). The torch class's shape-
+batched stacking is a launch optimization with no numerical effect
+(per-tensor state reproduces the reference modulo fp32 rounding —
+tests/test_train_core.py::test_scaled_adam_golden). The reference's
+verified quirks are replicated faithfully and documented in
+docs/PARITY_NOTES.md §s1 trainer optimizers (unclipped-grad re-read in
+_step, per-group clipping ring, quartile "median" index, bc2<0.99
+division switch, scalar path lr*0.1 + pre-clamp, param_rms refresh
+cadence). Defaults: lr 1e-2, betas (0.9,0.98), size_update_period 4,
+clipping_scale 2.0, clipping_update_period 1000.
 WarmupCosineLRSchedule lives in schedule.py.
 """
 

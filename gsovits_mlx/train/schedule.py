@@ -1,25 +1,14 @@
 """Warmup+cosine LR schedule with the OFFICIAL locked-LR quirk.
 
-Port of GPT-SoVITS-cuda_graph_accel_v5/GPT_SoVITS/AR/modules/lr_schedulers.py
-(WarmupCosineLRSchedule). The official file hard-locks the learning rate:
-
-    self.lr = lr = self.end_lr = 0.002  ###锁定用线性###不听话，直接锁定！
-    def set_lr(self, lr):
-        for g in self.optimizer.param_groups:
-            g["lr"] = self.end_lr   ###锁定用线性
-
-i.e. no matter what init/peak/end LRs or warmup/cosine window you configure,
-every ``step()`` writes lr = end_lr = 0.002 into every param group (and the
-scheduled value never escapes the method). This port keeps that behavior as
-the DEFAULT (``lr_locked=True``, matching the official repo byte-for-byte in
-effect: lr() always returns 0.002 after the first step). Setting
-``lr_locked=False`` enables the math the class was originally written for —
-linear warmup init_lr -> peak_lr until warmup_steps, cosine decay
-peak_lr -> end_lr until total_steps, constant end_lr afterwards — for
-experiments; it is NOT what official training runs used.
-
-``step()`` writes into ``optimizer.param_groups[i]["lr"]`` like the torch
-version.
+Port of AR/modules/lr_schedulers.py WarmupCosineLRSchedule. The official
+file hard-locks the lr (self.lr = lr = self.end_lr = 0.002 — "锁定用线性")
+and every step() writes lr = 0.002 into every param group regardless of
+configured init/peak/end LRs or warmup/cosine windows; the scheduled
+value never escapes. Port default lr_locked=True keeps that byte-for-byte
+(lr() always 0.002 after the first step). lr_locked=False enables the
+intended math (linear warmup init→peak, cosine peak→end, constant after)
+for experiments — NOT what official training used. step() writes
+optimizer.param_groups[i]["lr"] like torch.
 """
 
 from __future__ import annotations

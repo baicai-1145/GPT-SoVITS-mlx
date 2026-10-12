@@ -1,52 +1,25 @@
 """Per-component micro-benchmarks (task-5, P2-3).
 
-Fixed captured inputs, NO text front-end, NO HuBERT in the timed path.
-One component per process; run under the gpu.lock, ps-clean, for wall-times.
+Fixed captured inputs (.tmp/mb/<component>.npz + .meta.json), NO text
+front-end, NO HuBERT in the timed path. One component per process, under
+the gpu.lock, ps-clean. bench mode asserts parity against the captured
+golden output before reporting timing.
 
-Components
-----------
-GPT (AR decode, batch=1, seeded sampler identical to e2e):
-    gpt-s1v1   s1bert25hz-2kh  (v1)
-    gpt-s1v2   s1bert25hz-5kh  (v2/v2Pro/v2ProPlus)
-    gpt-s1v3   s1v3.ckpt       (v3/v4/v5dev/v5turbo)
-    metrics: tok/s over one full seeded decode (>=110 tokens) + pure-forward
-    replay of the captured token stream (teacher-forced steps, no sampling).
-
-SoVITS decoders (fixed codes+refer, ~110 generated tokens):
-    sovits-v1 v2 v2pro v2proplus   HiFiGAN direct 32 kHz
-    sovits-v3                      CFM 32-step + BigVGAN 24 kHz
-    sovits-v4                      CFM 32-step + Generator 48 kHz
-    sovits-v5dev                   CFMV5 rolling 32-step cfg 1.30
-    sovits-v5turbo                 CFMV5 4-step cfg 0.0
-    metric: decode latency (s) + golden-output max|diff| for parity.
-
-Measurement doctrine (task-11 revision; supersedes task-10 notes)
----------------------------------------------------------------
-1. State WHAT a number is, never assert what it is not:
-   - single-op synced latency (`op(); mx.eval()`) is a valid END-TO-END
-     latency including dispatch + sync; it is not pure kernel throughput.
-   - independent-batch timing (q distinct ops queued, ONE final eval)
-     measures achieved throughput of q pipelined ops; q must be stated.
-   - dependent-chain timing (x @ W1 @ W2 ... finite outputs) measures
-     chained-graph latency; FLOPs must be computed from the ACTUAL shapes
-     of every executed matmul.
-2. Repeated IDENTICAL operands risk runtime common-subexpression
-   elimination. Bench helpers must use DISTINCT materialized inputs and
-   retain + evaluate EVERY timed output. Keeping outputs in the graph is
-   necessary but not sufficient proof of execution count; state the
-   verification used (graph export / profile) when available.
-3. Never sum isolated micro timings into a physical lower bound, and never
-   extrapolate chain behavior from independent-op results (or vice versa).
-
-Usage
------
+Components: gpt-s1v1/s1v2/s1v3 (AR decode tok/s + teacher-forced replay),
+sovits-v1..v5turbo (decode latency + golden parity; vocoder per family).
+Usage:
   python3 tools/microbench.py capture --component gpt-s1v3   # under lock
   python3 tools/microbench.py bench   --component gpt-s1v3 --iters 3
   python3 tools/microbench.py bench   --all
   python3 tools/microbench.py gemm --shape 1600x1152x4608 --queue 8
 
-Captured artifacts live in .tmp/mb/<component>.npz (+ .meta.json). bench mode
-asserts parity against the captured golden output before reporting timing.
+Measurement doctrine (task-11 revision): docs/BENCH.md — state WHAT a
+number is (single-op synced latency = end-to-end incl. dispatch+sync,
+NOT kernel throughput; independent-batch = q-pipelined throughput, state
+q; dependent-chain = chained-graph latency, FLOPs from ACTUAL shapes);
+use DISTINCT materialized inputs (identical operands risk CSE), retain +
+eval EVERY timed output; never sum isolated micros into a physical lower
+bound, never extrapolate chains from independent ops or vice versa.
 """
 from __future__ import annotations
 

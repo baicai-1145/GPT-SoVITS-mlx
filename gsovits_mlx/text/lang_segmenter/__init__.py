@@ -1,29 +1,17 @@
-"""Language segmentation compatible with GPT-SoVITS-CPUFast `LangSegmenter`.
+"""Language segmentation compatible with CPUFast `LangSegmenter`.
 
-The official implementation (GPT_SoVITS/text/LangSegmenter/langsegmenter.py)
-wraps the `split_lang` package and post-processes its output:
+Faithful re-implementation of getTexts() on top of `split_lang` — no
+fast_langdetect import needed (the official module imports it UNGUARDED
+at top only to redirect the detector cache dir; all classification
+decisions come from split_lang; configure() still performs the same
+_default_detector swap when fast_langdetect + cache_dir are provided).
 
-* "digit" runs get the caller's default language (or a context rule when no
-  default is given),
-* runs the LID model mis-detected but that are pure-ASCII English are forced
-  to "en" (full_en),
-* non-ja runs are re-split for embedded kana sequences, then non-ko runs for
-  embedded hangul (split_jako),
-* unknown ("x") runs become zh when they contain CJK Han glyphs (full_cjk),
-* leftover "x" runs inherit a neighbour's language (or zh as last resort).
-
-This module re-implements getTexts() faithfully on top of `split_lang`, so
-the runtime needs NO fast_langdetect import at all. The official package
-cannot be imported without it: LangSegmenter/langsegmenter.py imports
-fast_langdetect UNGUARDED at module top (only to redirect its default
-detector's model cache directory) and never calls the LID model on the
-call chain (all classification decisions come from split_lang). When
-fast_langdetect IS importable and a cache_dir is provided, configure()
-performs the same _default_detector swap so any other consumer of
-fast_langdetect resolves the same model cache as the official checkout.
-
-Verified equivalent to the official LangSegmenter.getTexts on the P2-1
-acceptance corpus (see tests/test_lang_segmenter.py).
+Official post-processing replicated: "digit" runs take the caller's
+default language (or context rule), mis-detected pure-ASCII runs forced
+to "en", non-ja re-split for embedded kana then non-ko for hangul, "x"
+runs → zh when they contain CJK Han, leftover "x" inherit a neighbour
+(or zh). Verified equivalent on the P2-1 corpus
+(tests/test_lang_segmenter.py).
 """
 
 from __future__ import annotations

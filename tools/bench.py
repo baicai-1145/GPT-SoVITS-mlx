@@ -1,37 +1,19 @@
-"""Benchmark harness for gsovits_mlx pipelines (skeleton).
+"""One-shot e2e synthesis benchmark: per-stage timings + peak memory.
 
-Runs one synthesis per invocation, timing each pipeline stage and reporting
-process peak RSS plus peak physical footprint, as one JSON line on stdout.
-Stage names are stable so the output can be concatenated across runs and
-versions:
+One synthesis per invocation; stable stage names so JSON lines concat
+across runs/versions. Stages: frontend (text→phones+BERT), prompt_codes
+(ref→HuBERT→quantizer), refer_spec (32k linear spec crop), ar (GPT
+sampling), sovits (decode), vocoder (separate only for v3/v4/v5).
 
-    {"version": "v2", "stages": {"frontend_s": .., "prompt_codes_s": ..,
-     "refer_spec_s": .., "ar_s": .., "sovits_s": .., "ar_tokens": ..,
-     "audio_s": .., "peak_rss_kb": .., "peak_footprint_kb": ..}, "total_s": ..}
-
-Stage semantics:
-    frontend      text -> phones + BERT features (official cleaner + MLX BERT)
-    prompt_codes  ref audio -> HuBERT -> SoVITS quantizer (semantic prompt)
-    refer_spec    ref audio -> 32 kHz linear spectrogram crop (v2: 704 bins)
-    ar            GPT AR sampling of target semantic tokens
-    sovits        SoVITS decode (prompt + gen codes) -> 32 kHz audio
-    vocoder       reserved: only non-zero for v3/v4/v5 builds where the
-                  HiFiGAN/NiFiGAN vocoder runs as a separate stage (the v1/v2
-                  decoder includes the vocoder in `sovits`).
-
-Peak RSS is the child process's high-water mark
-(`resource.getrusage(RUSAGE_CHILDREN).ru_maxrss`, normalized to KB — macOS
-reports bytes), so it covers MLX Metal buffer cache growth; compare across
-identical stage sequences, not across versions.
-
-Peak footprint is the Activity-Monitor "Memory" caliber sampled live from the
-e2e child with /usr/bin/footprint (resident + compressed + Metal/GPU wired),
-normalized to KB; 0 means the sampler could not read it. It is the number to
-watch for the memory-peak budget, RSS alone under-reports GPU-wired pages.
+Memory calibers (do not mix): peak_rss_kb = child high-water RUSAGE
+(covers Metal cache growth; compare within identical stage sequences);
+peak_footprint_kb = /usr/bin/footprint live sample (resident+compressed+
+GPU-wired; 0 = unreadable) — THIS is the memory-peak budget number, RSS
+alone under-reports GPU-wired.
 
 Examples:
-    python3 tools/bench.py --version v2 \
-        --text "你好，欢迎来到各自的旅程。今天我们聊聊机器学习。" \
+    python3 tools/bench.py --version v2 \\
+        --text "你好，欢迎来到各自的旅程。" \\
         --ref-audio ref.wav --ref-text "希望你以后能够做得比我还好哟。"
     python3 tools/bench.py --version v2 --models-root /path/to/mlx --repeat 3
 """

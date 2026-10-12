@@ -1,26 +1,13 @@
 """GradScaler for MLX: torch.amp.GradScaler("16-mixed") semantics.
 
-Implements the official dynamic-loss-scaling state machine on top of MLX
-graphs:
-
-* ``scale(loss)`` multiplies the loss (and therefore every grad flowing from
-  it) by a power-of-two scale so fp16 activations/grads stay representable.
-* ``unscale_(optimizer)`` divides the (already-evaluated) fp32 grads of every
-  param in ``optimizer.param_groups`` by the scale and records, per param
-  group, whether any grad became non-finite (inf/nan) — ``mx.allfinite``-style
-  check via ``mx.isfinite`` + ``mx.all`` (mlx 0.32.2 has no ``allfinite``).
-* ``step(optimizer)`` applies the optimizer step only for groups whose grads
-  were all finite; groups with inf/nan grads are skipped entirely (their
-  optimizer state must NOT advance — matches torch, where found_inf per device
-  gates the whole per-device step; here the per-param-group granularity is the
-  natural MLX analogue because each group is stepped independently).
-* ``update()`` maintains the growth/backoff counters exactly like
-  ``torch.amp.GradScaler``:
-    - every consecutive finite step increments ``_growth_tracker``; once it
-      reaches ``growth_interval`` the scale is multiplied by
-      ``growth_factor`` (typically x2) and the tracker resets;
-    - any inf step multiplies the scale by ``backoff_factor`` (typically x0.5)
-      immediately and resets the tracker.
+The official dynamic-loss-scaling state machine on MLX graphs. Contract:
+scale(loss) multiplies loss (and grads) by a power-of-two scale;
+unscale_(opt) divides evaluated fp32 grads per param group and records
+inf/nan (mx.isfinite + mx.all — mlx 0.32.2 has no allfinite); step(opt)
+steps ONLY groups with all-finite grads (inf groups skip entirely, state
+must not advance — per-param-group is the MLX analogue of torch's
+per-device found_inf gate); update() runs growth/backoff exactly like
+torch.amp (growth_tracker → x2 at growth_interval, backoff x0.5 on inf).
 
 Usage:
     scaler = GradScaler()
@@ -29,8 +16,8 @@ Usage:
     scaler.step(opt, apply_fn=lambda o, grads: o.apply_grads(grads, params))
     scaler.update()
 
-NOTE MLX grads are ordinary arrays here (trainers keep a flat ``{name: array}``
-param/grad dict); ``unscale_`` mutates the grad dict in place.
+NOTE MLX grads are ordinary arrays (flat {name: array} dicts);
+unscale_ mutates the grad dict in place.
 """
 
 from __future__ import annotations

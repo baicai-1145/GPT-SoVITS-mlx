@@ -1,37 +1,19 @@
-"""GAN trainer memory-governance additions (gan-bucket-compile task).
+"""Shape-governance tests for the s2 GAN trainer (pad quantization,
+fixed-shape, gather slice, compile smoke).
 
-1. GAN batch-shape finding (documented in TRAINING.md): the official
-   DistributedBucketSampler is the GAN trainer's ONLY sampler (already
-   unconditional in tools/train_s2.py — official s2_train.py itself never
-   runs flat order), so "--length-buckets" reduces to CLI symmetry; the
-   varying dimensions are the collated ssl/spec/wav/text WIDTHS (83
-   distinct spec widths in 120 b3 batches of the 939-item exp set) —
-   quantized/fixed pads target those.
-2. Pad quantization (--pad-multiple) / fixed-shape (--fixed-shape) collate
-   contract: widths rounded/fixed; *_lengths arrays IDENTICAL (masks and
-   slices consume only lengths); extra columns exactly zero beyond every
-   length.
-3. Pad-neutrality of the GAN step on the REAL SynthesizerTrnTrain (CPU,
-   real s2G_v2 weights), pinned-draw contract:
-   (a) z's pad region is exactly 0 (x_mask kills it);
-   (b) ids_slice (segment starts) is width-independent — the uniform draw
-       is over lengths-bounded max with a (B,) shape (bit-equal);
-   (c) with the two official-parity width-coupled draws PINNED (posterior
-       noise per absolute position; ge = ref_enc output), loss_mel is
-       BIT-IDENTICAL across pad widths and loss_kl agrees to <=1e-6 rel
-       (kl sums over the padded width; masked entries are exactly 0, only
-       the fp32 accumulation ORDER changes). The two couplings are exactly
-       the ones official torch has (torch.randn_like over the padded
-       tensor; MelStyleEncoder reads the batch-max-padded y), so
-       fixed-shape padding shifts them exactly like official batch-max
-       padding does — distribution-identical, not bitwise.
-4. Gather-based segment slice (compile-safe path): bit-identical forward
-   and gradients vs the reference loop slice; same draw in rand variant.
-5. mx.compile smoke of the driver's exact call structures: compiled inner
-   forwards INSIDE value_and_grad (fwd arm) and value_and_grad INSIDE
-   compile (step arm), weights-as-args (no stale-capture).
-
-Run: pytest -q tests/test_train_s2_memshape.py
+Context: the GAN trainer already runs the official bucket sampler
+unconditionally; the varying dims are the collated WIDTHS (83 distinct
+spec widths in 120 b3 batches). These tests pin the contract:
+1. --pad-multiple / --fixed-shape: widths rounded/fixed; *_lengths arrays
+   IDENTICAL; extra columns zero beyond every length.
+2. Pad-neutrality on the real SynthesizerTrnTrain (CPU, s2G_v2 weights,
+   pinned draws): loss_mel BIT-IDENTICAL across pad widths, loss_kl
+   <=1e-6 rel (fp32 accumulation order only); the two width-coupled draws
+   (posterior noise, ge) couple exactly like official torch padding —
+   distribution-identical, not bitwise. Full rationale:
+   docs/TRAINING.md §5-§6; docs/PARITY_NOTES.md §s2 data pipeline.
+3. Gather-based segment slice: bit-identical fwd+grads vs loop slice.
+4. mx.compile smoke of the driver's call structures.
 """
 
 from __future__ import annotations

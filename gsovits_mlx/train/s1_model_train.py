@@ -1,48 +1,14 @@
-"""s1 (AR/GPT) training forward: official forward_old ported to MLX.
+"""s1 (AR) training-mode forward over the INFERENCE weight layout.
 
-Ports AR/models/t2s_model.py Text2SemanticDecoder.forward_old (the
-cuda_graph reference, lines ~450-510) as a training-mode forward over the
-INFERENCE weight layout (the gpt.safetensors keys: ar_text_embedding,
-block.<i>.qkv_w/..., bert_proj.weight, ar_predict_layer.weight, ...) —
-same weights as gsovits_mlx/gpt/t2s.py loads, no KV-cache streaming,
-differentiable via mx.grad over a flat params dict.
-
-Official semantics preserved exactly:
-
-* x block: ar_text_embedding(x) + bert_proj(bert^T) + ar_text_position.
-* y block: codes = y * (1 - y_mask) (pads zeroed); y, targets = pad_y_eos(
-  codes, y_mask_int, eos=1024): decoder input y = targets[:, :-1] (starts
-  with the row's first real code; EOS at every pad slot), targets = codes
-  + eos*mask extended with a trailing EOS column — every target row ends
-  with EOS.
-* attention mask: concat[x_attn_mask (x rows see all x, never y),
-  y_attn_mask (y rows see all x + causal triu(1) within y)] logical_or
-  padding (x: make_pad_mask_LEFT, y: make_pad_mask) broadcast over
-  (B*heads, 1, src) -> additive -inf float, built in fp16 (official
-  autocast materializes the mask in x.dtype).
-* logits = ar_predict_layer(xy_dec[:, x_len-1:]) with x_len = x_lens.max():
-  a (B, Y+1, D) slice — the LAST x position plus every y position. The
-  last-x position (which has attended only x) predicts the first y token;
-  y position j predicts target j+1; the final y position predicts EOS.
-  This is why the bucket sampler matters: rows share x_len (max) and the
-  per-row pad tails land on EOS targets.
-* loss = F.cross_entropy(logits.permute(0,2,1), targets, reduction="sum")
-  over ALL (B, Y+1) positions; acc = MulticlassAccuracy top_k=3,
-  ignore_index=EOS, multidim_average="global".
-
-Numerics: fp16 forward + fp32 CE (logits cast to fp32 — official 16-mixed
-autocast keeps CE fp32). Weights stay fp32 (masters); the trainer casts to
-fp16 per forward (S1Trainer/train_s1.py).
-
-Dropout: the official TRAIN stack would run dropout 0.1 (positional
-embeddings + per-layer), config dropout=0 covers only TokenEmbedding.
-This port defaults to p_dropout=0 (task spec; identical math in eval);
-GSOVITS_S1_TRAIN_DROPOUT>0 is an experimentation knob.
-
-Left-pad quirk (verified against official make_pad_mask_left): rows are
-right-padded by collate, but x_mask marks the row's FIRST (max_len -
-x_len) positions — the official mask hides leading slots while the actual
-pads sit at the tail. Replicated bit-for-bit (mask test vs torch).
+Ports AR/models/t2s_model.py Text2SemanticDecoder.forward_old (cuda_graph
+reference ~L450-510) as a differentiable forward over the gpt.safetensors
+keys (same weights gsovits_mlx/gpt/t2s.py loads; no KV-cache streaming;
+mx.grad over a flat params dict). Full semantics — pad_y_eos EOS layout,
+the concat attention mask (x-rows-see-only-x + causal y) in fp16,
+ar_predict_layer slice at x_len-1, sum-CE + top-3 accuracy, fp16
+forward/fp32 CE numerics, and the p_dropout=0 default with
+GSOVITS_S1_TRAIN_DROPOUT experimentation knob — are the port contract in
+docs/PARITY_NOTES.md §s1 training forward.
 """
 
 from __future__ import annotations

@@ -1,29 +1,20 @@
 #!/usr/bin/env python3
-"""s1 (AR/GPT) trainer, MLX port of the official GPT_SoVITS/s1_train.py loop.
+"""s1 (AR/GPT) trainer, MLX port of the official s1_train.py loop.
 
-Semantics ported from GPT-SoVITS-cuda_graph_accel_v5/GPT_SoVITS
-(AR/data + AR/models + s1_train.py + t2s_lightning_module.py):
-
-* dataset/sampler: official filters + bucketing (gsovits_mlx/train/s1_data.py)
-* forward: forward_old (gsovits_mlx/train/s1_model_train.py) — fp16 forward,
-  fp32 CE, sum reduction, top-3 acc (ignore EOS)
-* optimizer: ScaledAdam lr=0.01 betas (0.9,0.95) clipping_scale 2.0
-  clipping_update_period 1000 size_update_period 4 scalar_lr_scale 0.1
-  (official configure_optimizers defaults)
-* scheduler: locked-0.002 WarmupCosine (official hard-lock quirk)
-* grad accumulation: official manual_backward every batch; opt.step() only
-  when batch_idx>0 and batch_idx%4==0 (then zero_grad + scheduler.step) —
-  i.e. the first optimizer step accumulates batches 0..4 (5 batches) and
-  later steps every 4; loss is SUM-reduced, no averaging (matching official).
-* checkpointing: resume ckpt + export gpt.safetensors/gpt.json (task-1
-  ckpt.save_s1_inference) loadable by gsovits_mlx.pipeline.load_gpt.
+Semantics (full detail in docs/PARITY_NOTES.md §s1 training forward /
+§s1 trainer optimizers): official filters+bucketing (s1_data.py);
+forward_old (s1_model_train.py) fp16 fwd / fp32 sum-CE / top-3 acc
+(ignore EOS); ScaledAdam official defaults (lr 0.01, betas (0.9,0.95),
+clipping_scale 2.0 / period 1000, size_update_period 4,
+scalar_lr_scale 0.1); locked-0.002 WarmupCosine (official hard-lock
+quirk); grad accumulation — manual_backward every batch, opt.step() only
+when batch_idx>0 and %4==0 (first step accumulates 5 batches, then every
+4; SUM-reduced loss, no averaging). Checkpoint: resume ckpt + export
+gpt.safetensors/gpt.json loadable by pipeline.load_gpt.
 
 Usage:
-    python tools/train_s1.py --exp-dir .tmp/train_data/exp --version v2 \
+    python tools/train_s1.py --exp-dir .tmp/train_data/exp --version v2 \\
         [--init-from models_local/s1v2] [--max-steps 200] [--batch-size 8]
-
-Reads: <exp_dir>/2-name2text.txt, <exp_dir>/3-bert/*.npy,
-<exp_dir>/6-name2semantic.tsv (official 1-prepare artifacts, task-2 emits).
 """
 
 from __future__ import annotations

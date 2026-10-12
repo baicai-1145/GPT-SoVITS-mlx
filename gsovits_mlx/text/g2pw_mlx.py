@@ -1,29 +1,18 @@
 """MLX port of the CPUFast G2PW polyphonic-disambiguation model.
 
-Replaces ``text.g2pw.torch_api`` (the only torch-dependent piece of the
-official zh G2P chain). Everything around the model -- data prep
-(``prepare_onnx_input``), polyphonic/promise dictionaries, static assets,
-pypinyin prefill, sentence dedup, bopomofo->pinyin conversion -- comes from
-the official torch-free modules (text/g2pw/base_api.py + dataset.py +
-pronunciation.py) executed by gsovits_mlx.text.vendored_cpufront; this file
-only re-implements ``G2PWTorchConverter``: model load + one forward.
+Replaces text.g2pw.torch_api (the only torch-dependent piece of the
+official zh G2P chain); everything around the model (data prep, polyphonic
+dictionaries, pypinyin prefill, bopomofo conversion) is the official
+torch-free code via vendored_cpufront. This file is only G2PWTorchConverter:
+model load + one forward (bert-base-chinese sized; embeddings → 12
+post-LN gelu layers → per-query gather → pos head → descriptor mask →
+masked softmax → argmax; QuantStub/DeQuantStub residue is identity in
+eval — float math here is reference math).
 
-Model (CPUFast torch_api.G2PWModel, bert-base-chinese sized): embeddings ->
-12 transformer layers (post-LN, gelu, 12 heads) -> gather per-query
-positions -> pos head (argmax over 11 positions) -> descriptor-sigmoid mask
--> masked softmax over phoneme labels -> argmax. The float checkpoint
-carries QuantStub/DeQuantStub residue from an fx quantization export; in
-eval they are identity ops, so the float math here is the reference math.
-
-Weights: g2pw.safetensors (fp32 export of G2PWModel/g2pw.pth, created by
-tools/export_g2pw_mlx.py; kept fp32 because the argmax decides zh phones
-and fp16 logits can flip near-ties). Lookup order:
-    $GSOVITS_G2PW_SAFETENSORS
-    <official G2PWModel dir>/g2pw.safetensors
-    <models_root>/g2pw/g2pw.safetensors   (default <repo>/models_local/g2pw)
-
-Numerical gate: label-exact vs the torch G2PW on the parity corpus (see
-tests/test_g2pw_mlx.py).
+Weights: g2pw.safetensors (fp32 export of g2pw.pth; fp32 because argmax
+decides zh phones and fp16 flips near-ties). Lookup: $GSOVITS_G2PW_SAFETENSORS
+→ <official G2PWModel dir>/g2pw.safetensors → <models_root>/g2pw/.
+Numerical gate: label-exact vs torch (tests/test_g2pw_mlx.py).
 """
 
 from __future__ import annotations

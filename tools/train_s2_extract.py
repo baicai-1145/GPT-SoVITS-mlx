@@ -1,26 +1,13 @@
-"""Torch s2G/s2D checkpoint -> npz intermediates for s2 GAN training (task-4).
+"""Torch s2G/s2D checkpoint -> npz intermediates for s2 GAN training.
 
-Run under the BASE VENV (torch available); the repo venv stays torch-free.
-This is a one-time extraction per checkpoint; outputs land under
-<repo>/.tmp/train_s2/:
-
-  s2G_<version>.npz  — flat torch state-dict names, float32 numpy,
-                       conv layouts transposed to MLX:
-                         Conv1d weight (out,in,k)      -> (out,k,in)
-                         ConvTranspose1d (in,out,k)    -> (out,k,in)
-                         Conv2d stays (out,in,kh,kw)
-                       weight-norm modules keep BOTH weight_g and weight_v
-                       (training uses the live (g,v) parameterization; the
-                       fused single-weight form is only for inference).
-  s2D_<version>.npz  — same for the discriminator.
-
-Also prints the official load_state_dict(strict=False) missing/unexpected
-report (mirroring s2_train.py behavior for diagnostics).
-
-Usage:
-  /Users/baicai1145/.venvs/base/bin/python -m tools.train_s2_extract \
-      --version v2 --out .tmp/train_s2 [--extra-s2d path]
-Default checkpoint paths follow /Volumes/2T/gpt-sovits-models/pretrained_models.
+Run under the BASE VENV (torch available); repo venv stays torch-free.
+One-time extraction per checkpoint; outputs under <repo>/.tmp/train_s2/:
+s2G_<version>.npz / s2D_<version>.npz — flat torch state-dict names,
+float32 numpy, conv layouts transposed to MLX (Conv1d (out,in,k)→(out,k,in);
+ConvTranspose1d (in,out,k)→(out,k,in); Conv2d unchanged); weight-norm
+modules keep BOTH weight_g and weight_v (training uses the live (g,v)
+parameterization; the fused form is inference-only). Prints the official
+load_state_dict(strict=False) missing/unexpected report like s2_train.py.
 """
 
 from __future__ import annotations

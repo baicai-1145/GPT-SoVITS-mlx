@@ -1,33 +1,19 @@
-"""s1 (AR/GPT) training dataset + bucket sampler — official-semantics port.
+"""s1 (AR) training data: official data_utils + bucket sampler port.
 
-Port of GPT-SoVITS-cuda_graph_accel_v5/GPT_SoVITS/AR/data/{dataset,
-bucket_sampler}.py (Apache-2.0, upstream SoundStorm/VALL-E). The dataset
-reads the s1 pipeline artifacts (2-name2text.txt, 3-bert/*.npy, 6-name2semantic.tsv)
-produced by the official 1-prepare step (task-2 pipeline), applies the
-EXACT official filters, and collates right-padded batches. The sampler
-sorts by seconds, buckets, shuffles within buckets per epoch, and regroups
-— the length-bucketing that makes the official forward_old single-slice
-logits valid (rows in a batch have near-equal lengths).
+Reads the s1 pipeline artifacts (2-name2text, 3-bert/*.npy fp16 (1024,T),
+6-name2semantic.tsv), applies the EXACT official filters, collates
+right-padded batches; the sampler sorts by seconds, buckets, per-epoch
+in-bucket shuffle + regroup — the length-bucketing that makes the
+forward_old single-slice logits valid (rows share near-equal lengths).
+cleaned_text_to_sequence from the vendored official package, symbol
+table by explicit ``version`` arg (v1 512 / v2 732; os.environ is only
+the official fallback).
 
-Official quirks kept faithfully (see inline comments):
-
-* phoneme-file line filter: keep only lines with exactly 4 tab-separated
-  fields (the 4th field "text" is parsed but unused downstream);
-* min_num=100 duplication: replicate the WHOLE kept list
-  max(2, int(100/len)) times when fewer than 100 samples survive;
-* semantic length filter compares len(semantic_ids) > max_sec*hz (hz=25,
-  max_sec from the target version's s1 config: 54 for v1, 57 v2-family);
-* missing BERT features -> zeros (never skip; the official assert on
-  shape mismatch is a hard error, kept as ValueError);
-* sampler pad-to-total via index repetition (drop_last=False); batch
-  order shuffled after grouping.
-
-BERT storage: 3-bert/*.npy float16 (1024, T) produced by our pipeline;
-loaded per item, zero-padded to (B, 1024, max_phoneme_len) in collate.
-cleaned_text_to_sequence comes from the vendored official text package
-(gsovits_mlx.text.vendored_cpufront) with the version symbol table chosen
-by the explicit ``version`` argument (v1: 512 symbols, v2: 732) — the
-official module reads os.environ["version"] only as its fallback default.
+Faithful quirks (phoneme-line 4-field filter; min_num=100 whole-list
+duplication; semantic filter len > max_sec*hz with per-version max_sec;
+missing BERT → zeros, shape mismatch → ValueError; sampler
+pad-by-repetition with batch-order shuffle) are documented inline and in
+docs/PARITY_NOTES.md §s1 data pipeline.
 """
 
 from __future__ import annotations

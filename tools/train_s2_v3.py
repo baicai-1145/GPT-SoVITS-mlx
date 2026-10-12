@@ -1,26 +1,20 @@
 #!/usr/bin/env python3
 """s2 v3/v4/v5dev/v5turbo CFM+LoRA trainer (MLX port of s2_train_v3_lora.py).
 
-Official semantics (GPT-SoVITS-cuda_graph_accel_v5, read-only reference):
-
-* data: TextAudioSpeakerLoaderV3 (v3) / V4 (v4/v5dev/v5turbo) + collate
-  V3/V4 (gsovits_mlx/train/s2_v3_data.py; exp_dir from tools/prepare_data.py).
-* model: SynthesizerTrnV3.forward with freeze_quantizer=True — CFM MSE loss
-  on the flow-matching velocity; ssl_proj/quantizer/enc_p frozen;
-  ref_enc/bridge/wns1/linear_mel train full-model. LoRA rank-32 (default)
-  adapters on the DiT attention to_k/to_q/to_v/to_out.0 (scaling 1.0,
-  peft-default init); base DiT frozen. --no-lora trains the DiT full-model.
-* loop: AdamW(lr 1e-4, betas (0.8, 0.99), eps 1e-9) on TRAINABLE params
-  only, fp16 GradScaler, ExponentialLR gamma=0.999875 per epoch, no
-  discriminator. Checkpoints + merged-weight sovits export
-  (pipeline.load_sovits_v3-loadable) under --out.
+Semantics: V3/V4 loader+collate (s2_v3_data.py); SynthesizerTrnV3.forward
+freeze_quantizer=True — CFM MSE on the flow-matching velocity,
+ssl_proj/quantizer/enc_p frozen, ref_enc/bridge/wns1/linear_mel
+full-model; LoRA rank-32 on DiT attention to_k/to_q/to_v/to_out.0
+(scaling 1.0, peft-default init; --no-lora trains DiT full-model).
+Loop: AdamW(1e-4, (0.8,0.99), eps 1e-9) on TRAINABLE params, fp16
+GradScaler, ExponentialLR 0.999875/epoch, no discriminator. Checkpoints
++ merged sovits export (pipeline.load_sovits_v3) under --out.
+Config/speed guidance: docs/TRAINING.md §4 (bf16 --dit-dtype, buckets,
+pad-multiple); eager-backward is 16GB-dead (INCIDENTS#cfm-eager).
 
 Usage:
-  python3 tools/train_s2_v3.py --version v3 --exp-dir .tmp/train_data/exp \
-      --out .tmp/train_s2_v3_smoke --steps 200 --batch-size 3 --gpu
-
-GPU lock discipline: --gpu (or GSOVITS_GPU_LOCK_OK=1) with .tmp/gpu.lock.d
-held; CPU runs are allowed for smoke tests (numerically valid, slower).
+  python3 tools/train_s2_v3.py --version v3 --exp-dir .tmp/train_data/exp \\
+      --batch-size 3 --dit-dtype bf16 --length-buckets --pad-multiple 64
 """
 
 from __future__ import annotations

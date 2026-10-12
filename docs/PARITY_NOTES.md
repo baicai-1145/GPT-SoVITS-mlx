@@ -624,3 +624,124 @@ Reference (READ-ONLY): cuda_graph repo. Line anchors at port time:
   2026-10-09); LengthBucketSampler = official bucket semantics
   (boundary buckets, pad-to-batch-multiple, per-epoch shuffles), opt-in
   via --length-buckets; default loader order stays official.
+
+## s1 trainer optimizers (moved from gsovits_mlx/train/optim.py)
+
+ScaledAdam (official AR/modules/optim.py, Xiaomi Apache-2.0) verified
+quirks, replicated faithfully (deviating would break golden parity —
+tests/test_train_core.py::test_scaled_adam_golden):
+* clipping_scale multiplies the grad ONLY where it enters scale_grads
+  (per-tensor size/scale update); _step() re-reads p.grad UNCLIPPED for
+  exp_avg_sq and the momentum delta — the main Adam-style update is
+  never actually clipped (upstream bug preserved).
+* clipping ring buffer + threshold live per PARAM GROUP (torch calls
+  _get_clipping_scale once per group); ring stored in the first tensor's
+  state.
+* clipping quartile "median": sorted_norms[min(period-1, (period//4)*2)].
+* _step() divides exp_avg_sq by bias_correction2 only when bc2 < 0.99
+  (approximation switch, not a stability guard).
+* scalar tensors (numel==1): regular-Adam path, lr*scalar_lr_scale=0.1,
+  param clamped to ±scalar_max BEFORE adding delta.
+* param_rms recomputed only when step % size_update_period == period-1;
+  main update alpha = param_rms.clamp(min=param_min_rms).
+
+## s1 training forward contract (moved from gsovits_mlx/train/s1_model_train.py)
+
+Ports AR/models/t2s_model.py Text2SemanticDecoder.forward_old (cuda_graph
+~L450-510) over the inference weight layout. Preserved exactly:
+* x block: ar_text_embedding(x) + bert_proj(bert^T) + ar_text_position.
+* y block: codes = y*(1-y_mask); y, targets = pad_y_eos(codes, y_mask_int,
+  eos=1024): decoder input y = targets[:,:-1] (starts with the row's first
+  real code; EOS at every pad slot), targets = codes + eos*mask with a
+  trailing EOS column — every target row ends with EOS.
+* attention mask: concat[x_attn_mask (x rows see all x, never y),
+  y_attn_mask (y rows see all x + causal triu(1) within y)] logical_or
+  padding (x: make_pad_mask_LEFT, y: make_pad_mask) broadcast
+  (B*heads,1,src) → additive -inf float, built in fp16 (official autocast
+  materializes the mask in x.dtype).
+* logits = ar_predict_layer(xy_dec[:, x_len-1:]) with x_len = x_lens.max():
+  (B, Y+1, D) — last x position (attended only x) predicts the first y
+  token; y j predicts j+1; final y position predicts EOS. This is why the
+  bucket sampler matters: rows share x_len (max) and pad tails land on EOS
+  targets.
+* loss = cross_entropy(logits.permute(0,2,1), targets, reduction="sum")
+  over ALL (B, Y+1); acc = MulticlassAccuracy top_k=3, ignore_index=EOS,
+  multidim_average="global".
+* Numerics: fp16 forward + fp32 CE (official 16-mixed keeps CE fp32);
+  weights fp32 masters, cast per forward.
+* Dropout: official TRAIN stack runs 0.1 (positional + per-layer); config
+  dropout=0 covers only TokenEmbedding. Port default p_dropout=0 (task
+  spec, identical math in eval); GSOVITS_S1_TRAIN_DROPOUT>0 = knob.
+
+## s2 GAN step semantics detail (moved from gsovits_mlx/train/s2_gan.py)
+
+1. fp16 autocast forward of net_g (full SynthesizerTrn.forward incl. the
+   autocast-disabled fp32 ssl_proj+quantizer block; freeze_quantizer=True
+   eval()s ssl_proj+quantizer every step — VQ self.training branches
+   (commit loss, EMA) never run: kl_ssl is EXACTLY 0.0, logged verbatim).
+2. mel = spec_to_mel(spec); y_mel = slice_segments(mel, ids_slice, 32);
+   y_hat_mel = mel_spectrogram(y_hat) — FRESH stft on the generated
+   20480-sample slice (magnitude → mel fb → ln clamp 1e-5).
+3. D step first: net_d(y, y_hat.detach()) fp32 LSGAN losses;
+   scaler.scale().backward(); unscale_(optim_d); clip_grad_value_(None)
+   NO-OP (official commons clamps only when clip_value non-None);
+   scaler.step(optim_d).
+4. G step: net_d(y, y_hat) feature maps; fp32 losses mel*45 + kl*1.0 +
+   feature*2 + generator LS + kl_ssl*1; single shared GradScaler.update()
+   ONLY here (D step ran on the pre-update scale, like deferred torch).
+5. ExponentialLR gamma=0.999875 per epoch (+ official resume fast-forward).
+
+## text front-end loader (moved from gsovits_mlx/text/vendored_cpufront.py)
+
+Three guarded substitutions (torch-free runtime):
+* text.LangSegmenter imports fast_langdetect UNGUARDED at module top (LID
+  model never used on the getTexts() path) → gsovits_mlx.text.lang_segmenter.
+* text.g2pw.__init__ → g2pw.py → torch_api.py (torch) → stub package with
+  gsovits_mlx.text.g2pw_mlx injected as text.g2pw.torch_api (chinese2.py
+  imports only G2PWTorchConverter from there).
+* TTS_infer_pack/__init__ imports TTS.py (torch) → stub; stdlib-only
+  text_segmentation_method.py executed directly.
+
+Data-file contract (resolved via __file__ inside the CPUFast checkout,
+read-only): opencpop-strict.txt (zh pinyin→phone), cmudict*.rep +
+*_cache.pickle + namedict_cache.pickle (english G2P/names),
+jieba_posseg_assets_v1.pkl (zh posseg), opencc_s2tw_assets/ (s2t),
+ja_userdic/ (openjtalk), G2PWModel/ (zh polyphonic; g2pw.pth NOT read —
+MLX export g2pw.safetensors via g2pw_mlx.py), pretrained_models/
+fast_langdetect/ (optional, only for other lang_segmenter consumers).
+
+## text preprocessing (moved from gsovits_mlx/text/preproc.py)
+
+Official TextPreprocessor::get_phones_and_bert_with_phone_units replicated:
+* text = re.sub(r' {2,}', ' ', text) at the entry (NOT in pre_seg_text).
+* pre_seg_text: strip('\n') → '。'/'.' prefix when the text does not start
+  with a split separator and first segment < 4 chars → seg_method (cut0 =
+  no-op) → collapse '\n\n' → split/filter/merge_short_text_in_array(5) →
+  pad trailing separator → split_big_text(>510).
+* per-segment: clean_text_with_phone_units → cleaned_text_to_sequence →
+  bert: zh = MLX BERT on normalized text (word2ph repeat, hidden -3),
+  else all-zero (1024, len(phones)) (official get_bert_inf).
+* not final and len(phones) < 6 → redo WHOLE text as "."+text with
+  final=True (short-text recursion).
+* replace_consecutive_punctuation("!?…,.-" → first) on raw input inside
+  preprocess() before pre_seg_text.
+* batch zh (official _preprocess_batch_zh) batches ONLY the BERT forwards;
+  same condition (lang in {zh, all_zh}, no [A-Za-z] in any segment) and
+  output order.
+Deliberate differences: phone_units not exposed; bert fp32 numpy (1024,T);
+add_reference_audio/ref-text handled by callers — prompt text must NOT go
+through pre_seg_text '。'-prefixing (official TTS.py uses a separate
+simpler path).
+
+## s1 data pipeline quirks (moved from gsovits_mlx/train/s1_data.py)
+
+* phoneme-file line filter: keep only lines with exactly 4 tab-separated
+  fields (4th field "text" parsed but unused downstream).
+* min_num=100 duplication: replicate the WHOLE kept list max(2, 100//len)
+  times when fewer than 100 samples survive.
+* semantic length filter: len(semantic_ids) > max_sec*hz (hz=25; max_sec
+  from the version's s1 config: 54 v1, 57 v2-family).
+* missing BERT features → zeros (never skip); shape mismatch → ValueError
+  (official hard assert kept).
+* sampler pad-to-total via index repetition (drop_last=False); batch
+  order shuffled after grouping.

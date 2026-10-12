@@ -1,29 +1,16 @@
 """Disk cache for (ref_audio, ref_text) prompt front-end artifacts.
 
-The reference-audio prompt (HuBERT semantic codes + reference spec) and its
-text front-end (phones + bert) depend only on (ref_audio file, ref_text,
-prompt_lang, cleaner version) — recomputing them on every synthesis is the
-single biggest fixed cost of repeated inference with the same reference
-(the dominant real-world pattern), so the results are cached on disk keyed
-by an mtime+size content proxy of the audio file plus the full input
-parameters.
+The prompt pipeline (phones/bert, and via the caller's cached_call: HuBERT
+semantic codes + refer spec) depends only on (ref_audio, ref_text,
+prompt_lang, version) — recomputing per synthesis is the dominant fixed
+cost of repeated inference, so results cache on disk.
 
-Cache layout (one JSON + one npz per key, atomic tmp-rename writes):
-    <cache_dir>/prompt/<key>.json   {"meta": ...}   — human-readable, hit check
-    <cache_dir>/prompt/<key>.npz    arrays
-
-The key is sha256 over: path basename, file size, int(mtime * 1000),
-ref_text, prompt_lang, version, format tag. (mtime+size is the standard
-cheap proxy; the file content itself is NOT hashed — use clear() or a new
-cache_dir when a reference file changes in place within the same millisecond
-and identical size.)
-
-The frontend cache stores phones/bert; the audio-side artifacts
-(prompt_semantic codes, refer spec) are cached by the caller with the same
-helper (`cached_call`), because their computation needs the models.
-
-All functions are stdlib-only and safe to import without mlx/official deps
-(loading happens only when the caller evaluates the returned payloads).
+Layout: <cache_dir>/prompt/<key>.json (meta, hit check) + <key>.npz
+(arrays), atomic tmp-rename writes. Key = sha256(path basename, file
+size, int(mtime*1000), ref_text, prompt_lang, version, format tag) —
+mtime+size is the cheap proxy; file content is NOT hashed (clear() or a
+new cache_dir when a file changes in place within the same ms and size).
+Stdlib-only imports; payload loading deferred to the caller.
 """
 
 from __future__ import annotations
