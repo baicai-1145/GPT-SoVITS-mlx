@@ -2,53 +2,10 @@
 """MLX preprocessing pipeline: GPT-SoVITS prepare_datasets equivalent.
 
 Reproduces the official dataset preparation (cuda_graph repo
-GPT_SoVITS/prepare_datasets/{1-get-text, 2-get-hubert-wav32k, 2-get-sv,
-3-get-semantic}.py) producing the EXACT same exp_dir layout downstream
-training consumes:
-
-    <exp_dir>/2-name2text.txt          name\tphones\tword2ph\tnorm_text
-    <exp_dir>/3-bert/<name>.npy        (1024, T) fp32 zh bert feature
-                                       (official: torch .pt fp16; npy keeps
-                                       this repo torch-free — loader in the
-                                       s1 dataloader handles it)
-    <exp_dir>/4-cnhubert/<name>.npy    (1, 768, T) fp16 ssl feature
-    <exp_dir>/5-wav32k/<name>.wav      32 kHz int16 (bit-equal to official)
-    <exp_dir>/7-sv_cn/<name>.npy       (1, 20480) fp32 sv embedding (Pro only)
-    <exp_dir>/6-name2semantic.tsv      header + name\tcodes lines
-
-Semantic notes (parity documented in docs/PARITY_NOTES.md and
-tests/test_prepare_data.py):
-* 2-name2text word2ph: official writes the python list repr ("[2, 2, 1]");
-  non-zh lines have the literal "None". We write the same repr.
-* stage-1 bert gate is zh-only. Run with GSOVITS_FRONTEND_F32=1 and
-  GSOVITS_G2PW_FP16=0 for TRAINING data (fp32 BERT max-abs 1.1e-4 vs
-  transformers fp32 CPU; fp16 G2PW flips polyphones on ~8% of corpus
-  lines — measured 2/24 on the gate set; fp16 BERT adds ~5e-2).
-  Known front-end gap: our vendored CPUFast chinese2 (torch g2pw.pth)
-  vs the cuda_graph training repo's ONNX g2pW disagree on ~1/24 corpus
-  lines (e.g. 不得了 le5/liao3, 什么 sh en2/ir2) — an ONNX-vs-torch
-  model difference inside the official repos themselves, NOT an MLX
-  bug; our fp32 output is byte-identical to CPUFast torch clean_text.
-* stage-2 replicates the official load_audio ffmpeg CLI decode (f32le),
-  the 0.95/0.5 amplitude quirks, librosa soxr_hq 32k->16k resample
-  (librosa 1.0.0 + soxr; bit-equal to the base venv), HuBERT fp16-saved
-  ssl (fp32 compute, max-abs 1.4e-4 vs torch fp32), scipy-wavfile-equal
-  int16 wav32k (md5-verified 24/24), NaN-check + skip like official.
-* stage-2b sv reads 5-wav32k/<name>.wav, torchaudio sinc_interp_hann
-  Resample (numpy port gsovits_mlx/audio_resample.py, 1.8e-7 vs
-  torchaudio — NOT soxr, which differs at 5e-2), kaldi fbank +
-  ERes2NetV2 forward3 fp32 (embedding max 2.2e-4, fbank-dominated:
-  fbank itself is the documented 4.1e-4 numpy-vs-torchaudio parity;
-  network alone 5.7e-6).
-* stage-3 ssl_proj + quantizer argmin computed in fp32 on the fp16 ssl
-  (upcast weights). Reason: the expand-form L2 (||x||²+||e||²-2xe) in
-  fp16 suffers catastrophic cancellation (~10 distance error at |d|~700)
-  flipping argmin on sub-0.5 margins — 24/2915 frames measured vs torch
-  fp32. fp32 diff-form matches torch fp32 codes EXACTLY (24/24 files,
-  2915/2915 frames, both v1 and v2 weights). Official CUDA is_half runs
-  carry the same fp16 cancellation with a different rounding pattern
-  (not bit-replicable on MLX); cross-input end-to-end (each pipeline's
-  own HuBERT output): 23/24 files exact, 1 frame in 2915.
+GPT_SoVITS/prepare_datasets/*) producing the exact exp_dir layout the
+trainers consume (2-name2text / 3-bert / 4-cnhubert / 5-wav32k /
+6-name2semantic.tsv / 7-sv_cn). Per-stage parity evidence and semantic
+notes: docs/PARITY_NOTES.md §prepare_data; gates: tests/test_prepare_data.py.
 
 Usage:
     python tools/prepare_data.py --list file --wav-dir dir --exp-dir out \
@@ -56,15 +13,11 @@ Usage:
         [--parts N --part i] [--stages all|text,hubert,sv,semantic,merge] \
         [--timing-json out.json]
 
-Recommended training run (parity settings):
-    GSOVITS_G2PW_FP16=0 GSOVITS_FRONTEND_F32=1 \
-    python tools/prepare_data.py --list wavtest.list --wav-dir wavtest \
-        --exp-dir .tmp/train_data/exp --version v2 --stages all
-
-GPU: stages text/hubert/sv/semantic use MLX (Metal) under the shared
-.tmp/gpu.lock.d discipline (AGENTS.md); the tool resolves the device once
-and refuses GPU-less audio/semantic stages (front-end-only CPU smoke is
-legal via GSOVITS_FRONTEND_DEVICE=cpu GSOVITS_PREP_CPU=1).
+Training data MUST use the parity env: GSOVITS_G2PW_FP16=0
+GSOVITS_FRONTEND_F32=1 (fp16 G2PW flips ~8% of polyphones; measured in
+PARITY_NOTES §prepare_data). GPU stages run under .tmp/gpu.lock.d
+(AGENTS.md); CPU-only frontend smoke via GSOVITS_FRONTEND_DEVICE=cpu
+GSOVITS_PREP_CPU=1.
 """
 
 from __future__ import annotations

@@ -1,53 +1,16 @@
-"""s2 v3/v4/v5 training data pipeline (module/data_utils.py V3/V4 in MLX).
+"""s2 v3/v4/v5 training data pipeline (official module/data_utils.py
+V3/V4 in MLX).
 
-Official semantics ported:
-
-* TextAudioSpeakerLoaderV3 / V4 (module/data_utils.py L279/L517):
-  reads ``<exp_dir>/2-name2text.txt`` (name\tphones\tword2ph\tnorm_text),
-  intersects names with ``4-cnhubert/<name>.pt|.npy`` and ``5-wav32k/<name>``,
-  repeats the list when < 100 items (max(2, 100//n) times), shuffles with
-  ``random.seed(1234)``, converts phones via cleaned_text_to_sequence with
-  the GLOBAL ``version`` env (official module/data_utils.py L13; the webui
-  exports it before spawning s2_train_v3_lora), filters 0.6s < dur < 54s by
-  ``os.path.getsize(wav32k) / 32000 / 2``.
-* V3 audio: spec32k = spectrogram_torch(2048/640/2048, center=False) on the
-  wav32k samples; mel = 100-mel(24k ffmpeg-resampled audio, 1024/256/1024,
-  center=False) normalized (x+12)/14*2-1. ssl padded by ONE replicate frame
-  when ssl.shape[-1] != spec.shape[-1].
-* V4 audio: spec32k same; mel = 100-mel(32k audio, 1280/320/1280,
-  center=False), same norm. (v5 family trains with the V4 loader —
-  TextAudioSpeakerLoader selection is `V3 if version == "v3" else V4`.)
-* CollateV3: sort batch by spec len descending; max_ssl_len1 = 8*((max+8)//8)
-  i.e. 8*((max//8)+1); max_ssl_len = 2*((max//2)+1); max_spec_len =
-  2*((max//2)+1); max_mel_len = int(max_ssl_len1 * 1.25 * 1.5); mel row width
-  max_mel_len.
-* CollateV4: max_ssl_len = 2*((max//2)+1); max_spec_len = 2*((max//2)+1);
-  mel row width max_spec_len*2.
-
-CFM-trainer additions (memory optimization, OFF by default):
-
-* ``quantize_pad_multiple``: pad widths rounded up to a multiple of 64
-  frames (opt-in; ``--pad-multiple 64`` in tools/train_s2_v3.py). Extra pad
-  columns are zeros beyond every length, so all masked loss slices
-  (x_lens/mel_lengths bounded) and the y_mask/x_mask-aware trunk are
-  unchanged; quantizing the collated widths recycles a small set of Metal
-  buffer sizes instead of growing the allocator cache with every distinct
-  length (5.8GB cache on a 1GB live set, measured 2026-10-09).
-* ``LengthBucketSampler``: official DistributedBucketSampler semantics for
-  the CFM loader (boundary buckets on the spec-length proxy, per-bucket
-  pad-to-batch-multiple, seeded per-epoch in-bucket shuffle + batch-order
-  shuffle) — the pattern the official s2_train_v3_lora.py itself uses.
-  Opt-in via ``--length-buckets``; the default loader order (seed-1234 flat
-  shuffle) is the official V3/V4 loader semantics and stays untouched.
-
-The 24k ffmpeg resample replicates tools/my_utils.load_audio: ``ffmpeg -i in
--f f32le -acodec pcm_f32le -ac 1 -ar 24000 -`` (bit-parity matters for the
-mel target; the loader caches nothing and streams ffmpeg stdout).
-
-Phone id sequences come from the vendored official cleaner
-(gsovits_mlx.text.vendored_cpufront) — the same cleaned_text_to_sequence the
-official data_utils imports, evaluated in OUR process against the CPUFast
-checkout (read-only).
+V3/V4 loader + collate semantics (global ``version`` env for the phone
+symbol table, <100-file repeat loop, seed-1234 order shuffle, duration
+filter, per-family spec/mel front-ends and pad formulas) and the
+CFM-trainer memory additions (pad-multiple quantization and
+LengthBucketSampler — opt-in, OFF by default; official loader order is
+the default) are documented in docs/PARITY_NOTES.md §s2 data pipeline
+semantics and §s2 CFM trainer port details. The 24k ffmpeg f32le CLI
+resample (bit-parity for the mel target) and the vendored
+cleaned_text_to_sequence (CPUFast checkout, read-only) match official
+my_utils/data_utils exactly.
 """
 
 from __future__ import annotations

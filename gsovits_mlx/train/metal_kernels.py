@@ -1,61 +1,30 @@
 """Fused Metal kernels for the s2 GAN trainer (mx.fast.metal_kernel).
 
-STEP-1 profile census (bc_fix_d, v2 b3, 5 steps, CPU-side dispatch count,
-.py instrumentation; binary `+`/`*` operator dispatches NOT countable from
-Python and are folded in analytically at the site level):
+Three fusion families (bias+LeakyReLU tails, WN effective-weight scale,
+WN tanh*sigmoid gating), wired behind --metal-kernels (default OFF).
+Step-1 dispatch census, ranked-pattern rationale, measured micro-bench
+numbers, and the honest e2e verdict (+3.7%, order-alternating A/B):
+docs/TRAINING.md §metal kernels.
 
-  per step (counts/5):  transpose 1682 | sum 1367 | sqrt 1359 | pad 592 |
-  conv1d 540 | conv2d 120 | zeros_like 370 | leaky_relu 316 | maximum 346 |
-  tanh 70 + sigmoid 68 (WN gating) | mean 56 | astype ~large (uncountable) |
+Numerics: fp32 bit-exact where op order is preserved (lrelu chain);
+documented <=1e-6 rel where the GPU reduction order cannot match MLX's
+tree sum (weight-norm row sum R>~1k: measured max rel 2.0e-6, in tests).
+All primals run under mx.custom_function with Metal/MLX vjps so mx.grad
+flows (a raw metal_kernel call is opaque to the autodiff graph).
 
-Ranked fusable patterns (dispatch + bytes moved):
+Kernel law (mlx #4534): grid= is TOTAL THREAD COUNT. Use grid=(N,1,1),
+threadgroup=(256,1,1), guard elem<N. Every kernel is probed with a
+full-coverage write test AND parity vs the op chain before any benchmark
+(tests/test_metal_kernels.py).
 
-  #1 bias+LeakyReLU tails — every D conv (S:6+1, P:5+1 x5 periods) and the
-     HiFi-GAN dec resblock chain. Conv output is (B,T,C) there, so the
-     chain is transpose + astype + add(bias) + leaky_relu = 4 dispatches,
-     4 full-tensor memory passes (activations up to (3,1024,20480) fp32 =
-     251 MB) -> ONE elementwise kernel, 1 read + 1 write. Lead-validated
-     4.4x on the 6144x2048 shape, bit-exact.
-
-  #2 weight-norm effective weight w = g*v/||v|| (per-out-channel): every
-     WN conv in enc_q (17) + flow (4x7) + HiFi-GAN dec (34) + every D conv
-     (S 7 + P 36) ~= ~120 convs per forward; the chain is astype+mul+mul+
-     sum+sqrt+div (+astype) ~= 6 dispatches on the WEIGHT tensors, recomputed
-     in forward AND backward (mx.grad re-runs it) -> ONE kernel per conv.
-     Weight tensors are small (384x5x192=369k elem max) so this is a
-     dispatch-count kill, not a bandwidth kill.
-
-  #3 WN gating tanh*sigmoid (fused_add_tanh_sigmoid_multiply): in_act =
-     a+b then tanh(half)*sigmoid(half) over (B,2H,T) fp32 at the trunk
-     width (960): 340 tanh + 328 sigmoid + ~700 binary-op dispatches/step
-     across enc_q/flow; chain = add + tanh + sigmoid + multiply = 4
-     dispatches, 4 passes over big activations -> ONE elementwise kernel.
-
-Numerics policy per mission: fp32 bit-exact vs the replaced MLX op chain
-where the op ORDER is preserved (lrelu chain); documented <=1e-6 rel where
-the GPU reduction order cannot match MLX's tree sum (weight-norm row sum
-for R>~1k: measured max rel 2.0e-6 on dec.ups k16; documented in tests).
-All three primals run under mx.custom_function with Metal/MLX vjps so
-mx.grad flows (a raw metal_kernel call is opaque to the autodiff graph).
-
-Kernel law (lead's lesson, mlx #4534): grid= is TOTAL THREAD COUNT. Use
-grid=(N,1,1), threadgroup=(256,1,1), guard elem<N. Every kernel is
-probed with a full-coverage write test AND parity vs the op chain before
-any benchmark (tests/test_metal_kernels.py).
-
-mx 0.32.2 metal_kernel conventions (probed, see tests):
-  - source is the function BODY only; the wrapper emits the kernel shell
-    with one `const constant T* <input_name> [[buffer(i)]]` per input and
-    `device T* <output_name> [[buffer(j)]]` per output, plus
-    uint3 thread_position_in_grid. Use thread_position_in_grid.x.
-  - inputs are flattened ROW-MAJOR contiguous views (ensure_row_contiguous
-    default); a (B,C,T) tensor's element e maps to channel c = (e // T) % C.
-  - template=[("T", dtype)] instantiates one typename for ALL T-typed
-    params; template names must not collide with input names.
-  - scalars: pass python ints/floats in inputs= (they specialize the
-    kernel hash) or bake via string substitution (compile-time constant).
-  - mx.custom_function vjp args convention (probed): for a 1-input primal,
-    vjp(x, cot, out); for >1 inputs, vjp((x1, x2, ...), cot, out).
+mx 0.32.2 metal_kernel conventions (probed, see tests): source is the
+function BODY only; inputs arrive as flattened ROW-MAJOR contiguous
+buffers (a (B,C,T) element e: channel c = (e // T) % C); template=
+[("T", dtype)] shares one typename across T-typed params (must not
+collide with input names); scalars via inputs= (kernel-hash
+specialization) or string substitution (compile-time constant);
+mx.custom_function vjp args: 1-input vjp(x, cot, out), multi-input
+vjp((x1, x2, ...), cot, out).
 """
 from __future__ import annotations
 

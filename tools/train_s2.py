@@ -1,77 +1,20 @@
 """s2 (SoVITS) GAN training driver — MLX port of official s2_train.py.
 
-Usage (single process; the official multi-GPU DDP path collapses to
-num_replicas=1 here):
+Single process (official multi-GPU DDP collapses to num_replicas=1).
+One-time npz extraction: `tools/train_s2_extract.py --version V --out
+.tmp/train_s2`. Full optimizer/scaler/RNG semantics, g-forward mode
+contract, deviations and precision guidance: docs/PARITY_NOTES.md
+§s2 training addendum; incidents: docs/INCIDENTS.md#fp16-scaler-collapse.
 
-  # one-time checkpoint extraction (base venv, torch):
-  /Users/baicai1145/.venvs/base/bin/python tools/train_s2_extract.py \
-      --version v2 --out .tmp/train_s2
+Quick reference:
+  python tools/train_s2.py --version v2 --exp-dir <dir> \
+      --train-npz .tmp/train_s2/s2G_v2.npz [--disc-npz ...] \
+      --out .tmp/train_s2/run --epochs 10 --batch-size 3
+  --g-forward {single,double} | --precision {fp32,fp16,bf16} |
+  --fixed-shape --metal-kernels (see docs/TRAINING.md §reference configs)
 
-  # training run (repo venv, GPU behind the lock):
-  python tools/train_s2.py --version v2 \
-      --exp-dir <exp_dir from tools/prepare_data.py> \
-      --train-npz .tmp/train_s2/s2G_v2.npz \
-      [--disc-npz .tmp/train_s2/s2D_v2.npz] \
-      --out .tmp/train_s2/run_v2 --steps 200 --batch-size 6
-
-Semantics (official s2_train.py, verified line-by-line):
-  * AdamW G: 4 param groups — base lr 1e-4; text_embedding / encoder_text /
-    mrte each at lr*0.4 (text_low_lr_rate); betas (0.8, 0.99), eps 1e-9,
-    weight_decay 0.01 (torch default).
-  * AdamW D: single group, same hyperparams.
-  * SHARED GradScaler: D step scales+steps on the pre-update scale;
-    scaler.update() runs ONLY after the G step.
-  * ExponentialLR gamma=0.999875 stepped once per epoch.
-  * clip_grad_value_(None): NO-OP on grads (official commons only clamps
-    when clip_value is not None); we compute the grad norm for logging.
-  * freeze_quantizer=True: ssl_proj + quantizer excluded from optimizers
-    (official no_grad+eval); quantizer runs fp32 outside the low-precision
-    graph.
-  * fp16 autocast for the G forward; fp32 losses (mel/kl/fm/gen).
-
-G-forward modes (--g-forward):
-  * single (default): ONE G forward per step inside ONE traced
-    value_and_grad over (d16, p16) jointly — official torch structure
-    (official runs net_g() once and reuses y_hat: net_d(y, y_hat.detach())
-    for D, net_d(y, y_hat) for G). The D branch sees y_hat through
-    stop_gradient (grad-free, like .detach()); the G branch sees D weights
-    through stop_gradient (D as constants). Both losses + the 5 loss parts
-    come back as the aux output of the single trace. Official RNG
-    semantics: ONE rand_slice_segments draw + ONE posterior-noise draw per
-    step, shared by both branches.
-  * double (legacy): the pre-optimization structure — separate D-step and
-    G-step traces, each with its OWN G forward. Matches the old behavior
-    except the RNG: both forwards now use the SAME key (official
-    single-draw semantics; the legacy code drew kd/kg separately, an
-    undocumented deviation). --double-split-draw restores the exact legacy
-    RNG (different draws per forward) for A/B.
-
-Deviations (documented, unavoidable or measured):
-  * G-step D forward uses the PRE-update D weights (official torch
-    sequential-overlap artifact: net_d.step() has updated the .data of the
-    same tensors the G-step forward reads; MLX traced grads need frozen
-    inputs, so the G step sees the pre-step D). Measured immaterial on
-    200-step smokes; kept identical across all modes/precisions here.
-  * DDP gradient averaging absent (single process).
-  * Bucket sampler randperm: numpy PCG64, not torch Philox (s2_data.py).
-  * v1/v2 have NO pretrained s2D on this machine (checked /Volumes/2T
-    .../pretrained_models and the whole repo tree): D inits fresh for
-    v1/v2; v2Pro/ProPlus load s2Dv2Pro*.pth.
-
-Precision (--precision):
-  * fp32: no autocast, no GradScaler (official s2 config default,
-    fp16_run=false). fp16 is proven unstable here: KL exp(-2*logs_p)
-    overflows fp16 range and the scaler collapses (scale 1e-56 in the v2
-    smoke); use fp32.
-  * fp16: autocast+GradScaler (official fp16_run=True semantics).
-    Retained for reproducibility; unstable (see above).
-  * bf16: bf16 G/D compute graph, fp32 loss heads (mel/kl/fm/gen cast to
-    fp32 at entry — KL's exp(-2*logs_p) is evaluated in fp32; bf16 shares
-    fp32's exponent range so the fp16 overflow mode cannot occur), fp32
-    masters/optimizer, GradScaler bypassed (CFM precedent: bf16 needs no
-    scaler). Frozen fp32 exemptions kept: ssl_proj/quantizer (frozen32) and
-    sv_emb/ge_to512/prelu (v2Pro export policy). OPT-IN; fp32 stays the
-    default.
+Use fp32 (default). fp16 collapses the GradScaler on KL overflow
+(INCIDENTS#fp16-scaler-collapse). bf16 is opt-in.
 """
 
 from __future__ import annotations

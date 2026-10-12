@@ -301,3 +301,18 @@ T~300-1000 does not — inverting s1's finding.
   measurement doctrine).
 - **Hash-seed the loaders** for any cross-run loss comparison
   (PYTHONHASHSEED=0; §1).
+
+### Step-1 dispatch census + fusion rationale (from metal_kernels.py)
+
+Per-step CPU-side census (bc_fix_d, v2 b3, 5 steps): transpose 1682 |
+sum 1367 | sqrt 1359 | pad 592 | conv1d 540 | conv2d 120 | zeros_like
+370 | leaky_relu 316 | maximum 346 | tanh 70 + sigmoid 68 (WN gating) |
+mean 56 | astype ~large (uncountable; folded analytically). Ranked
+fusable patterns: #1 bias+LeakyReLU tails (D convs + dec resblocks:
+transpose+astype+add+leaky = 4 dispatches, 4 full-tensor passes, up to
+(3,1024,20480) fp32 = 251MB → ONE kernel, 1 read + 1 write);
+#2 WN effective weight g*v/||v|| (~120 convs/fwd across enc_q 17,
+flow 4x7, dec 34, D 43; astype+mul+mul+sum+sqrt+div = 6 dispatches on
+small weight tensors, recomputed fwd AND bwd → ONE kernel; dispatch-count
+kill, not bandwidth); #3 WN gating tanh*sigmoid (340 tanh + 328 sigmoid +
+~700 binary ops at trunk width → ONE kernel, 3 reads + 1 write).

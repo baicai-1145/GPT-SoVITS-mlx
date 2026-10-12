@@ -1,53 +1,13 @@
 """s2 (SoVITS v1/v2/v2Pro/v2ProPlus) training data pipeline.
 
-Port of GPT-SoVITS module/data_utils.py TextAudioSpeakerLoader /
-TextAudioSpeakerCollate / DistributedBucketSampler (single-process; the
-official num_replicas=1 CPU case) reading the exp_dir produced by
-tools/prepare_data.py (task-2 layout: .npy feature files instead of torch .pt).
-
-GAN-trainer memory additions (this port, OFF by default — see
-pad_multiple/fixed_widths below; --pad-multiple / --fixed-shape in
-tools/train_s2.py): quantized or fully-fixed collated widths recycle a
-small set of Metal buffer sizes instead of fragmenting the allocator
-cache with ~1 distinct width per batch (measured 83 distinct spec widths
-in 120 b3 batches of the 939-item exp set). Extra pad is zero columns
-beyond every *_lengths entry; all loss/mask consumption paths are
-length-bounded (y_mask/x_mask from sequence_mask, kl summed under z_mask,
-segment slices in-bounds), so losses are pad-neutral EXCEPT the posterior
-randn draw, whose width follows the padded shape exactly like official
-torch (torch.randn over the padded tensor) — fixed/quantized widths shift
-the draw in the SAME way official torch pads do; NOT a semantic deviation.
-
-Semantics replicated exactly (verified against the official source):
-  * dataset construction: intersect 2-name2text ∩ 4-cnhubert ∩ 5-wav32k
-    (+7-sv_cn for Pro), the <100-file duplication loop, random.seed(1234)
-    shuffle of the ORDER (python stdlib — bit-exact across implementations),
-    duration filter 0.6 < d < 54 via file size / (32000*2), lengths =
-    size // (2*hop).
-  * __getitem__: load 32 kHz wav (int16 PCM from the prep pipeline) ->
-    float32 /32768; spectrogram via the MLX stft front-end (hann periodic,
-    reflect pad (n_fft-hop)/2, center=False — parity-tested vs torch);
-    ssl .npy load with F.pad(ssl, (0,1), "replicate") when the ssl frame
-    count != spec frame count (official quirk).
-  * collate: ids sorted by spec_len DESC (stable), max_ssl_len =
-    2*((max//2)+1), max_spec_len likewise, zero-pad everything.
-  * bucket sampler: boundaries [32,300,...,1900], per-bucket repeat to a
-    multiple of batch_size, in-bucket sequential batches, batch-level shuffle.
-    RNG: the official torch.randperm(generator=Philox(seed=epoch)) is NOT
-    bit-reproducible outside torch; we use numpy default_rng(epoch) and
-    DOCUMENT the divergence (see BUCKET RNG note below).
-
-BUCKET RNG note (deviation from official):
-    torch.Generator with manual_seed(epoch) produces a Philox counter stream;
-    numpy's PCG64 stream differs. Batch ORDER and the repeated-id tail
-    composition therefore differ from a torch run at the same epoch. This is
-    unavoidable without reimplementing Philox; the sampler is still
-    deterministic per epoch (same epoch -> same batches on this
-    implementation), every sample appears in exactly one batch, and the
-    dataset-level shuffle (seed 1234, stdlib random) IS bit-exact with the
-    official code. Real official runs also reshuffle per-process (list(set())
-    ordering is PYTHONHASHSEED-dependent), so batch composition is not a
-    parity target in the first place.
+Port of official module/data_utils.py TextAudioSpeakerLoader /
+Collate / DistributedBucketSampler (num_replicas=1) reading the exp_dir
+from tools/prepare_data.py. Full construction/getitem/collate/sampler
+semantics and the bucket-RNG deviation: docs/PARITY_NOTES.md §s2 training
+addendum; pad-neutrality proof for the memory additions (pad_multiple /
+fixed widths — opt-in, OFF by default): docs/TRAINING.md §fixed-shape
+(posterior randn width follows the padded shape exactly like official
+torch padding — not a semantic deviation).
 """
 
 from __future__ import annotations

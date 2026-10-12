@@ -497,3 +497,130 @@ Four findings, all merged:
    hunts across seeds incl. CLI-seed parity — suspected rare draw ×
    post-optimizer weight-state interaction, unproven. Two failing
    batches archived as npz under the task worktree for bisection.
+
+## prepare_data pipeline parity (moved from tools/prepare_data.py docstring)
+
+* 2-name2text word2ph: official list repr ("[2, 2, 1]"); non-zh lines
+  literal "None". Parity env for TRAINING data: GSOVITS_FRONTEND_F32=1,
+  GSOVITS_G2PW_FP16=0 (fp32 BERT 1.1e-4 vs transformers CPU; fp16 G2PW
+  flips polyphones ~8% of corpus lines — 2/24 measured; fp16 BERT +5e-2).
+  Known front-end gap: vendored CPUFast chinese2 (torch g2pw.pth) vs
+  cuda_graph ONNX g2pW disagree on ~1/24 lines (ONNX-vs-torch model
+  difference inside the official repos, not an MLX bug).
+* stage-2: ffmpeg f32le decode, 0.95/0.5 amplitude quirks, librosa
+  soxr_hq resample (bit-equal), HuBERT fp16-saved ssl (fp32 compute,
+  1.4e-4), scipy-equal int16 wav32k (md5 24/24), NaN skip like official.
+* stage-2b sv: torchaudio sinc_interp_hann numpy port
+  (gsovits_mlx/audio_resample.py, 1.8e-7 — NOT soxr, 5e-2). fbank +
+  ERes2NetV2 details: §v2Pro/v2ProPlus addendum above.
+* stage-3 quantizer argmin in fp32 on the fp16 ssl: expand-form L2 in
+  fp16 has catastrophic cancellation (~10 distance error at |d|~700)
+  flipping argmin on sub-0.5 margins (24/2915 frames). fp32 diff-form
+  matches torch exactly (24/24 files, 2915/2915 frames, v1+v2 weights).
+
+## s2 GAN trainer contract (moved from tools/train_s2.py docstring)
+
+* AdamW G: 4 param groups — base lr 1e-4; text_embedding/encoder_text/
+  mrte at lr*0.4 (text_low_lr_rate); betas (0.8, 0.99), eps 1e-9, wd 0.01.
+  AdamW D: single group, same hyperparams. SHARED GradScaler: D step
+  scales+steps on the pre-update scale; scaler.update() ONLY after G step.
+  ExponentialLR gamma=0.999875 per epoch. clip_grad_value_(None) is a
+  NO-OP (official commons clamps only when clip_value non-None).
+* freeze_quantizer=True: ssl_proj+quantizer excluded from optimizers;
+  quantizer fp32 outside the low-precision graph. fp16 autocast for G
+  forward; fp32 losses (mel/kl/fm/gen).
+* --g-forward single (default): ONE G forward per step in ONE traced
+  value_and_grad — official torch structure (net_g() once, y_hat reused:
+  D sees detach(), G sees D as constants). ONE rand_slice_segments +
+  ONE posterior-noise draw per step, shared by both branches.
+  double (legacy): separate D/G-step traces, each its own G forward,
+  SAME RNG key (official single-draw); --double-split-draw restores the
+  legacy split-draw deviation for A/B.
+* Deviations: G-step D forward reads PRE-update D weights (MLX traced
+  grads need frozen inputs; official torch sequential-overlap reads the
+  updated .data — measured immaterial on 200-step smokes); DDP grad
+  averaging absent; bucket sampler randperm numpy PCG64 not torch
+  Philox; v1/v2 have no pretrained s2D on this machine (D inits fresh;
+  v2Pro/ProPlus load s2Dv2Pro).
+* Precision: fp32 default (official fp16_run=false). fp16 unstable —
+  KL exp overflow collapses the scaler (INCIDENTS#fp16-scaler-collapse).
+  bf16 opt-in: bf16 G/D graph, fp32 loss heads, fp32 masters, no scaler.
+
+## s2 data pipeline semantics (moved from gsovits_mlx/train/s2_data.py)
+
+* Construction: intersect 2-name2text ∩ 4-cnhubert ∩ 5-wav32k (+7-sv_cn
+  Pro), <100-file duplication loop, random.seed(1234) ORDER shuffle
+  (stdlib — bit-exact), duration filter 0.6<d<54 via size/(32000*2),
+  lengths = size // (2*hop).
+* __getitem__: int16 wav → fp32 /32768; MLX stft front-end (hann
+  periodic, reflect pad (n_fft-hop)/2, center=False — parity-tested);
+  ssl .npy with F.pad(...,(0,1),"replicate") when frame counts differ
+  (official quirk). Collate: sort by spec_len DESC (stable), max lens
+  2*((max//2)+1), zero-pad.
+* Bucket sampler: boundaries [32,300,...,1900], per-bucket repeat to
+  batch multiple, in-bucket sequential, batch-level shuffle. RNG
+  DEVIATION: torch Philox(seed=epoch) not bit-reproducible outside torch;
+  numpy default_rng(epoch) — deterministic per epoch here, but batch
+  order/tail composition differ from torch. Dataset-level shuffle IS
+  bit-exact. Real official runs reshuffle per-process anyway
+  (PYTHONHASHSEED-dependent list(set()) ordering) — batch composition is
+  not a parity target.
+* Pad-neutrality of pad_multiple/fixed widths (opt-in memory feature):
+  extra pad is zero columns beyond *_lengths; all loss/mask paths
+  length-bounded; the posterior randn draw follows the padded shape
+  exactly like official torch padding — not a semantic deviation
+  (proof: docs/TRAINING.md §fixed-shape; measured 83 distinct spec
+  widths in 120 b3 batches motivated the feature).
+
+## s2 CFM trainer port details (moved from gsovits_mlx/train/s2_cfm.py)
+
+Reference (READ-ONLY): cuda_graph repo. Line anchors at port time:
+* SynthesizerTrnV3.forward L1305-1333: fp32 island — y_mask; ge =
+  ref_enc(y[:,:704]*y_mask, y_mask); freeze_quantizer=True runs
+  ssl_proj+quantizer+enc_p under no_grad (enc_p frozen too, __init__
+  L1300-1303); quantized nearest x2; bridge (Conv1d+LeakyReLU 0.01);
+  nearest interp x1.875 (v3) / x2 (v4/v5); wns1 Encoder(512,512,512,
+  k5,d1,L8) with ge at mel_lengths; prompt_len = floor(rand(B) *
+  mel_lengths*2/3); mel/fea truncated to min; CFM loss.
+* CFM.forward L1174-1207: per-sample t~U(0,1), x0~N(0,1), vt=x1-x0,
+  xt=x0+t*vt; prompt zeroing; 30% two-step branch (python random.random()
+  < 0.3; base = torch.randint(2, 8, (b,)) — HIGH IS EXCLUSIVE, bases in
+  [2,8); d=2^-base; d_input masked <1e-2→0; v1/v2 DETACHED; vt=(v1+v2)/2
+  detached; dt=2*d); final estimator call WITH grad; loss = mean over ALL
+  elements of MSE over the prompt_i:mel_len_i slice (torch MSELoss
+  semantics).
+* DiT training forward (f5_tts dit.py non-infer path): text_embed+pos →
+  InputEmbedding(x, cond=prompt) → blocks (AdaLN from t + d_embed(dt)
+  when use_step_embedding) → norm_out → proj_out. Head-0-only RoPE and
+  trailing mask multiply are checkpoint-family quirks already in
+  gsovits_mlx/sovits/dit.py (inference-verified).
+* v5 upstream-broken finding: official v5 s2 training TypeErrors —
+  webui.py L1498 Radio has no v5 choices and SynthesizerTrnV3.__init__
+  L1295-1299 swaps self.cfm for the inference-only CFMV5. v5's estimator
+  DiT is identical (use_step_embedding=False), so this trainer runs
+  v5dev/v5turbo on the plain CFM path.
+* LoRA: rank-32 on every Attention to_k/to_q/to_v/to_out.0 (official peft
+  targets, alpha=r → scaling 1.0); x@W.T + b + (x@A.T)@B.T; base DiT
+  frozen; trunk (ref_enc/bridge/wns1/linear_mel) fully trainable; peft
+  wraps ONLY net_g.cfm.
+
+## s2 v3/v4/v5 data pipeline semantics (moved from s2_v3_data.py)
+
+* LoaderV3/V4 (official data_utils.py L279/L517): global ``version`` env
+  drives cleaned_text_to_sequence (webui exports it before spawning
+  s2_train_v3_lora); <100-file repeat max(2,100//n); seed-1234 order
+  shuffle; duration filter getsize/32000/2.
+* V3 audio: spec32k = spectrogram_torch(2048/640/2048, center=False);
+  mel = 100-mel(24k ffmpeg audio, 1024/256/1024, center=False) normalized
+  (x+12)/14*2-1; ssl +1 replicate frame on frame-count mismatch.
+  V4: mel = 100-mel(32k, 1280/320/1280, center=False). v5 family uses
+  the V4 loader (`V3 if version=="v3" else V4`).
+* CollateV3: sort spec-len DESC; max_ssl_len1 = 8*((max+8)//8);
+  max_ssl_len = max_spec_len = 2*((max//2)+1); max_mel_len =
+  int(max_ssl_len1*1.25*1.5). CollateV4: mel row width = max_spec_len*2.
+* Memory additions (opt-in, OFF by default): quantize_pad_multiple pads
+  to 64-frame multiples (zeros beyond lengths; masked losses unchanged;
+  recycles Metal buffer sizes — 5.8GB cache → small set, measured
+  2026-10-09); LengthBucketSampler = official bucket semantics
+  (boundary buckets, pad-to-batch-multiple, per-epoch shuffles), opt-in
+  via --length-buckets; default loader order stays official.

@@ -1,53 +1,17 @@
 """s2 CFM training (SynthesizerTrnV3.forward + CFM.forward port) in MLX.
 
-Ports, from the official cuda_graph repo (READ-ONLY reference
-/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-cuda_graph_accel_v5):
+Ports the official cuda_graph repo's training forward (fp32 island:
+ref_enc ge, frozen ssl_proj/quantizer/enc_p, bridge + wns1 trunk;
+CFM loss with per-sample t/x0/vt, prompt zeroing, the 30% two-step
+branch with exclusive-high torch.randint bases, and detached v1/v2
+calls), plus the LoRA layout (rank-32 on every Attention projection,
+frozen base DiT, trunk fully trainable — official peft semantics).
 
-* ``module/models.py SynthesizerTrnV3.forward`` (L1305-1333): fp32 island —
-  y_mask -> ge = ref_enc(y[:, :704] * y_mask, y_mask); freeze_quantizer=True
-  path runs ssl_proj + quantizer + enc_p under no_grad (enc_p IS frozen too:
-  __init__ L1300-1303 set_no_grad(ssl_proj)/set_no_grad(quantizer)/
-  set_no_grad(enc_p)); quantized nearest x2; fea = bridge(x) (Sequential
-  Conv1d + nn.LeakyReLU() -> negative_slope 0.01) -> nearest interp x1.875
-  (v3) / x2 (v4/v5) -> wns1 Encoder(512,512,512,k5,d1,L8) with ge at
-  mel_lengths; prompt_len = floor(rand(B) * mel_lengths*2/3); mel/fea
-  truncated to min length; CFM loss.
-* ``module/models.py CFM.forward`` (L1174-1207): per-sample t~U(0,1),
-  x0~N(0,1), vt = x1-x0, xt = x0 + t*vt; prompt zeroing per sample; the 30%
-  two-step branch (python ``random.random() < 0.3``; base = torch.randint(
-  2, 8, (b,)) — NOTE torch.randint's high is EXCLUSIVE so per-sample bases
-  are integers in [2, 8); d = 2^-base; d_input = d masked <1e-2 -> 0;
-  v1/v2 estimator calls DETACHED (no_grad); vt = (v1+v2)/2 detached;
-  dt = 2*d); final estimator call at (xt, t, dt) WITH grad; loss =
-  mean over batch of MSE(vt_pred[i,:,prompt_i:mel_len_i],
-  vt[i,:,prompt_i:mel_len_i]) (torch MSELoss = mean over ALL elements).
-* DiT training forward (f5_tts/model/backbones/dit.py DiT.forward, the
-  non-infer path): text_embed(text)+pos -> InputEmbedding(x, cond=prompt,
-  text_embed) -> blocks (AdaLN from t + d_embed(dt) when use_step_embedding)
-  -> norm_out -> proj_out. Head-0-only RoPE and the trailing mask multiply
-  are quirks of this checkpoint family already implemented (and inference-
-  verified) in gsovits_mlx/sovits/dit.py; the trainer calls
-  ``estimator(x0, cond0, x_lens, time, d, mu, use_grad_ckpt=False)`` with
-  infer=False which exercises exactly that layout.
-
-v5 training finding (documented per task): official v5 s2 training is
-BROKEN upstream — webui.py L1498 training-version Radio choices are
-["v1","v2","v4","v2Pro","v2ProPlus"] (no v5dev/v5turbo), and
-SynthesizerTrnV3.__init__ L1295-1299 unconditionally replaces self.cfm with
-module/v5_inference.CFMV5 (an @inference_mode inference-only class with no
-forward), so s2_train_v3_lora.py's ``net_g(...)`` call would TypeError for
-v5. The estimator DiT is identical for v5 (only use_step_embedding=False),
-so this trainer trains v5dev/v5turbo with the plain CFM loss path (same as
-v3/v4), matching what the official code builds before its training-breaking
-CFMV5 swap.
-
-LoRA: gsovits_mlx.train.lora creates rank-32 adapters on every Attention
-to_k/to_q/to_v/to_out.0 (official peft targets; alpha=r -> scaling 1.0).
-During training each wrapped projection computes
-``x @ W.T + b + (x @ A.T) @ B.T``. The BASE DiT weights are frozen (peft
-marks them requires_grad=False); full-model training continues on ref_enc /
-bridge / wns1 / linear_mel as in the official trainer (peft wraps ONLY
-net_g.cfm).
+Full line-by-line mapping, the v5-upstream-broken finding (official
+v5 s2 training TypeErrors on the CFMV5 swap; this trainer trains
+v5dev/v5turbo on the plain CFM path), and the two-pass vs eager
+backward contract: docs/PARITY_NOTES.md §s2 training addendum;
+eager 18.79GB transient: docs/INCIDENTS.md#cfm-eager-1879gb-transient-freeze.
 """
 
 from __future__ import annotations
