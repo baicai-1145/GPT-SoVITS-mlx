@@ -32,6 +32,8 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+from gsovits_mlx.train.auto_label import add_auto_label_args, run_auto_label
+
 LANGUAGE_V1_TO_V2 = {
     "ZH": "zh", "zh": "zh",
     "JP": "ja", "jp": "ja", "JA": "ja", "ja": "ja",
@@ -427,8 +429,11 @@ def run_merge(args) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--list", required=True, help="wav|spk|lang|text list file")
-    ap.add_argument("--wav-dir", required=True, help="dir containing the wavs")
+    ap.add_argument("--list", default=None,
+                    help="wav|spk|lang|text list file (optional with --raw-list)")
+    ap.add_argument("--wav-dir", default=None,
+                    help="dir containing the wavs (default: dir of the "
+                         "first --raw-list entry; separated dir with --separate)")
     ap.add_argument("--exp-dir", required=True, help="output exp dir")
     ap.add_argument("--version", default="v2",
                     choices=["v1", "v2", "v2Pro", "v2ProPlus"],
@@ -443,6 +448,7 @@ def main() -> None:
                     help="comma list of: text,hubert,sv,semantic,merge | all")
     ap.add_argument("--timing-json", default=None,
                     help="write per-stage timing breakdown to this file")
+    add_auto_label_args(ap)
     args = ap.parse_args()
 
     # bootstrap() chdirs into the CPUFast repo before stage-1 runs, so any
@@ -450,7 +456,8 @@ def main() -> None:
     # (g2pw tokenizer FileNotFoundError, missing wav list, exp dir inside
     # CPUFast). Normalize every path arg to absolute up front.
     for p in ("list", "wav_dir", "exp_dir", "models_root"):
-        setattr(args, p, os.path.abspath(os.path.expanduser(getattr(args, p))))
+        if getattr(args, p) is not None:
+            setattr(args, p, os.path.abspath(os.path.expanduser(getattr(args, p))))
     if args.cpufast_repo:
         args.cpufast_repo = os.path.abspath(os.path.expanduser(args.cpufast_repo))
     if args.timing_json:
@@ -484,6 +491,19 @@ def main() -> None:
 
     timing: dict = {"device": device, "parts": args.parts, "part": args.part}
     t_all = time.perf_counter()
+    if args.raw_list:
+        # stage-0: auto-label emits <exp_dir>/0-auto_label/auto.list;
+        # --separate runs pymss (MLX) first — GPU work under the same lock.
+        run_auto_label(args, timing)
+        if not args.list:
+            args.list = os.path.join(args.exp_dir, "0-auto_label", "auto.list")
+        if not args.wav_dir:
+            first = next(l.strip() for l in open(args.raw_list) if l.strip())
+            args.wav_dir = (os.path.join(args.exp_dir, "0-auto_label", "separated")
+                            if args.separate
+                            else os.path.dirname(os.path.abspath(first)))
+    if not args.list or not args.wav_dir:
+        raise SystemExit("[prepare] --list/--wav-dir required without --raw-list")
     if "text" in stages:
         run_text(args, timing)
     if "hubert" in stages:
