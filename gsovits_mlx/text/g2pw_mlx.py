@@ -25,11 +25,13 @@ import numpy as np
 
 from .fused_ln import dense_residual_norm
 
+from gsovits_mlx.paths import default_models_root
+
 _NUM_POS = 11
 _NUM_HEADS = 12
 _MODEL = None  # {"arrays": ..., "n_layers": int}, built lazily
 
-DEFAULT_MODELS_ROOT = os.environ.get("GSOVITS_MODELS_ROOT", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "models_local"))
+DEFAULT_MODELS_ROOT = default_models_root()
 
 
 def _abs_model_dir(model_dir: str) -> str:

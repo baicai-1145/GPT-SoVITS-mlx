@@ -54,7 +54,12 @@ def _repo_root() -> str:
 
 def lock_dir() -> str:
     """Canonical lock dir: <main-repo-root>/.tmp/gpu.lock.d (single lock)."""
-    return os.path.join(_repo_root(), ".tmp", "gpu.lock.d")
+    if env := os.environ.get("GSOVITS_GPU_LOCK_DIR"):
+        return os.path.abspath(env)
+    root = _repo_root()
+    if not os.path.exists(os.path.join(root, ".git")):
+        return os.path.expanduser("~/.cache/gsovits/gpu.lock.d")
+    return os.path.join(root, ".tmp", "gpu.lock.d")
 
 
 def _find_lock() -> tuple[str, str] | None:

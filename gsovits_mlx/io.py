@@ -143,3 +143,18 @@ def model_dir_paths(model_dir: str, component: str) -> tuple[str, str]:
     w = os.path.join(model_dir, f"{component}.safetensors")
     c = os.path.join(model_dir, f"{component}.json")
     return w, c
+
+
+def save_safetensors(path: str, arrays: dict[str, object], metadata: dict | None = None) -> None:
+    """Save a dictionary of numpy or MLX arrays to a safetensors file."""
+    import numpy as np
+    from safetensors.numpy import save_file
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    np_arrays = {}
+    for k, v in arrays.items():
+        if isinstance(v, mx.array):
+            np_arrays[k] = np.ascontiguousarray(np.array(v))
+        else:
+            np_arrays[k] = np.ascontiguousarray(v)
+    save_file(np_arrays, path, metadata=metadata or None)

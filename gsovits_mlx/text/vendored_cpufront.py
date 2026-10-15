@@ -25,7 +25,21 @@ import os
 import sys
 import types
 
-DEFAULT_CPUFAST_REPO = "/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-CPUFast"
+def _find_default_cpufast_repo() -> str:
+    if env := os.environ.get("GPT_SOVITS_CPUFAST"):
+        return os.path.abspath(env)
+    cands = [
+        os.path.expanduser("~/.cache/gsovits/cpufast"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "GPT-SoVITS-CPUFast"),
+        "/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-CPUFast",
+    ]
+    for c in cands:
+        if os.path.isdir(os.path.join(c, "GPT_SoVITS", "text")):
+            return c
+    return cands[0]
+
+
+DEFAULT_CPUFAST_REPO = _find_default_cpufast_repo()
 
 _TEXT_PKG = "text"
 _TTS_PKG = "TTS_infer_pack"

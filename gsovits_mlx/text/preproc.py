@@ -21,6 +21,7 @@ from typing import Callable, NamedTuple
 
 import numpy as np
 
+from gsovits_mlx.paths import default_models_root
 from gsovits_mlx.text import vendored_cpufront
 
 punctuation = set(["!", "?", "…", ",", ".", "-"])  # official module constant
@@ -52,9 +53,9 @@ class TextFrontend:
     """
 
     def __init__(self, cpufast_repo: str | None = None,
-                 models_root: str = "/Volumes/2T/gpt-sovits-models/mlx",
+                 models_root: str | None = None,
                  device: str = "gpu", lazy: bool = False):
-        self.models_root = models_root
+        self.models_root = models_root or default_models_root()
         self.device = device
         if device == "cpu":
             import mlx.core as mx
@@ -413,16 +414,17 @@ class TextFrontend:
 
 
 def bootstrap(cpufast_repo: str | None = None,
-              models_root: str = "/Volumes/2T/gpt-sovits-models/mlx") -> None:
+              models_root: str | None = None) -> None:
     """chdir into the CPUFast repo (official modules use relative scratch
     paths, e.g. japanese TEMP/ja, g2pw model_dir) before first use, and
     point the official bert_path env (G2PW tokenizer source) at the
     converted bert export, which carries tokenizer.json."""
+    root = models_root or default_models_root()
     repo = vendored_cpufront.cpufast_repo(cpufast_repo)
     if os.getcwd() != repo:
         os.chdir(repo)
     if not os.environ.get("bert_path"):
-        os.environ["bert_path"] = os.path.join(models_root, "bert")
+        os.environ["bert_path"] = os.path.join(root, "bert")
 
 
 def _assert_gpu_allowed(device: str) -> None:

@@ -19,9 +19,26 @@ import subprocess
 import sys
 import time
 
-DEFAULT_ASR_MODEL = "/Volumes/2T/gpt-sovits-models/asr/qwen3-asr-0.6b-mlx/w4a16"
+from gsovits_mlx.paths import default_models_root
+
+
+def get_default_asr_model() -> str:
+    legacy = "/Volumes/2T/gpt-sovits-models/asr/qwen3-asr-0.6b-mlx/w4a16"
+    if os.path.exists(legacy):
+        return legacy
+    return os.path.join(default_models_root(), "asr", "qwen3-asr-0.6b-mlx", "w4a16")
+
+
+def get_default_mss_dir() -> str:
+    legacy = "/Volumes/2T/gpt-sovits-models/mss"
+    if os.path.exists(legacy):
+        return legacy
+    return os.path.join(default_models_root(), "mss")
+
+
+DEFAULT_ASR_MODEL = get_default_asr_model()
 DEFAULT_MSS_MODEL = "bs_roformer_anvuew_sdr_12.45"
-DEFAULT_MSS_DIR = "/Volumes/2T/gpt-sovits-models/mss"
+DEFAULT_MSS_DIR = get_default_mss_dir()
 
 
 def _clean_asr_text(raw: str, force_lang: str | None) -> str:

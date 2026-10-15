@@ -28,27 +28,9 @@ __all__ = ["Text2SemanticDataset", "BucketBatchSampler", "collate",
 
 HZ = 25  # official env default "25hz" (AR/data/dataset.py)
 
-# gsovits_mlx/train/s1_data.py is five dirnames from the MAIN checkout
-# root when installed as the repo package; in worktrees the tree is
-# <main>/.pi/.../worktrees/<name>/gsovits_mlx/train/ — walk up until a
-# models_local dir is found (main checkout owns the weights).
-def _default_models_root() -> str:
-    if os.environ.get("GSOVITS_MODELS_ROOT"):
-        return os.environ["GSOVITS_MODELS_ROOT"]
-    d = os.path.dirname(os.path.abspath(__file__))
-    while True:
-        cand = os.path.join(d, "models_local")
-        if os.path.isdir(cand):
-            return cand
-        parent = os.path.dirname(d)
-        if parent == d:
-            break
-        d = parent
-    return os.path.join("/Users/baicai1145/repos/gpt-sovits/GPT-SoVITS-mlx",
-                        "models_local")
+from gsovits_mlx.paths import default_models_root
 
-
-DEFAULT_MODELS_ROOT = _default_models_root()
+DEFAULT_MODELS_ROOT = default_models_root()
 
 
 def bootstrap_frontend(cpufast_repo: str | None = None,

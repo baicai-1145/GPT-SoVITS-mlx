@@ -17,7 +17,21 @@ per-version parity numbers and quirks live in
 [docs/PARITY_NOTES.md](docs/PARITY_NOTES.md), performance in
 [docs/BENCH.md](docs/BENCH.md).
 
-## Setup
+## Installation
+
+### From PyPI
+
+```bash
+pip install gsovits-mlx
+
+# With multi-language text frontend:
+pip install "gsovits-mlx[frontend]"
+
+# With ASR and vocal separation for automated data prep:
+pip install "gsovits-mlx[frontend,asr,mss]"
+```
+
+### From Source (Development)
 
 Requires Python 3.12+ and an Apple-silicon Mac. With [uv](https://docs.astral.sh/uv/):
 
@@ -27,19 +41,49 @@ uv sync --extra convert      # + torch (ONLY for weight conversion)
 uv sync --extra dev          # + pytest
 ```
 
-## Usage
+## Quick Start
 
-One CLI for all versions:
+### 1. Download Pre-converted Weights
 
 ```bash
-python3 tools/e2e.py --version v2 \
+# Download weights for a specific family (e.g. v2):
+gsovits download v2
+
+# In mainland China, add --mirror to use hf-mirror.com:
+gsovits download v2 --mirror
+
+# Or download all 8 model families:
+gsovits download all --mirror
+```
+
+### 2. Text-to-Speech Inference
+
+```bash
+# Unified CLI:
+gsovits infer --version v2 \
     --text "你好，欢迎来到各自的旅程。今天我们聊聊机器学习。" \
     --ref-audio ref_zh_3.5s.wav --ref-text "希望你以后能够做得比我还好哟。" \
     --out out_v2.wav
 
-# v1 | v2 | v2Pro | v2ProPlus | v3 | v4 | v5dev | v5turbo
-python3 tools/e2e.py --version v5turbo ...
-python3 tools/e2e.py --version v2ProPlus ...
+# Or standalone console script:
+gsovits-e2e --version v5turbo ...
+```
+
+### 3. Audio Preparation & Training
+
+```bash
+# Auto-label raw audio with Vocal Separation (pymss) + ASR (qwen3-asr w4a16):
+gsovits prepare --raw-list songs.list --separate --speaker singer_a \
+    --exp-dir exp --version v2ProPlus --stages all
+
+# Train stage-1 AR GPT model:
+gsovits-train-s1 --exp-dir exp --version v2 --epochs 4
+
+# Train stage-2 SoVITS GAN model (v1/v2/v2Pro/v2ProPlus):
+gsovits-train-s2 --exp-dir exp --version v2 --epochs 8
+
+# Train stage-2 CFM model (v3/v4/v5dev/v5turbo):
+gsovits-train-s2-v3 --exp-dir exp --version v5turbo --epochs 8
 ```
 
 The old per-version scripts (`tools/e2e_v2.py` etc.) remain as thin
